@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="header.png" alt="magus">
+</p>
+
 # magus
 
 `magus` is a day-2 reconciler for bootc / Fedora CoreOS hosts. It consumes the
