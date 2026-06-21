@@ -7,11 +7,13 @@ import (
 	"testing"
 )
 
-// workloadPolicy mirrors ../core-image/config/magus/policy.yaml — the REAL
-// boundary magus runs under on a core-base host. Quadlets + /etc/core files are
-// the workload surface; standalone units and /etc/systemd/system are NOT in
-// file_roots here (that is deliberate on core-base). Tests that need standalone
-// units use examplePolicy instead.
+// workloadPolicy is a byte-faithful copy of ../core-image/config/magus/policy.yaml
+// — the REAL boundary magus runs under on a core-base host. Kept in sync
+// deliberately (not simplified) so the harness proves the actual deployment
+// boundary, including the secret/substrate denies. Quadlets + /etc/core files
+// are the workload surface; standalone units and /etc/systemd/system are NOT in
+// file_roots here (deliberate on core-base — see the policy-inconsistency note
+// on TestDropIn). Tests that need standalone units use examplePolicy.
 const workloadPolicy = `version: 1
 file_roots:
   - /etc/containers/systemd
@@ -25,9 +27,14 @@ deny:
     - /etc/passwd
     - /etc/sudoers
     - /etc/sudoers.d/*
+    - /etc/core/reconcile.env
+    - /etc/core/labmap.env
   units:
     - "sshd.*"
     - "systemd-*"
+    - "labmap-agent.*"
+    - "core-reconcile.*"
+    - "bootc-*"
 `
 
 // examplePolicy mirrors policy.example.yaml — broader file_roots + magus-*
@@ -69,6 +76,23 @@ func (c *container) apply(bu string) (string, int) {
 	return c.magus("apply", "--yes", "--policy", "/policy.yaml", "/host.bu")
 }
 
+func (c *container) plan(bu string) (string, int) {
+	c.t.Helper()
+	c.put("/host.bu", bu)
+	return c.magus("plan", "--policy", "/policy.yaml", "/host.bu")
+}
+
+// inode returns the inode number of a path — used to prove a "no write"
+// operation (adoption) did not replace the file via tmp+rename.
+func (c *container) inode(path string) string {
+	c.t.Helper()
+	out, code := c.exec("stat", "-c", "%i", path)
+	if code != 0 {
+		c.t.Fatalf("stat -i %s: %s", path, out)
+	}
+	return strings.TrimSpace(out)
+}
+
 // TestFileLifecycle proves create → idempotent no-op → delete-on-omission for a
 // plain file under the real workload policy.
 func TestFileLifecycle(t *testing.T) {
@@ -102,8 +126,12 @@ func TestFileLifecycle(t *testing.T) {
 		t.Errorf("second apply not a no-op:\n%s", out2)
 	}
 
-	// Delete-on-omission: drop the file from the IR (declare a different one);
-	// magus owns it, so omission deletes it.
+	// An UNOWNED neighbor inside the same file_root must survive deletion —
+	// proves delete is manifest-bounded, not "prune everything undeclared".
+	c.put("/etc/core/manual.conf", "hand-placed\n")
+
+	// Delete-on-omission: drop the owned file from the IR (declare a different
+	// one); magus owns hello.conf, so omission deletes it.
 	bu2 := butaneHeader + `storage:
   files:
     - path: /etc/core/other.conf
@@ -115,10 +143,13 @@ func TestFileLifecycle(t *testing.T) {
 		t.Fatalf("apply delete: exit %d\n%s", code3, out3)
 	}
 	if c.exists("/etc/core/hello.conf") {
-		t.Errorf("hello.conf should have been deleted on omission")
+		t.Errorf("owned hello.conf should have been deleted on omission")
 	}
 	if !c.exists("/etc/core/other.conf") {
 		t.Errorf("other.conf should have been created")
+	}
+	if !c.exists("/etc/core/manual.conf") {
+		t.Errorf("UNOWNED manual.conf was deleted — deletion is not manifest-bounded")
 	}
 }
 
@@ -128,12 +159,18 @@ func TestConflictSkips(t *testing.T) {
 	c := setup(t, workloadPolicy)
 	c.put("/etc/core/conf.env", "OLD=1\n")
 
+	// Declare the conflicting file AND a clean neighbor: the conflict must skip
+	// while the neighbor still converges (per-resource skip never halts apply).
 	bu := butaneHeader + `storage:
   files:
     - path: /etc/core/conf.env
       contents:
         inline: |
           NEW=1
+    - path: /etc/core/clean.conf
+      contents:
+        inline: |
+          converged
 `
 	out, code := c.apply(bu)
 	if code != 2 {
@@ -142,8 +179,13 @@ func TestConflictSkips(t *testing.T) {
 	if !strings.Contains(out, "conflict") {
 		t.Errorf("expected conflict in output:\n%s", out)
 	}
-	if got := c.readFile("/etc/core/conf.env"); !strings.Contains(got, "OLD=1") {
-		t.Errorf("conflict file was overwritten: %q", got)
+	// Byte-exact: not overwritten, not appended, not partially written.
+	if got := c.readFile("/etc/core/conf.env"); got != "OLD=1\n" {
+		t.Errorf("conflict file mutated: %q, want exactly \"OLD=1\\n\"", got)
+	}
+	// The non-conflicting neighbor must have converged in the same apply.
+	if got := c.readFile("/etc/core/clean.conf"); !strings.Contains(got, "converged") {
+		t.Errorf("conflict halted apply — clean neighbor not converged: %q", got)
 	}
 }
 
@@ -153,6 +195,7 @@ func TestAdoption(t *testing.T) {
 	c := setup(t, workloadPolicy)
 	c.put("/etc/core/match.env", "K=V\n")
 	c.exec("chmod", "644", "/etc/core/match.env")
+	inodeBefore := c.inode("/etc/core/match.env")
 
 	bu := butaneHeader + `storage:
   files:
@@ -169,6 +212,11 @@ func TestAdoption(t *testing.T) {
 	if !strings.Contains(out, "adopt") {
 		t.Errorf("expected adopt in output:\n%s", out)
 	}
+	// Adoption must be a no-op for content: the inode is unchanged (a tmp+rename
+	// write would replace it with a new inode).
+	if after := c.inode("/etc/core/match.env"); after != inodeBefore {
+		t.Errorf("adoption rewrote the file: inode %s -> %s (must be a no-op)", inodeBefore, after)
+	}
 	out2, code2 := c.apply(bu)
 	if code2 != 0 || !strings.Contains(out2, "Nothing to apply") {
 		t.Errorf("post-adopt apply not a no-op: exit %d\n%s", code2, out2)
@@ -181,12 +229,21 @@ func TestAdoption(t *testing.T) {
 func TestIgnitionOnlyIgnored(t *testing.T) {
 	c := setup(t, workloadPolicy)
 
+	// Two Ignition-only sections magus must ignore (not reject): a disk layout
+	// (storage.disks) and a user (passwd.users), alongside one magus file.
 	bu := butaneHeader + `passwd:
   users:
     - name: alice
       groups:
         - wheel
 storage:
+  disks:
+    - device: /dev/vdb
+      wipe_table: false
+      partitions:
+        - label: data
+          number: 1
+          size_mib: 64
   files:
     - path: /etc/core/ok.conf
       contents:
@@ -203,6 +260,11 @@ storage:
 	}
 	if !c.exists("/etc/core/ok.conf") {
 		t.Errorf("magus file not created alongside ignored sections")
+	}
+	// "Ignored" must mean no effect: magus is not Ignition, so it must NOT have
+	// created the declared user.
+	if _, idCode := c.exec("id", "alice"); idCode == 0 {
+		t.Errorf("magus acted on passwd.users — user alice exists, but magus must ignore it")
 	}
 }
 
@@ -291,12 +353,155 @@ func TestQuadlet(t *testing.T) {
           WantedBy=multi-user.target
 `
 	out, code := c.apply(bu)
-	if !c.exists("/etc/containers/systemd/hello.container") {
-		t.Fatalf("quadlet source not written\n%s", out)
+
+	// Write correctness, independent of image egress: the source must be on
+	// disk byte-for-byte as declared.
+	if got := c.readFile("/etc/containers/systemd/hello.container"); !strings.Contains(got, "Image=quay.io/podman/hello:latest") {
+		t.Fatalf("quadlet source not written as declared: %q\n%s", got, out)
 	}
-	// After magus' daemon-reload the generator must know hello.service.
+	// After magus' daemon-reload the generator must materialize hello.service.
 	if _, ccode := c.exec("systemctl", "cat", "hello.service"); ccode != 0 {
-		t.Errorf("quadlet generator did not materialize hello.service (apply exit %d)\n%s", code, out)
+		t.Fatalf("quadlet generator did not materialize hello.service (apply exit %d)\n%s", code, out)
 	}
-	t.Logf("quadlet apply exit %d; hello.service is-active=%s", code, c.isActive("hello.service"))
+
+	// Attribute the exit code so a real regression can't hide behind the
+	// egress-dependent container start:
+	//   - exit 0 + active        → full success (image was pullable)
+	//   - exit 1 + not-active     → expected when the nested container has no
+	//     image egress; magus must have attributed the failure to hello
+	//   - anything else           → a real regression
+	active := c.isActive("hello.service")
+	switch {
+	case code == 0 && active == "active":
+		// full success
+	case code == 1 && active != "active":
+		if !strings.Contains(out, "hello") {
+			t.Errorf("quadlet apply failed but not attributed to the hello quadlet:\n%s", out)
+		}
+		t.Logf("quadlet start skipped (no image egress); generation verified, exit attributed to hello.service")
+	default:
+		t.Fatalf("unexpected quadlet state: apply exit %d, hello.service is-active=%s\n%s", code, active, out)
+	}
+}
+
+// TestPlanAndStatus proves the read-only verbs against real state: plan reports
+// pending changes (exit 2) before apply and a clean tree (exit 0) after, and
+// status --json reflects the resource magus now manages.
+func TestPlanAndStatus(t *testing.T) {
+	c := setup(t, workloadPolicy)
+
+	bu := butaneHeader + `storage:
+  files:
+    - path: /etc/core/planned.conf
+      contents:
+        inline: |
+          planned
+`
+	// plan before apply: a create is pending → exit 2, [create] in output.
+	pout, pcode := c.plan(bu)
+	if pcode != 2 {
+		t.Fatalf("plan (pending): exit %d (want 2)\n%s", pcode, pout)
+	}
+	if !strings.Contains(pout, "create") {
+		t.Errorf("plan did not report the pending create:\n%s", pout)
+	}
+
+	if out, code := c.apply(bu); code != 0 {
+		t.Fatalf("apply: exit %d\n%s", code, out)
+	}
+
+	// plan after apply: nothing pending → exit 0.
+	pout2, pcode2 := c.plan(bu)
+	if pcode2 != 0 {
+		t.Errorf("plan (clean): exit %d (want 0)\n%s", pcode2, pout2)
+	}
+
+	// status --json must report the managed resource.
+	sout, scode := c.magus("status", "--json")
+	if scode != 0 {
+		t.Fatalf("status: exit %d\n%s", scode, sout)
+	}
+	if !strings.Contains(sout, "/etc/core/planned.conf") {
+		t.Errorf("status --json does not list the managed file:\n%s", sout)
+	}
+	if !strings.Contains(sout, "\"managed_resources\"") {
+		t.Errorf("status --json missing managed_resources field:\n%s", sout)
+	}
+}
+
+// TestDropIn proves the drop-in path against real systemd: a 10-magus.conf
+// drop-in is written to the unit's .d/ directory and survives daemon-reload.
+//
+// NOTE: this runs under examplePolicy, not the real workload policy. The
+// core-image workload policy is internally inconsistent for drop-ins — its
+// unit_patterns allows "*.d/10-magus.conf" but its file_roots omit
+// /etc/systemd/system, so a drop-in there is path-denied. Flagged for the
+// core-image policy owner; on core-base the unit surface is quadlets, not
+// drop-ins.
+func TestDropIn(t *testing.T) {
+	c := setup(t, examplePolicy)
+
+	bu := butaneHeader + `systemd:
+  units:
+    - name: magus-base.service
+      contents: |
+        [Unit]
+        Description=magus drop-in base
+        [Service]
+        Type=oneshot
+        RemainAfterExit=yes
+        ExecStart=/usr/bin/true
+      dropins:
+        - name: 10-magus.conf
+          contents: |
+            [Service]
+            Environment=MAGUS_DROPIN=present
+`
+	out, code := c.apply(bu)
+	if code != 0 {
+		t.Fatalf("apply drop-in: exit %d\n%s", code, out)
+	}
+	dropinPath := "/etc/systemd/system/magus-base.service.d/10-magus.conf"
+	if !c.exists(dropinPath) {
+		t.Fatalf("drop-in not written at %s\n%s", dropinPath, out)
+	}
+	if got := c.readFile(dropinPath); !strings.Contains(got, "MAGUS_DROPIN=present") {
+		t.Errorf("drop-in content wrong: %q", got)
+	}
+	// systemd must have merged the drop-in (proves precedence-named file is live).
+	props, _ := c.exec("systemctl", "show", "magus-base.service", "-p", "Environment")
+	if !strings.Contains(props, "MAGUS_DROPIN=present") {
+		t.Errorf("systemd did not merge the drop-in: %q", props)
+	}
+}
+
+// TestDenyEnforcement proves the policy deny list is enforced: an IR declaring a
+// path the real workload policy denies (the fleet credential) is rejected at
+// validate, applies nothing, and never writes the file.
+func TestDenyEnforcement(t *testing.T) {
+	c := setup(t, workloadPolicy)
+
+	bu := butaneHeader + `storage:
+  files:
+    - path: /etc/core/reconcile.env
+      contents:
+        inline: |
+          STOLEN=1
+`
+	c.put("/host.bu", bu)
+	vout, vcode := c.magus("validate", "--policy", "/policy.yaml", "/host.bu")
+	if vcode == 0 {
+		t.Fatalf("validate accepted a denied path:\n%s", vout)
+	}
+	if !strings.Contains(vout, "reconcile.env") {
+		t.Errorf("validate error did not name the denied path:\n%s", vout)
+	}
+	// apply must also refuse (input-bad halts) and never touch the file.
+	aout, acode := c.apply(bu)
+	if acode == 0 {
+		t.Fatalf("apply proceeded on a denied path:\n%s", aout)
+	}
+	if c.exists("/etc/core/reconcile.env") {
+		t.Errorf("denied file was written despite policy deny")
+	}
 }
