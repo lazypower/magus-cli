@@ -226,11 +226,11 @@ type ignNodeOwner struct {
 }
 
 type ignUnit struct {
-	Name     string       `json:"name"`
-	Enabled  *bool        `json:"enabled"`
-	Mask     *bool        `json:"mask"`
-	Contents *string      `json:"contents"`
-	Dropins  []ignDropin  `json:"dropins"`
+	Name     string      `json:"name"`
+	Enabled  *bool       `json:"enabled"`
+	Mask     *bool       `json:"mask"`
+	Contents *string     `json:"contents"`
+	Dropins  []ignDropin `json:"dropins"`
 }
 
 type ignDropin struct {

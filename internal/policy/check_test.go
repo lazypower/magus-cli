@@ -4,7 +4,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/lazypower/magus/internal/ir"
+	"gitea.wabash.place/lab/magus-cli/internal/ir"
 )
 
 func TestCheckCleanIR(t *testing.T) {
@@ -38,13 +38,13 @@ deny:
 	in := &ir.IR{
 		Files: []ir.File{
 			{Path: "/etc/passwd"},                       // outside file_roots
-			{Path: "/etc/magus.d/secret"},                // explicit deny
-			{Path: "/etc/magus.d/world", Mode: 0o646},    // world-writable
-			{Path: "/etc/magus.d/setuid", Mode: 0o4755},  // setuid
+			{Path: "/etc/magus.d/secret"},               // explicit deny
+			{Path: "/etc/magus.d/world", Mode: 0o646},   // world-writable
+			{Path: "/etc/magus.d/setuid", Mode: 0o4755}, // setuid
 		},
 		Units: []ir.Unit{
-			{Name: "ollama.service"},      // doesn't match unit_patterns
-			{Name: "magus-secret-thing"},  // explicit deny
+			{Name: "ollama.service"},     // doesn't match unit_patterns
+			{Name: "magus-secret-thing"}, // explicit deny
 			{Name: "magus-ok", DropIns: []ir.DropIn{
 				{Name: "20-other.conf"}, // wrong drop-in name
 			}},

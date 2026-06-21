@@ -9,7 +9,7 @@ import (
 	"sort"
 	"time"
 
-	"github.com/lazypower/magus/internal/manifest"
+	"gitea.wabash.place/lab/magus-cli/internal/manifest"
 )
 
 const statusUsage = `magus status — print reconciler state

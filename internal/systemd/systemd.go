@@ -92,12 +92,12 @@ func (m *osManager) runOutput(args ...string) (string, error) {
 	return strings.TrimSpace(string(out)), err
 }
 
-func (m *osManager) DaemonReload() error { return m.run("daemon-reload") }
-func (m *osManager) Enable(unit string) error      { return m.run("enable", unit) }
-func (m *osManager) EnableNow(unit string) error   { return m.run("enable", "--now", unit) }
-func (m *osManager) Disable(unit string) error     { return m.run("disable", unit) }
-func (m *osManager) DisableNow(unit string) error  { return m.run("disable", "--now", unit) }
-func (m *osManager) Restart(unit string) error     { return m.run("restart", unit) }
+func (m *osManager) DaemonReload() error          { return m.run("daemon-reload") }
+func (m *osManager) Enable(unit string) error     { return m.run("enable", unit) }
+func (m *osManager) EnableNow(unit string) error  { return m.run("enable", "--now", unit) }
+func (m *osManager) Disable(unit string) error    { return m.run("disable", unit) }
+func (m *osManager) DisableNow(unit string) error { return m.run("disable", "--now", unit) }
+func (m *osManager) Restart(unit string) error    { return m.run("restart", unit) }
 
 func (m *osManager) IsEnabled(unit string) (Enablement, error) {
 	out, _ := m.runOutput("is-enabled", unit)
@@ -130,11 +130,13 @@ func (m *osManager) IsActive(unit string) (bool, error) {
 // unavailableManager is the substitute returned when systemctl isn't on PATH.
 type unavailableManager struct{}
 
-func (unavailableManager) DaemonReload() error                 { return ErrUnavailable }
-func (unavailableManager) IsEnabled(string) (Enablement, error) { return EnablementUnknown, ErrUnavailable }
-func (unavailableManager) IsActive(string) (bool, error)        { return false, ErrUnavailable }
-func (unavailableManager) Enable(string) error                  { return ErrUnavailable }
-func (unavailableManager) EnableNow(string) error               { return ErrUnavailable }
-func (unavailableManager) Disable(string) error                 { return ErrUnavailable }
-func (unavailableManager) DisableNow(string) error              { return ErrUnavailable }
-func (unavailableManager) Restart(string) error                 { return ErrUnavailable }
+func (unavailableManager) DaemonReload() error { return ErrUnavailable }
+func (unavailableManager) IsEnabled(string) (Enablement, error) {
+	return EnablementUnknown, ErrUnavailable
+}
+func (unavailableManager) IsActive(string) (bool, error) { return false, ErrUnavailable }
+func (unavailableManager) Enable(string) error           { return ErrUnavailable }
+func (unavailableManager) EnableNow(string) error        { return ErrUnavailable }
+func (unavailableManager) Disable(string) error          { return ErrUnavailable }
+func (unavailableManager) DisableNow(string) error       { return ErrUnavailable }
+func (unavailableManager) Restart(string) error          { return ErrUnavailable }

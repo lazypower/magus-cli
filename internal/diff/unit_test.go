@@ -4,8 +4,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/lazypower/magus/internal/ir"
-	"github.com/lazypower/magus/internal/manifest"
+	"gitea.wabash.place/lab/magus-cli/internal/ir"
+	"gitea.wabash.place/lab/magus-cli/internal/manifest"
 )
 
 func TestUnitCreate(t *testing.T) {

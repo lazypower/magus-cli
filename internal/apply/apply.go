@@ -10,11 +10,11 @@ import (
 	"path/filepath"
 	"time"
 
-	"github.com/lazypower/magus/internal/diff"
-	"github.com/lazypower/magus/internal/hostfs"
-	"github.com/lazypower/magus/internal/ir"
-	"github.com/lazypower/magus/internal/manifest"
-	"github.com/lazypower/magus/internal/systemd"
+	"gitea.wabash.place/lab/magus-cli/internal/diff"
+	"gitea.wabash.place/lab/magus-cli/internal/hostfs"
+	"gitea.wabash.place/lab/magus-cli/internal/ir"
+	"gitea.wabash.place/lab/magus-cli/internal/manifest"
+	"gitea.wabash.place/lab/magus-cli/internal/systemd"
 )
 
 // Status records what happened to one resource during apply.
@@ -104,13 +104,13 @@ type pendingResource struct {
 // injected so applied_at timestamps are deterministic in tests.
 //
 // Apply runs in three phases per the spec:
-//   1. Filesystem mutations. Unit body deletes are special-cased to
-//      'systemctl disable --now' before unlink so enablement symlinks are
-//      cleaned before the file disappears.
-//   2. systemctl daemon-reload, exactly once, if any unit file was mutated.
-//   3. Per-IR-unit state reconciliation: enablement, first-time start for
-//      newly-created enabled units, and restart-if-active for content
-//      changes.
+//  1. Filesystem mutations. Unit body deletes are special-cased to
+//     'systemctl disable --now' before unlink so enablement symlinks are
+//     cleaned before the file disappears.
+//  2. systemctl daemon-reload, exactly once, if any unit file was mutated.
+//  3. Per-IR-unit state reconciliation: enablement, first-time start for
+//     newly-created enabled units, and restart-if-active for content
+//     changes.
 //
 // Per-resource errors do not halt — the reconciler-pattern posture from the
 // spec. One bad resource does not take the system hostage.

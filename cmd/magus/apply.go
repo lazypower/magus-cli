@@ -9,13 +9,13 @@ import (
 	"strings"
 	"time"
 
-	"github.com/lazypower/magus/internal/apply"
-	"github.com/lazypower/magus/internal/diff"
-	"github.com/lazypower/magus/internal/hostfs"
-	"github.com/lazypower/magus/internal/ir"
-	"github.com/lazypower/magus/internal/manifest"
-	"github.com/lazypower/magus/internal/policy"
-	"github.com/lazypower/magus/internal/systemd"
+	"gitea.wabash.place/lab/magus-cli/internal/apply"
+	"gitea.wabash.place/lab/magus-cli/internal/diff"
+	"gitea.wabash.place/lab/magus-cli/internal/hostfs"
+	"gitea.wabash.place/lab/magus-cli/internal/ir"
+	"gitea.wabash.place/lab/magus-cli/internal/manifest"
+	"gitea.wabash.place/lab/magus-cli/internal/policy"
+	"gitea.wabash.place/lab/magus-cli/internal/systemd"
 )
 
 const applyUsage = `magus apply — reconcile the system toward the declared state

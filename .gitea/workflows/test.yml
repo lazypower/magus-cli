@@ -16,6 +16,13 @@ jobs:
           host="${GITHUB_SERVER_URL#https://}"
           git clone "https://token:${TOKEN}@${host}/${GITHUB_REPOSITORY}.git" src
           git -C src checkout "$GITHUB_SHA"
+      - name: Format check
+        working-directory: src
+        run: |
+          unformatted="$(gofmt -l .)"
+          if [ -n "$unformatted" ]; then
+            echo "gofmt needed on:"; echo "$unformatted"; exit 1
+          fi
       - name: Test
         working-directory: src
         run: go test ./...

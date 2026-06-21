@@ -8,14 +8,14 @@ import "strings"
 // systemd, even if they differ in whitespace or comments.
 //
 // The 7 rules, from docs/spec-reconciler.md "Equivalence":
-//   1. Drop blank lines.
-//   2. Drop comment lines (first non-whitespace character is # or ;).
-//   3. Trim trailing whitespace from each line.
-//   4. Normalize key=value spacing: collapse to "key=value" (no whitespace
-//      around =).
-//   5. Preserve section headers exactly — case-sensitive, brackets included.
-//   6. Preserve key order within each section.
-//   7. Preserve section order across the file.
+//  1. Drop blank lines.
+//  2. Drop comment lines (first non-whitespace character is # or ;).
+//  3. Trim trailing whitespace from each line.
+//  4. Normalize key=value spacing: collapse to "key=value" (no whitespace
+//     around =).
+//  5. Preserve section headers exactly — case-sensitive, brackets included.
+//  6. Preserve key order within each section.
+//  7. Preserve section order across the file.
 //
 // Rules 5–7 are "preserve, don't reorder" — order is behavior-significant in
 // systemd (ExecStart*, Environment, etc.), so canonicalization is intentionally

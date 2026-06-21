@@ -31,10 +31,10 @@ deny:
 	}{
 		{"/etc/magus.d/ollama.env", true},
 		{"/var/lib/magus/state.json", true},
-		{"/etc/passwd", false},      // outside file_roots
-		{"/etc/magus.d", true},       // root path itself
-		{"/etc/magus.dother/x", false}, // prefix-without-separator should not match
-		{"/etc/magus.d/secret", false}, // exact deny
+		{"/etc/passwd", false},              // outside file_roots
+		{"/etc/magus.d", true},              // root path itself
+		{"/etc/magus.dother/x", false},      // prefix-without-separator should not match
+		{"/etc/magus.d/secret", false},      // exact deny
 		{"/etc/magus.d/secrets/foo", false}, // glob deny
 		{"/etc/magus.d/secrets", false},     // glob deny base
 	}

@@ -10,9 +10,9 @@ import (
 	"path/filepath"
 	"strings"
 
-	"github.com/lazypower/magus/internal/hostfs"
-	"github.com/lazypower/magus/internal/ir"
-	"github.com/lazypower/magus/internal/manifest"
+	"gitea.wabash.place/lab/magus-cli/internal/hostfs"
+	"gitea.wabash.place/lab/magus-cli/internal/ir"
+	"gitea.wabash.place/lab/magus-cli/internal/manifest"
 )
 
 // Action is the per-resource verb the planner picks.
@@ -393,9 +393,11 @@ func kindFromManifest(k manifest.Kind) Kind {
 
 // QuadletGeneratedService returns the .service name the systemd-quadlet
 // generator materializes from a quadlet source name. v1 supported types:
-//   foo.container → foo.service
-//   foo.volume    → foo-volume.service
-//   foo.network   → foo-network.service
+//
+//	foo.container → foo.service
+//	foo.volume    → foo-volume.service
+//	foo.network   → foo-network.service
+//
 // Unsupported types return an empty string and a non-nil error so callers
 // can surface a clear message rather than guess.
 func QuadletGeneratedService(quadletName string) (string, error) {

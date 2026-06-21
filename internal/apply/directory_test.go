@@ -4,10 +4,10 @@ import (
 	"testing"
 	"time"
 
-	"github.com/lazypower/magus/internal/diff"
-	"github.com/lazypower/magus/internal/ir"
-	"github.com/lazypower/magus/internal/manifest"
-	"github.com/lazypower/magus/internal/systemd"
+	"gitea.wabash.place/lab/magus-cli/internal/diff"
+	"gitea.wabash.place/lab/magus-cli/internal/ir"
+	"gitea.wabash.place/lab/magus-cli/internal/manifest"
+	"gitea.wabash.place/lab/magus-cli/internal/systemd"
 )
 
 func TestDirectoryCreate(t *testing.T) {

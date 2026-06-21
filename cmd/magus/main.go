@@ -1,4 +1,4 @@
-// Command magus is the day-2 reconciler for Magus OS images.
+// Command magus is a day-2 reconciler for bootc / Fedora CoreOS hosts.
 //
 // magus consumes the IR subset of a Butane file and converges the running
 // system toward the declared state. See docs/spec-reconciler.md for the
@@ -15,12 +15,12 @@ const usage = `magus — Butane reconciler for Magus
 Usage: magus <command> [flags]
 
 Commands:
-  validate    Parse a Butane file and check it against the policy
-  plan        Show what apply would do (not implemented yet)
-  apply       Reconcile the system toward the declared state (not implemented yet)
-  status      Print reconciler state (not implemented yet)
-  adopt       Take over an existing path that differs from the IR (not implemented yet)
-  reclaim     Restore an orphaned path to active reconciliation (not implemented yet)
+  validate    Parse a Butane source and check it against the policy
+  plan        Show what apply would do
+  apply       Reconcile the system toward the declared state
+  status      Print reconciler state from the manifest
+  adopt       Take over an existing path that differs from the IR
+  reclaim     Restore an orphaned path to active reconciliation
 
 Run 'magus <command> -h' for command-specific flags.
 `
