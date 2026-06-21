@@ -3,8 +3,13 @@
 package integration
 
 import (
+	"encoding/json"
+	"os"
+	"reflect"
 	"strings"
 	"testing"
+
+	"gitea.wabash.place/lab/magus-cli/internal/policy"
 )
 
 // workloadPolicy is a byte-faithful copy of ../core-image/config/magus/policy.yaml
@@ -82,15 +87,32 @@ func (c *container) plan(bu string) (string, int) {
 	return c.magus("plan", "--policy", "/policy.yaml", "/host.bu")
 }
 
-// inode returns the inode number of a path — used to prove a "no write"
-// operation (adoption) did not replace the file via tmp+rename.
-func (c *container) inode(path string) string {
+// statSig returns "inode:mtime" of a path — used to prove a "no write"
+// operation (adoption) did not touch the file at all (a tmp+rename replaces the
+// inode; any rewrite bumps mtime).
+func (c *container) statSig(path string) string {
 	c.t.Helper()
-	out, code := c.exec("stat", "-c", "%i", path)
+	out, code := c.exec("stat", "-c", "%i:%Y", path)
 	if code != 0 {
-		c.t.Fatalf("stat -i %s: %s", path, out)
+		c.t.Fatalf("stat %s: %s", path, out)
 	}
 	return strings.TrimSpace(out)
+}
+
+// manifestOrigin parses the on-disk manifest and returns the recorded origin
+// ("create"/"adopt"/"force-adopt") for a path, or "" if absent.
+func (c *container) manifestOrigin(path string) string {
+	c.t.Helper()
+	raw := c.readFile("/var/lib/magus/manifest.json")
+	var m struct {
+		Resources map[string]struct {
+			Origin string `json:"origin"`
+		} `json:"resources"`
+	}
+	if err := json.Unmarshal([]byte(raw), &m); err != nil {
+		c.t.Fatalf("parse manifest: %v\n%s", err, raw)
+	}
+	return m.Resources[path].Origin
 }
 
 // TestFileLifecycle proves create → idempotent no-op → delete-on-omission for a
@@ -195,7 +217,7 @@ func TestAdoption(t *testing.T) {
 	c := setup(t, workloadPolicy)
 	c.put("/etc/core/match.env", "K=V\n")
 	c.exec("chmod", "644", "/etc/core/match.env")
-	inodeBefore := c.inode("/etc/core/match.env")
+	sigBefore := c.statSig("/etc/core/match.env")
 
 	bu := butaneHeader + `storage:
   files:
@@ -209,13 +231,17 @@ func TestAdoption(t *testing.T) {
 	if code != 0 {
 		t.Fatalf("adopt apply: exit %d\n%s", code, out)
 	}
-	if !strings.Contains(out, "adopt") {
-		t.Errorf("expected adopt in output:\n%s", out)
+	// The per-resource line proves a real adopt, not the "0 adopts" footer.
+	if !strings.Contains(out, "adopted, no write") {
+		t.Errorf("expected an adopted-no-write outcome:\n%s", out)
 	}
-	// Adoption must be a no-op for content: the inode is unchanged (a tmp+rename
-	// write would replace it with a new inode).
-	if after := c.inode("/etc/core/match.env"); after != inodeBefore {
-		t.Errorf("adoption rewrote the file: inode %s -> %s (must be a no-op)", inodeBefore, after)
+	// No-op for content: inode AND mtime unchanged (any write would move one).
+	if after := c.statSig("/etc/core/match.env"); after != sigBefore {
+		t.Errorf("adoption touched the file: stat %s -> %s (must be a no-op)", sigBefore, after)
+	}
+	// Ownership is recorded with origin=adopt, not create.
+	if o := c.manifestOrigin("/etc/core/match.env"); o != "adopt" {
+		t.Errorf("manifest origin = %q, want adopt", o)
 	}
 	out2, code2 := c.apply(bu)
 	if code2 != 0 || !strings.Contains(out2, "Nothing to apply") {
@@ -375,8 +401,10 @@ func TestQuadlet(t *testing.T) {
 	case code == 0 && active == "active":
 		// full success
 	case code == 1 && active != "active":
-		if !strings.Contains(out, "hello") {
-			t.Errorf("quadlet apply failed but not attributed to the hello quadlet:\n%s", out)
+		// The failure must be the generated service's start, surfaced as an
+		// errored outcome for hello.service — not the path echoed in the plan.
+		if !(strings.Contains(out, "hello.service") && strings.Contains(out, "errored")) {
+			t.Errorf("exit 1 not attributed to hello.service start:\n%s", out)
 		}
 		t.Logf("quadlet start skipped (no image egress); generation verified, exit attributed to hello.service")
 	default:
@@ -397,35 +425,46 @@ func TestPlanAndStatus(t *testing.T) {
         inline: |
           planned
 `
-	// plan before apply: a create is pending → exit 2, [create] in output.
+	// plan before apply: a create is pending → exit 2, with the [create] action
+	// tag (not the "N creates" summary footer, which is present even at 0).
 	pout, pcode := c.plan(bu)
 	if pcode != 2 {
 		t.Fatalf("plan (pending): exit %d (want 2)\n%s", pcode, pout)
 	}
-	if !strings.Contains(pout, "create") {
-		t.Errorf("plan did not report the pending create:\n%s", pout)
+	if !strings.Contains(pout, "[create]") {
+		t.Errorf("plan did not report the pending [create]:\n%s", pout)
 	}
 
 	if out, code := c.apply(bu); code != 0 {
 		t.Fatalf("apply: exit %d\n%s", code, out)
 	}
 
-	// plan after apply: nothing pending → exit 0.
+	// plan after apply: nothing pending → exit 0, no [create] tag.
 	pout2, pcode2 := c.plan(bu)
 	if pcode2 != 0 {
 		t.Errorf("plan (clean): exit %d (want 0)\n%s", pcode2, pout2)
 	}
+	if strings.Contains(pout2, "[create]") {
+		t.Errorf("clean plan still shows a [create]:\n%s", pout2)
+	}
 
-	// status --json must report the managed resource.
+	// status --json must be valid JSON that reports the managed resource.
 	sout, scode := c.magus("status", "--json")
 	if scode != 0 {
 		t.Fatalf("status: exit %d\n%s", scode, sout)
 	}
-	if !strings.Contains(sout, "/etc/core/planned.conf") {
-		t.Errorf("status --json does not list the managed file:\n%s", sout)
+	var report struct {
+		ManagedResources int               `json:"managed_resources"`
+		Files            map[string]string `json:"files"`
 	}
-	if !strings.Contains(sout, "\"managed_resources\"") {
-		t.Errorf("status --json missing managed_resources field:\n%s", sout)
+	if err := json.Unmarshal([]byte(sout), &report); err != nil {
+		t.Fatalf("status --json not valid JSON: %v\n%s", err, sout)
+	}
+	if report.ManagedResources < 1 {
+		t.Errorf("status managed_resources = %d, want >= 1", report.ManagedResources)
+	}
+	if _, ok := report.Files["/etc/core/planned.conf"]; !ok {
+		t.Errorf("status files does not include the managed file:\n%s", sout)
 	}
 }
 
@@ -481,12 +520,19 @@ func TestDropIn(t *testing.T) {
 func TestDenyEnforcement(t *testing.T) {
 	c := setup(t, workloadPolicy)
 
+	// One denied path + one perfectly-allowed neighbor. A denied IR path is
+	// input-bad: it must HALT the whole apply (nothing written), not skip the
+	// denied path while converging the rest.
 	bu := butaneHeader + `storage:
   files:
     - path: /etc/core/reconcile.env
       contents:
         inline: |
           STOLEN=1
+    - path: /etc/core/allowed.conf
+      contents:
+        inline: |
+          should-not-exist-yet
 `
 	c.put("/host.bu", bu)
 	vout, vcode := c.magus("validate", "--policy", "/policy.yaml", "/host.bu")
@@ -496,12 +542,53 @@ func TestDenyEnforcement(t *testing.T) {
 	if !strings.Contains(vout, "reconcile.env") {
 		t.Errorf("validate error did not name the denied path:\n%s", vout)
 	}
-	// apply must also refuse (input-bad halts) and never touch the file.
+	// apply must refuse (input-bad halts) and write NEITHER file.
 	aout, acode := c.apply(bu)
 	if acode == 0 {
 		t.Fatalf("apply proceeded on a denied path:\n%s", aout)
 	}
 	if c.exists("/etc/core/reconcile.env") {
 		t.Errorf("denied file was written despite policy deny")
+	}
+	if c.exists("/etc/core/allowed.conf") {
+		t.Errorf("allowed neighbor was written — deny was treated as per-resource skip, not a halt")
+	}
+}
+
+// TestWorkloadPolicyMatchesCoreImage guards against drift: the embedded
+// workloadPolicy must parse to the SAME boundary (roots, unit patterns, denies)
+// as the live core-image policy, so the harness keeps proving the REAL
+// deployment boundary. Compares parsed semantics (via the real loader) rather
+// than bytes, so comment/whitespace churn in core-image is ignored but a changed
+// root/deny is caught. Skips when the core-image repo isn't checked out
+// alongside (e.g. in CI), so it never blocks the gate. No container needed.
+func TestWorkloadPolicyMatchesCoreImage(t *testing.T) {
+	path := os.Getenv("CORE_IMAGE_POLICY")
+	if path == "" {
+		path = "../../../core-image/config/magus/policy.yaml"
+	}
+	if _, err := os.Stat(path); err != nil {
+		t.Skipf("core-image policy not available (%v); cannot check drift", err)
+	}
+	live, err := policy.Load(path)
+	if err != nil {
+		t.Fatalf("load live core-image policy: %v", err)
+	}
+
+	tmp, err := os.CreateTemp(t.TempDir(), "workload-*.yaml")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := tmp.WriteString(workloadPolicy); err != nil {
+		t.Fatal(err)
+	}
+	tmp.Close()
+	embedded, err := policy.Load(tmp.Name())
+	if err != nil {
+		t.Fatalf("load embedded workloadPolicy: %v", err)
+	}
+
+	if !reflect.DeepEqual(live, embedded) {
+		t.Errorf("embedded workloadPolicy has drifted from the real core-image boundary\nlive:     %+v\nembedded: %+v", live, embedded)
 	}
 }
