@@ -13,6 +13,7 @@ import (
 	"gitea.wabash.place/lab/magus-cli/internal/hostfs"
 	"gitea.wabash.place/lab/magus-cli/internal/ir"
 	"gitea.wabash.place/lab/magus-cli/internal/manifest"
+	"gitea.wabash.place/lab/magus-cli/internal/policy"
 )
 
 // Action is the per-resource verb the planner picks.
@@ -115,10 +116,70 @@ func HashContent(b []byte, kind Kind) string {
 }
 
 // Compute joins the three inputs and produces a plan. fsys reads disk state;
-// in normal operation pass hostfs.OS().
-//
-// Files and units are diffed; directories are not yet (PR 6).
+// in normal operation pass hostfs.OS(). This is the policy-unaware entry point
+// (no symlink containment) — production callers use ComputeWithPolicy.
 func Compute(in *ir.IR, m *manifest.Manifest, fsys hostfs.Reader) (*Plan, error) {
+	return ComputeWithPolicy(nil, in, m, fsys)
+}
+
+// ComputeWithPolicy is Compute plus symlink-resolved containment: for path-
+// governed resources (files, directories, quadlets) whose declared path is
+// lexically in-bounds but resolves — through a symlinked ancestor — to a
+// location the policy denies, the action is downgraded to a Conflict so apply
+// skips it rather than writing outside magus's authority. Requires fsys to
+// implement hostfs.Resolver; otherwise containment is a no-op (test fakes).
+// p may be nil to skip containment entirely.
+func ComputeWithPolicy(p *policy.Policy, in *ir.IR, m *manifest.Manifest, fsys hostfs.Reader) (*Plan, error) {
+	plan, err := computeCore(in, m, fsys)
+	if err != nil {
+		return nil, err
+	}
+	if p != nil {
+		applyContainment(p, plan, fsys)
+	}
+	return plan, nil
+}
+
+// applyContainment downgrades write actions whose resolved path escapes the
+// policy. Scoped to path-governed kinds (file/dir/quadlet); units are governed
+// by unit_patterns (name), not file_roots, and their write is symlink-safe via
+// the tmp+rename in hostfs. Fail-closed: a resolution error becomes a conflict.
+func applyContainment(p *policy.Policy, plan *Plan, fsys hostfs.Reader) {
+	r, ok := fsys.(hostfs.Resolver)
+	if !ok {
+		return
+	}
+	for i := range plan.Actions {
+		a := &plan.Actions[i]
+		switch a.Kind {
+		case KindFile, KindDirectory, KindQuadlet:
+		default:
+			continue
+		}
+		switch a.Action {
+		case ActionCreate, ActionUpdate, ActionAdopt:
+		default:
+			continue
+		}
+		resolved, err := r.ResolvePath(a.Path)
+		if err != nil {
+			a.Action = ActionConflict
+			a.Reason = "path resolution failed (fail-closed): " + err.Error()
+			continue
+		}
+		if resolved == filepath.Clean(a.Path) {
+			continue // no symlink rewrote the path
+		}
+		if reason := p.DenyPathReason(resolved); reason != "" {
+			a.Action = ActionConflict
+			a.Reason = fmt.Sprintf("resolves outside authority via symlink → %s (%s)", resolved, reason)
+		}
+	}
+}
+
+// computeCore joins the three inputs and produces a plan without policy-aware
+// containment. fsys reads disk state.
+func computeCore(in *ir.IR, m *manifest.Manifest, fsys hostfs.Reader) (*Plan, error) {
 	plan := &Plan{}
 	declared := map[string]bool{}
 
@@ -391,27 +452,11 @@ func kindFromManifest(k manifest.Kind) Kind {
 	}
 }
 
-// QuadletGeneratedService returns the .service name the systemd-quadlet
-// generator materializes from a quadlet source name. v1 supported types:
-//
-//	foo.container → foo.service
-//	foo.volume    → foo-volume.service
-//	foo.network   → foo-network.service
-//
-// Unsupported types return an empty string and a non-nil error so callers
-// can surface a clear message rather than guess.
+// QuadletGeneratedService is the canonical generated-service mapping, kept here
+// as a thin alias for existing diff/apply call sites; the implementation lives
+// in ir so the policy gate can reuse it without an import cycle.
 func QuadletGeneratedService(quadletName string) (string, error) {
-	ext := filepath.Ext(quadletName)
-	base := strings.TrimSuffix(quadletName, ext)
-	switch ext {
-	case ".container":
-		return base + ".service", nil
-	case ".volume":
-		return base + "-volume.service", nil
-	case ".network":
-		return base + "-network.service", nil
-	}
-	return "", fmt.Errorf("unsupported quadlet type: %s", ext)
+	return ir.QuadletGeneratedService(quadletName)
 }
 
 // UnitPath is the on-disk location magus owns a unit body at.

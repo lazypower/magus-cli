@@ -33,6 +33,18 @@ type Reader interface {
 	ReadFile(path string) ([]byte, error)
 }
 
+// Resolver is an optional capability: resolve a path's symlinks so policy
+// containment can be checked against the REAL path a write would touch. diff
+// uses it (when the fsys implements it) to catch a symlinked ancestor that
+// redirects an in-bounds-looking path outside file_roots. Test fakes that have
+// no symlinks need not implement it.
+type Resolver interface {
+	// ResolvePath returns path with symlinks in its longest existing ancestor
+	// resolved and the not-yet-existing tail appended unchanged. A missing leaf
+	// (normal create) is not an error; only a genuine resolution failure is.
+	ResolvePath(path string) (string, error)
+}
+
 // Writer extends Reader with the mutating operations apply needs. Apply may
 // read (for adoption re-verification) and write through the same value.
 type Writer interface {
@@ -95,14 +107,49 @@ func (osImpl) ReadFile(path string) ([]byte, error) {
 	return os.ReadFile(path)
 }
 
+// ResolvePath walks up to the longest existing ancestor of path, resolves its
+// symlinks with EvalSymlinks, then re-appends the non-existing tail. This is
+// how magus checks the REAL location a write would land against the policy
+// roots — a symlinked parent inside file_roots that points outside is caught
+// because the resolved path escapes the roots. A non-existent leaf is the
+// normal create case and is not an error.
+func (osImpl) ResolvePath(path string) (string, error) {
+	clean := filepath.Clean(path)
+	var missing []string
+	cur := clean
+	for {
+		if _, err := os.Lstat(cur); err == nil {
+			break
+		} else if !errors.Is(err, fs.ErrNotExist) {
+			return "", err
+		}
+		parent := filepath.Dir(cur)
+		missing = append([]string{filepath.Base(cur)}, missing...)
+		if parent == cur {
+			break // reached the root without an existing ancestor
+		}
+		cur = parent
+	}
+	resolved, err := filepath.EvalSymlinks(cur)
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(append([]string{resolved}, missing...)...), nil
+}
+
 func (osImpl) WriteFile(path string, contents []byte, mode uint32, uid, gid *int) error {
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
 		return err
 	}
 	tmp := path + ".magus.tmp"
-	// Use O_TRUNC so a leftover tmp from a prior crashed apply is replaced
-	// rather than appended to.
-	f, err := os.OpenFile(tmp, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, os.FileMode(mode))
+	// Remove any leftover tmp from a prior crashed apply first (unlink follows
+	// no symlink — it drops a planted symlink itself, not its target), then
+	// create fresh with O_EXCL|O_NOFOLLOW so we never write THROUGH a symlink
+	// planted at the tmp path. The destination is reached via rename(2), which
+	// replaces a symlink at `path` atomically rather than following it — so the
+	// final target can't be redirected either.
+	_ = os.Remove(tmp)
+	f, err := os.OpenFile(tmp, os.O_WRONLY|os.O_CREATE|os.O_EXCL|syscall.O_NOFOLLOW, os.FileMode(mode))
 	if err != nil {
 		return err
 	}
