@@ -78,9 +78,17 @@ func runApply(args []string) int {
 
 	// Manifest↔policy contention: transition any owned path the current policy
 	// now denies to orphaned BEFORE diff, so the sweep skips+warns instead of
-	// deleting it. Persisted with the manifest at the end of apply.
-	for _, path := range policy.OrphanDenied(p, m, now) {
-		fmt.Fprintf(os.Stderr, "warning: %s orphaned (policy now denies it; `magus reclaim` to restore)\n", path)
+	// deleting it. Persist the transition immediately — the sticky-orphan
+	// guarantee must hold even if this apply later aborts (e.g. conflicts-only,
+	// declined at the prompt) before the end-of-apply Save.
+	if orphaned := policy.OrphanDenied(p, m, now); len(orphaned) > 0 {
+		for _, path := range orphaned {
+			fmt.Fprintf(os.Stderr, "warning: %s orphaned (policy now denies it; `magus reclaim` to restore)\n", path)
+		}
+		if err := m.Save(*manifestPath); err != nil {
+			fmt.Fprintf(os.Stderr, "error: failed to persist orphan transitions: %v\n", err)
+			return 1
+		}
 	}
 
 	w := hostfs.OS()

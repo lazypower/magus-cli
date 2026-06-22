@@ -96,7 +96,7 @@ func runReclaim(args []string) int {
 		return 1
 	}
 
-	declared, ok := findFile(parsed, target)
+	declared, ok := findDeclared(parsed, target)
 	if !ok {
 		fmt.Fprintf(os.Stderr, "error: %s is not declared in %s\n", target, butanePath)
 		return 1
@@ -127,8 +127,10 @@ func runReclaim(args []string) int {
 		fmt.Fprintf(os.Stderr, "error: read %s: %v\n", target, err)
 		return 1
 	}
-	onDisk := hashContent(body)
-	declaredHash := hashContent(declared.Contents)
+	// Hash with the resource's equivalence rule (canonical for units/quadlets,
+	// raw for files) so unit/quadlet drift detection matches the manifest hash.
+	onDisk := diff.HashContent(body, declared.diffKind)
+	declaredHash := diff.HashContent(declared.contents, declared.diffKind)
 
 	drifted := onDisk != entry.Hash
 	mismatchedFromIR := onDisk != declaredHash
@@ -176,7 +178,7 @@ func runReclaim(args []string) int {
 
 	if *force && mismatchedFromIR {
 		// Containment already verified above (unconditionally).
-		if err := w.WriteFile(target, declared.Contents, declared.Mode, declared.UID, declared.GID); err != nil {
+		if err := w.WriteFile(target, declared.contents, declared.mode, declared.uid, declared.gid); err != nil {
 			fmt.Fprintf(os.Stderr, "error: write %s: %v\n", target, err)
 			return 1
 		}
@@ -198,6 +200,42 @@ func runReclaim(args []string) int {
 	}
 	fmt.Printf("  ✓ %s  (state: orphaned → active)\n", target)
 	return 0
+}
+
+// declaredTarget is a path's declared desired state, normalized across IR kinds
+// so reclaim can restore a file, a unit body, a drop-in, or a quadlet — every
+// kind OrphanDenied can orphan.
+type declaredTarget struct {
+	contents []byte
+	mode     uint32
+	uid, gid *int
+	diffKind diff.Kind
+}
+
+// findDeclared locates the IR resource that owns the given on-disk path across
+// files, unit bodies, drop-ins, and quadlets.
+func findDeclared(in *ir.IR, path string) (declaredTarget, bool) {
+	for _, f := range in.Files {
+		if f.Path == path {
+			return declaredTarget{f.Contents, f.Mode, f.UID, f.GID, diff.KindFile}, true
+		}
+	}
+	for _, u := range in.Units {
+		if len(u.Contents) > 0 && diff.UnitPath(u.Name) == path {
+			return declaredTarget{[]byte(u.Contents), 0o644, nil, nil, diff.KindUnit}, true
+		}
+		for _, di := range u.DropIns {
+			if diff.DropInPath(u.Name, di.Name) == path {
+				return declaredTarget{[]byte(di.Contents), 0o644, nil, nil, diff.KindUnit}, true
+			}
+		}
+	}
+	for _, q := range in.Quadlets {
+		if q.Path == path {
+			return declaredTarget{q.Contents, q.Mode, q.UID, q.GID, diff.KindQuadlet}, true
+		}
+	}
+	return declaredTarget{}, false
 }
 
 func matchAnnotation(matches bool) string {
