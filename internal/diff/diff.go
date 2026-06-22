@@ -8,7 +8,6 @@ import (
 	"encoding/hex"
 	"fmt"
 	"path/filepath"
-	"strings"
 
 	"gitea.wabash.place/lab/magus-cli/internal/hostfs"
 	"gitea.wabash.place/lab/magus-cli/internal/ir"
@@ -153,25 +152,20 @@ func ContainmentEscape(p *policy.Policy, r hostfs.Resolver, path string) (resolv
 		return "", "path resolution failed (fail-closed): " + err.Error()
 	}
 	if resolved == filepath.Clean(path) {
-		return resolved, "" // no symlink rewrote the path
+		return resolved, "" // no symlink anywhere in the ancestry — nothing rewrote it
 	}
-	// A symlink rewrote the path. It's safe only if the RESOLVED path still
-	// lands within a file_root and clears deny — compared root-resolved-to-
-	// resolved, so a legitimately symlinked file_root (e.g. /var -> /private/var
-	// on some systems) is not a false escape.
-	for _, root := range p.FileRoots {
-		rr, err := r.ResolvePath(root)
-		if err != nil {
-			continue
-		}
-		if resolved == rr || strings.HasPrefix(resolved, rr+string(filepath.Separator)) {
-			if dr := p.DenyRuleReason(resolved); dr != "" {
-				return resolved, fmt.Sprintf("resolves into a denied path via symlink → %s (%s)", resolved, dr)
-			}
-			return resolved, "" // within authority
-		}
+	// A symlink rewrote the path. Re-check the RESOLVED path against the policy
+	// (file_roots membership + deny) using the same lexical matcher policy.Check
+	// uses. This is fail-closed by construction: file_roots and deny.paths are
+	// expressed as real paths, so a redirect outside them — or into a denied
+	// subtree — is caught. (Requires file_roots to be real, non-symlinked paths,
+	// which holds on the bootc target; a file_root that is itself under a symlink
+	// would make every path under it read as an escape — conservative, not
+	// unsafe.)
+	if dr := p.DenyPathReason(resolved); dr != "" {
+		return resolved, fmt.Sprintf("resolves outside authority via symlink → %s (%s)", resolved, dr)
 	}
-	return resolved, fmt.Sprintf("resolves outside file_roots via symlink → %s", resolved)
+	return resolved, ""
 }
 
 // applyContainment downgrades create/update/adopt/DELETE actions whose resolved

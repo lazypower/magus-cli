@@ -132,3 +132,24 @@ func TestOrphanHeldWhenFilePresent(t *testing.T) {
 		t.Fatalf("present orphan not held: action=%s", a.Action)
 	}
 }
+
+func TestContainmentBlocksSymlinkIntoDeniedSubtree(t *testing.T) {
+	// A symlink that redirects an in-root path INTO a denied subtree must be
+	// caught (regression for the reverted resolved-root deny bypass).
+	p := &policy.Policy{
+		Version:   1,
+		FileRoots: []string{"/etc/core"},
+		Deny:      policy.Deny{Paths: []string{"/etc/core/secret/*"}},
+	}
+	in := &ir.IR{Files: []ir.File{{Path: "/etc/core/link/x", Contents: []byte("hi")}}}
+	fs := resolverFS{memFS: memFS{}, resolve: map[string]string{
+		"/etc/core/link/x": "/etc/core/secret/x",
+	}}
+	plan, err := ComputeWithPolicy(p, in, manifest.New(), fs)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if a := findAction(t, plan, "/etc/core/link/x"); a.Action != ActionConflict {
+		t.Fatalf("symlink into denied subtree not blocked: action=%s reason=%q", a.Action, a.Reason)
+	}
+}
