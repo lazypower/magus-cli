@@ -8,11 +8,11 @@ import (
 	"encoding/hex"
 	"fmt"
 	"path/filepath"
-	"strings"
 
 	"gitea.wabash.place/lab/magus-cli/internal/hostfs"
 	"gitea.wabash.place/lab/magus-cli/internal/ir"
 	"gitea.wabash.place/lab/magus-cli/internal/manifest"
+	"gitea.wabash.place/lab/magus-cli/internal/policy"
 )
 
 // Action is the per-resource verb the planner picks.
@@ -115,10 +115,83 @@ func HashContent(b []byte, kind Kind) string {
 }
 
 // Compute joins the three inputs and produces a plan. fsys reads disk state;
-// in normal operation pass hostfs.OS().
-//
-// Files and units are diffed; directories are not yet (PR 6).
+// in normal operation pass hostfs.OS(). This is the policy-unaware entry point
+// (no symlink containment) — production callers use ComputeWithPolicy.
 func Compute(in *ir.IR, m *manifest.Manifest, fsys hostfs.Reader) (*Plan, error) {
+	return ComputeWithPolicy(nil, in, m, fsys)
+}
+
+// ComputeWithPolicy is Compute plus symlink-resolved containment: for path-
+// governed resources (files, directories, quadlets) whose declared path is
+// lexically in-bounds but resolves — through a symlinked ancestor — to a
+// location the policy denies, the action is downgraded to a Conflict so apply
+// skips it rather than writing outside magus's authority. Requires fsys to
+// implement hostfs.Resolver; otherwise containment is a no-op (test fakes).
+// p may be nil to skip containment entirely.
+func ComputeWithPolicy(p *policy.Policy, in *ir.IR, m *manifest.Manifest, fsys hostfs.Reader) (*Plan, error) {
+	plan, err := computeCore(in, m, fsys)
+	if err != nil {
+		return nil, err
+	}
+	if p != nil {
+		applyContainment(p, plan, fsys)
+	}
+	return plan, nil
+}
+
+// ContainmentEscape reports whether mutating path would land outside the
+// policy's authority because a symlink in its resolved ancestry redirects it.
+// It returns the resolved path and a non-empty reason when the mutation
+// escapes — including a fail-closed reason if resolution itself fails. An empty
+// reason means the mutation is safe. Used by both the plan-time downgrade
+// (applyContainment) and the apply-time re-check (which closes the plan→apply
+// TOCTOU window).
+func ContainmentEscape(p *policy.Policy, r hostfs.Resolver, path string) (resolved, reason string) {
+	resolved, err := r.ResolvePath(path)
+	if err != nil {
+		return "", "path resolution failed (fail-closed): " + err.Error()
+	}
+	if resolved == filepath.Clean(path) {
+		return resolved, "" // no symlink rewrote the path
+	}
+	if dr := p.DenyPathReason(resolved); dr != "" {
+		return resolved, fmt.Sprintf("resolves outside authority via symlink → %s (%s)", resolved, dr)
+	}
+	return resolved, ""
+}
+
+// applyContainment downgrades create/update/adopt/DELETE actions whose resolved
+// path escapes the policy to a Conflict (skipped). Scoped to path-governed
+// kinds (file/dir/quadlet); units are governed by unit_patterns (name), not
+// file_roots. Deletes are included because unlink follows a symlinked PARENT —
+// a redirected delete is data loss outside authority.
+func applyContainment(p *policy.Policy, plan *Plan, fsys hostfs.Reader) {
+	r, ok := fsys.(hostfs.Resolver)
+	if !ok {
+		return
+	}
+	for i := range plan.Actions {
+		a := &plan.Actions[i]
+		switch a.Kind {
+		case KindFile, KindDirectory, KindQuadlet:
+		default:
+			continue
+		}
+		switch a.Action {
+		case ActionCreate, ActionUpdate, ActionAdopt, ActionDelete:
+		default:
+			continue
+		}
+		if _, reason := ContainmentEscape(p, r, a.Path); reason != "" {
+			a.Action = ActionConflict
+			a.Reason = reason
+		}
+	}
+}
+
+// computeCore joins the three inputs and produces a plan without policy-aware
+// containment. fsys reads disk state.
+func computeCore(in *ir.IR, m *manifest.Manifest, fsys hostfs.Reader) (*Plan, error) {
 	plan := &Plan{}
 	declared := map[string]bool{}
 
@@ -345,7 +418,20 @@ func diffOrphan(path string, entry manifest.Resource, fsys hostfs.Reader) (Resou
 		ra.UnitName = filepath.Base(path)
 	}
 
+	st, err := fsys.Stat(path)
+	if err != nil {
+		return ra, fmt.Errorf("stat %s: %w", path, err)
+	}
+
 	if entry.State == manifest.StateOrphaned {
+		// Orphans age out: if the underlying file is gone (removed out of band),
+		// drop the orphan entry so the manifest doesn't accumulate forever.
+		// While the file exists, the orphan is held (audit) and skip+warned.
+		if !st.Exists {
+			ra.Action = ActionCleanup
+			ra.Reason = "orphaned entry without on-disk file — aged out"
+			return ra, nil
+		}
 		ra.Action = ActionOrphaned
 		ra.Reason = "orphaned: " + entry.OrphanedReason
 		return ra, nil
@@ -353,10 +439,6 @@ func diffOrphan(path string, entry manifest.Resource, fsys hostfs.Reader) (Resou
 
 	// Active manifest entry, no IR declaration → delete, stale-clean, or
 	// (for directories) skip-with-reason since v1 does not delete dirs.
-	st, err := fsys.Stat(path)
-	if err != nil {
-		return ra, fmt.Errorf("stat %s: %w", path, err)
-	}
 	if !st.Exists {
 		ra.Action = ActionCleanup
 		ra.Reason = "manifest entry without on-disk file"
@@ -391,27 +473,11 @@ func kindFromManifest(k manifest.Kind) Kind {
 	}
 }
 
-// QuadletGeneratedService returns the .service name the systemd-quadlet
-// generator materializes from a quadlet source name. v1 supported types:
-//
-//	foo.container → foo.service
-//	foo.volume    → foo-volume.service
-//	foo.network   → foo-network.service
-//
-// Unsupported types return an empty string and a non-nil error so callers
-// can surface a clear message rather than guess.
+// QuadletGeneratedService is the canonical generated-service mapping, kept here
+// as a thin alias for existing diff/apply call sites; the implementation lives
+// in ir so the policy gate can reuse it without an import cycle.
 func QuadletGeneratedService(quadletName string) (string, error) {
-	ext := filepath.Ext(quadletName)
-	base := strings.TrimSuffix(quadletName, ext)
-	switch ext {
-	case ".container":
-		return base + ".service", nil
-	case ".volume":
-		return base + "-volume.service", nil
-	case ".network":
-		return base + "-network.service", nil
-	}
-	return "", fmt.Errorf("unsupported quadlet type: %s", ext)
+	return ir.QuadletGeneratedService(quadletName)
 }
 
 // UnitPath is the on-disk location magus owns a unit body at.
@@ -426,16 +492,10 @@ func DropInPath(unitName, dropInName string) string {
 	return filepath.Join("/etc/systemd/system", unitName+".d", dropInName)
 }
 
-// UnitNameFromPath recovers the systemd unit name from a managed path.
-// Returns the unit's name for both unit-body paths
-// (/etc/systemd/system/foo.service) and drop-in paths
-// (/etc/systemd/system/foo.service.d/10-magus.conf).
+// UnitNameFromPath is a thin alias; the implementation lives in ir so the
+// policy gate can derive unit names without an import cycle.
 func UnitNameFromPath(p string) string {
-	parent := filepath.Base(filepath.Dir(p))
-	if strings.HasSuffix(parent, ".d") {
-		return strings.TrimSuffix(parent, ".d")
-	}
-	return filepath.Base(p)
+	return ir.UnitNameFromPath(p)
 }
 
 // explainDiff produces a short reason string for update/conflict rows.

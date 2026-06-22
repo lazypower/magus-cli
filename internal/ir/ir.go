@@ -6,6 +6,12 @@
 // "IR contract".
 package ir
 
+import (
+	"fmt"
+	"path/filepath"
+	"strings"
+)
+
 // IR is the parsed, in-memory representation of a Butane file's reconcilable
 // subset.
 type IR struct {
@@ -73,4 +79,42 @@ type Quadlet struct {
 	UID      *int
 	GID      *int
 	Contents []byte
+}
+
+// UnitNameFromPath recovers the systemd unit name from a managed path. It
+// returns the unit's name for both unit-body paths
+// (/etc/systemd/system/foo.service) and drop-in paths
+// (/etc/systemd/system/foo.service.d/10-magus.conf). Lives in ir so the policy
+// gate can derive unit names without importing diff.
+func UnitNameFromPath(p string) string {
+	parent := filepath.Base(filepath.Dir(p))
+	if strings.HasSuffix(parent, ".d") {
+		return strings.TrimSuffix(parent, ".d")
+	}
+	return filepath.Base(p)
+}
+
+// QuadletGeneratedService returns the .service name the systemd-quadlet
+// generator materializes from a quadlet source name. v1 supported types:
+//
+//	foo.container → foo.service
+//	foo.volume    → foo-volume.service
+//	foo.network   → foo-network.service
+//
+// Unsupported types return an empty string and a non-nil error so callers can
+// surface a clear message rather than guess. This lives in ir (not diff) so
+// both diff/apply and the policy gate can derive the generated-service name
+// without an import cycle.
+func QuadletGeneratedService(quadletName string) (string, error) {
+	ext := filepath.Ext(quadletName)
+	base := strings.TrimSuffix(quadletName, ext)
+	switch ext {
+	case ".container":
+		return base + ".service", nil
+	case ".volume":
+		return base + "-volume.service", nil
+	case ".network":
+		return base + "-network.service", nil
+	}
+	return "", fmt.Errorf("unsupported quadlet type: %s", ext)
 }

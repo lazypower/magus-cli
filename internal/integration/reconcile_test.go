@@ -555,6 +555,132 @@ func TestDenyEnforcement(t *testing.T) {
 	}
 }
 
+// TestQuadletDeniedGeneratedService proves the Phase-2 quadlet policy gate: a
+// quadlet whose GENERATED service matches a deny.units rule
+// (core-reconcile.container → core-reconcile.service) is rejected at validate
+// and apply, and the source is never written — even though its path is inside
+// file_roots.
+func TestQuadletDeniedGeneratedService(t *testing.T) {
+	c := setup(t, workloadPolicy)
+
+	bu := butaneHeader + `storage:
+  files:
+    - path: /etc/containers/systemd/core-reconcile.container
+      contents:
+        inline: |
+          [Container]
+          Image=quay.io/podman/hello:latest
+`
+	c.put("/host.bu", bu)
+	vout, vcode := c.magus("validate", "--policy", "/policy.yaml", "/host.bu")
+	if vcode == 0 {
+		t.Fatalf("validate accepted a quadlet generating a denied service:\n%s", vout)
+	}
+	if !strings.Contains(vout, "generated service denied") {
+		t.Errorf("validate error did not cite the denied generated service:\n%s", vout)
+	}
+	aout, acode := c.apply(bu)
+	if acode == 0 {
+		t.Fatalf("apply proceeded on a denied quadlet:\n%s", aout)
+	}
+	if c.exists("/etc/containers/systemd/core-reconcile.container") {
+		t.Errorf("denied quadlet source was written")
+	}
+}
+
+// TestSymlinkEscapeBlocked proves symlink-resolved containment: a path that is
+// lexically inside file_roots but whose parent is a symlink pointing OUT (here
+// /etc/core/evil -> /etc) is downgraded to a conflict and skipped, so magus
+// never writes through the symlink to /etc.
+func TestSymlinkEscapeBlocked(t *testing.T) {
+	c := setup(t, workloadPolicy)
+	c.exec("mkdir", "-p", "/etc/core")
+	// /etc/core/evil -> /etc (an allowed-root child that redirects outside).
+	if out, code := c.exec("ln", "-sfn", "/etc", "/etc/core/evil"); code != 0 {
+		t.Fatalf("create symlink: %s", out)
+	}
+
+	bu := butaneHeader + `storage:
+  files:
+    - path: /etc/core/evil/magus-escape-probe
+      contents:
+        inline: |
+          escaped
+`
+	out, code := c.apply(bu)
+	if code != 2 {
+		t.Fatalf("symlink-escape apply: exit %d (want 2 conflict)\n%s", code, out)
+	}
+	if !strings.Contains(out, "conflict") && !strings.Contains(out, "resolves outside") {
+		t.Errorf("escape not reported as a containment conflict:\n%s", out)
+	}
+	// The write must NOT have landed at the symlink target (/etc/magus-escape-probe).
+	if c.exists("/etc/magus-escape-probe") {
+		t.Errorf("write escaped through the symlink to /etc")
+	}
+}
+
+// TestOrphanOnNewDeny proves manifest↔policy contention: a path magus owns,
+// once the policy denies it (and it leaves the IR), is ORPHANED — left on disk,
+// excluded from reconciliation — not deleted by the sweep. Orphan is sticky.
+func TestOrphanOnNewDeny(t *testing.T) {
+	c := setup(t, workloadPolicy)
+
+	// 1. Create + own the file under the permissive workload policy.
+	bu1 := butaneHeader + `storage:
+  files:
+    - path: /etc/core/svc.env
+      contents:
+        inline: |
+          OWNED=1
+`
+	if out, code := c.apply(bu1); code != 0 {
+		t.Fatalf("initial apply: exit %d\n%s", code, out)
+	}
+
+	// 2. New policy denies the now-owned path; drop it from the IR. Without
+	//    orphaning, the sweep would DELETE it; with orphaning, it's kept.
+	denyPolicy := strings.Replace(workloadPolicy,
+		"    - /etc/core/labmap.env",
+		"    - /etc/core/labmap.env\n    - /etc/core/svc.env", 1)
+	c.put("/policy.yaml", denyPolicy)
+	bu2 := butaneHeader + `storage:
+  files:
+    - path: /etc/core/keep.conf
+      contents:
+        inline: keep
+`
+	out, code := c.apply(bu2)
+	if code != 2 {
+		t.Fatalf("orphan apply: exit %d (want 2)\n%s", code, out)
+	}
+	if !c.exists("/etc/core/svc.env") {
+		t.Fatalf("owned-then-denied file was DELETED; it must be orphaned and kept")
+	}
+	if o := c.manifestOrigin("/etc/core/svc.env"); o == "" {
+		t.Errorf("manifest entry dropped; orphan must retain the entry for audit")
+	}
+	// status must list it in the orphaned array (parsed, not substring-matched).
+	sout, _ := c.magus("status", "--json")
+	var report struct {
+		Orphaned []struct {
+			Path string `json:"path"`
+		} `json:"orphaned"`
+	}
+	if err := json.Unmarshal([]byte(sout), &report); err != nil {
+		t.Fatalf("status --json invalid: %v\n%s", err, sout)
+	}
+	found := false
+	for _, o := range report.Orphaned {
+		if o.Path == "/etc/core/svc.env" {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("status orphaned[] does not include the path:\n%s", sout)
+	}
+}
+
 // TestWorkloadPolicyMatchesCoreImage guards against drift: the embedded
 // workloadPolicy must parse to the SAME boundary (roots, unit patterns, denies)
 // as the live core-image policy, so the harness keeps proving the REAL

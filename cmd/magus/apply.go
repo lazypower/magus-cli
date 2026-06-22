@@ -62,7 +62,7 @@ func runApply(args []string) int {
 		fmt.Fprintf(os.Stderr, "error: %v\n", err)
 		return 1
 	}
-	if violations := policy.Check(p, parsed); len(violations) > 0 {
+	if violations := policy.Check(p, parsed, *manifestPath, *policyPath); len(violations) > 0 {
 		for _, v := range violations {
 			fmt.Fprintf(os.Stderr, "error: %s\n", v)
 		}
@@ -74,8 +74,25 @@ func runApply(args []string) int {
 		return 1
 	}
 
+	now := time.Now().UTC()
+
+	// Manifest↔policy contention: transition any owned path the current policy
+	// now denies to orphaned BEFORE diff, so the sweep skips+warns instead of
+	// deleting it. Persist the transition immediately — the sticky-orphan
+	// guarantee must hold even if this apply later aborts (e.g. conflicts-only,
+	// declined at the prompt) before the end-of-apply Save.
+	if orphaned := policy.OrphanDenied(p, m, now); len(orphaned) > 0 {
+		for _, path := range orphaned {
+			fmt.Fprintf(os.Stderr, "warning: %s orphaned (policy now denies it; `magus reclaim` to restore)\n", path)
+		}
+		if err := m.Save(*manifestPath); err != nil {
+			fmt.Fprintf(os.Stderr, "error: failed to persist orphan transitions: %v\n", err)
+			return 1
+		}
+	}
+
 	w := hostfs.OS()
-	plan, err := diff.Compute(parsed, m, w)
+	plan, err := diff.ComputeWithPolicy(p, parsed, m, w)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "error: %v\n", err)
 		return 1
@@ -97,7 +114,7 @@ func runApply(args []string) int {
 	}
 	fmt.Println()
 
-	result := apply.Apply(plan, parsed, w, m, systemd.OS(), time.Now().UTC())
+	result := apply.ApplyWithPolicy(p, plan, parsed, w, m, systemd.OS(), now)
 	for _, oc := range result.Outcomes {
 		printOutcome(os.Stdout, oc)
 	}

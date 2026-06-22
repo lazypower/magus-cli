@@ -14,6 +14,7 @@ import (
 	"gitea.wabash.place/lab/magus-cli/internal/hostfs"
 	"gitea.wabash.place/lab/magus-cli/internal/ir"
 	"gitea.wabash.place/lab/magus-cli/internal/manifest"
+	"gitea.wabash.place/lab/magus-cli/internal/policy"
 	"gitea.wabash.place/lab/magus-cli/internal/systemd"
 )
 
@@ -115,6 +116,18 @@ type pendingResource struct {
 // Per-resource errors do not halt — the reconciler-pattern posture from the
 // spec. One bad resource does not take the system hostage.
 func Apply(plan *diff.Plan, in *ir.IR, w hostfs.Writer, m *manifest.Manifest, sd systemd.Manager, now time.Time) *Result {
+	return ApplyWithPolicy(nil, plan, in, w, m, sd, now)
+}
+
+// ApplyWithPolicy is Apply plus an apply-time symlink-containment re-check: just
+// before each path-governed write or delete it re-resolves the target and skips
+// it if a symlinked ancestor now redirects it outside policy authority. This
+// closes the plan→apply TOCTOU window (the plan was computed earlier; an ancestor
+// could have been swapped to a symlink since). p may be nil to skip the re-check
+// (unit-test callers). The residual race between this check and the syscall is
+// only exploitable by an attacker who can write a file_root ancestor — i.e.
+// root on the real core-base layout — which is out of scope.
+func ApplyWithPolicy(p *policy.Policy, plan *diff.Plan, in *ir.IR, w hostfs.Writer, m *manifest.Manifest, sd systemd.Manager, now time.Time) *Result {
 	resources := indexResources(in)
 	r := &Result{Outcomes: make([]Outcome, 0, len(plan.Actions))}
 
@@ -154,7 +167,7 @@ func Apply(plan *diff.Plan, in *ir.IR, w hostfs.Writer, m *manifest.Manifest, sd
 				getEvents(a.UnitName).bodyDeleted = true
 			}
 		case isQuadletDelete(a):
-			oc := applyQuadletDelete(a, w, m, sd)
+			oc := applyQuadletDelete(p, a, w, m, sd)
 			r.Outcomes = append(r.Outcomes, oc)
 			if oc.Status == StatusApplied {
 				getQuadletEvents(a.UnitName).bodyDeleted = true
@@ -168,7 +181,7 @@ func Apply(plan *diff.Plan, in *ir.IR, w hostfs.Writer, m *manifest.Manifest, sd
 		if isUnitBodyDelete(a) || isQuadletDelete(a) {
 			continue // handled above
 		}
-		oc := applyOne(a, resources, w, m, now)
+		oc := applyOne(p, a, resources, w, m, now)
 		r.Outcomes = append(r.Outcomes, oc)
 		if oc.Status != StatusApplied {
 			continue
@@ -329,8 +342,13 @@ func applyUnitBodyDelete(a diff.ResourceAction, w hostfs.Writer, m *manifest.Man
 // applyQuadletDelete stops the generated service, then unlinks the quadlet
 // source. Daemon-reload runs later in the batched phase 2 — that's what
 // causes the generator to drop the now-orphaned .service from systemd's view.
-func applyQuadletDelete(a diff.ResourceAction, w hostfs.Writer, m *manifest.Manifest, sd systemd.Manager) Outcome {
+func applyQuadletDelete(p *policy.Policy, a diff.ResourceAction, w hostfs.Writer, m *manifest.Manifest, sd systemd.Manager) Outcome {
 	oc := Outcome{Path: a.Path, Action: a.Action}
+	if reason := containmentReason(p, w, a.Kind, a.Path); reason != "" {
+		oc.Status = StatusSkipped
+		oc.Reason = reason
+		return oc
+	}
 	svc, err := diff.QuadletGeneratedService(a.UnitName)
 	if err != nil {
 		oc.Status = StatusErrored
@@ -353,8 +371,20 @@ func applyQuadletDelete(a diff.ResourceAction, w hostfs.Writer, m *manifest.Mani
 	return oc
 }
 
-func applyOne(a diff.ResourceAction, resources map[string]pendingResource, w hostfs.Writer, m *manifest.Manifest, now time.Time) Outcome {
+func applyOne(p *policy.Policy, a diff.ResourceAction, resources map[string]pendingResource, w hostfs.Writer, m *manifest.Manifest, now time.Time) Outcome {
 	oc := Outcome{Path: a.Path, Action: a.Action}
+
+	// Apply-time containment re-check for path-governed mutations, closing the
+	// plan→apply TOCTOU window. A symlinked ancestor planted since planning that
+	// redirects this path outside authority turns it into a skip, not a write.
+	switch a.Action {
+	case diff.ActionCreate, diff.ActionUpdate, diff.ActionAdopt, diff.ActionDelete:
+		if reason := containmentReason(p, w, a.Kind, a.Path); reason != "" {
+			oc.Status = StatusSkipped
+			oc.Reason = reason
+			return oc
+		}
+	}
 
 	switch a.Action {
 	case diff.ActionSkip:
@@ -511,6 +541,27 @@ func applyDirectoryAdopt(a diff.ResourceAction, r pendingResource, w hostfs.Writ
 	return oc
 }
 
+// containmentReason returns a non-empty skip reason if mutating path would
+// escape policy authority through a symlinked ancestor. Scoped to path-governed
+// kinds (file/dir/quadlet); nil policy or a non-Resolver writer disables it
+// (unit-test path). See diff.ContainmentEscape.
+func containmentReason(p *policy.Policy, w hostfs.Writer, kind diff.Kind, path string) string {
+	if p == nil {
+		return ""
+	}
+	switch kind {
+	case diff.KindFile, diff.KindDirectory, diff.KindQuadlet:
+	default:
+		return ""
+	}
+	r, ok := w.(hostfs.Resolver)
+	if !ok {
+		return ""
+	}
+	_, reason := diff.ContainmentEscape(p, r, path)
+	return reason
+}
+
 // dirHash is the sentinel manifest hash for directory entries. Directories
 // have no content equivalence; the hash field is populated for schema
 // consistency only.
@@ -522,6 +573,11 @@ func diffKind(k manifest.Kind) diff.Kind {
 	switch k {
 	case manifest.KindUnit:
 		return diff.KindUnit
+	case manifest.KindQuadlet:
+		// Quadlets canonicalize like units — without this they'd be stored with
+		// a raw hash while diff/reclaim hash them canonically, making a clean
+		// orphaned quadlet falsely read as drifted on reclaim.
+		return diff.KindQuadlet
 	case manifest.KindDirectory:
 		return diff.KindDirectory
 	default:

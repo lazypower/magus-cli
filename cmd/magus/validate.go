@@ -50,7 +50,7 @@ func runValidate(args []string) int {
 		fmt.Fprintf(os.Stderr, "warning: %s\n", w)
 	}
 
-	violations := policy.Check(p, parsed)
+	violations := policy.Check(p, parsed, *policyPath)
 	for _, v := range violations {
 		fmt.Fprintf(os.Stderr, "error: %s\n", v)
 	}

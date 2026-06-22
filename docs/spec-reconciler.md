@@ -64,6 +64,7 @@ version: 1
 file_roots:
   - /etc/magus.d
   - /etc/systemd/system
+  - /etc/containers/systemd   # quadlet sources (.container/.volume/.network)
   - /var/lib/magus
   - /var/data
 
@@ -84,12 +85,13 @@ deny:
 
 **Hard rules:**
 
-1. **Path allowlist.** No write outside `file_roots`. Paths checked after symlink resolution.
-2. **Unit namespace.** Only manage units matching `unit_patterns`.
+1. **Path allowlist.** No write outside `file_roots`. Paths are checked after symlink resolution: the longest existing ancestor of the target is resolved (`EvalSymlinks`) and the *resolved* path must still fall within `file_roots` and clear `deny` — a symlinked ancestor that redirects an in-bounds-looking path outside the roots is a conflict (skipped), not a write. Resolution failure fails closed. At write time the atomic `tmp`+`rename` and `O_NOFOLLOW` on the temp file ensure Magus never writes *through* a symlink at the destination.
+2. **Unit namespace.** Only manage units matching `unit_patterns`. Quadlet *generated* services (e.g. `ollama.service` from `ollama.container`) are the exception: they are gated by `deny.units` only, **not** `unit_patterns` — they're a side effect of a file under `file_roots`, and requiring a `unit_patterns` match would reject every quadlet under a drop-in-only policy.
 3. **Deny list.** A path or unit matching `deny` is off-limits even if it falls inside `file_roots` / `unit_patterns`. Deny is the explicit "never touch this" override.
 4. **Drop-in precedence.** All drop-ins go to `10-magus.conf` so they sort predictably and are easy to identify.
 5. **Manifest ownership is binding.** Magus reconciles paths it owns (per the manifest), including removing them when they leave the IR. Paths it didn't claim are skipped — even if they fall inside `file_roots`. No "polite reconciliation."
-6. **No privilege escalation.** File modes cannot exceed what the policy declares. No setuid, no world-writable.
+6. **No privilege escalation.** File modes cannot exceed what the policy declares. No setuid, no setgid, no world-writable.
+7. **Reserved state paths.** Magus's own state files — `manifest.json` and `status.json` under `/var/lib/magus` (or wherever `--manifest`/`--status` point) — may **not** be declared in the IR, even though they live inside a `file_root`. Letting an IR manage Magus's ownership ledger would let it clobber the consent contract from outside the contract. A reserved path in the IR is a parse-time validation error.
 
 **Policy contention with the manifest.** When a new policy denies a path Magus currently owns, Magus transitions the manifest entry to an **orphaned** state: the entry is retained (audit trail), no further reconciliation occurs, the path is excluded from diff and apply, a warning is emitted on every plan and apply. The file is left in place — never deleted, never modified.
 
@@ -100,6 +102,13 @@ The cleanup case: if an orphaned path is also removed from disk out-of-band, the
 Policy is a live control plane in this model. A change to `policy.yaml` is a behavioral change, not a config tweak. Treat it like code — review, version, audit.
 
 **Policy contention with the IR.** When the IR declares a path or unit that the policy denies, that's an input-bad case: the user wrote two contradictory things. `magus apply` halts at parse-time validation, exits non-zero, applies nothing. Resolve by editing the IR or the policy.
+
+**Precedence — halt vs orphan.** These two contention rules are deliberately separated by whether the denied path is still declared:
+
+- Denied **and still in the IR** → *halt* (input-bad). The config contradicts itself; a human must fix it. Magus does not orphan here — it touches nothing and exits non-zero.
+- Denied **and owned but no longer in the IR** → *orphan* (sticky). Magus stops reconciling and refuses to delete it.
+
+One consequence is intentional: if you deny a path you still declare, then later remove the deny, management resumes — because the path was never orphaned (apply was halting, not managing). The sticky-orphan guarantee ("removing a deny does not auto-resume") protects paths Magus had *stopped touching*; a path that stayed declared was never in that state. To make a denied path sticky, remove it from the IR (so it orphans) rather than leaving it declared.
 
 ## IR contract
 

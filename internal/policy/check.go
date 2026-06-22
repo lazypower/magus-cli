@@ -25,42 +25,63 @@ func (v Violation) String() string {
 // Check validates ir against p. The slice is empty when ir is fully permitted.
 //
 // Check enforces the hard rules from the spec's Policy section: path allowlist,
-// unit namespace, deny lists, and (where applicable) mode caps. It does not
-// touch the filesystem or check on-disk state — that's the diff stage.
-func Check(p *Policy, ir *ir.IR) []Violation {
+// unit namespace, deny lists, mode caps, and reserved-state-path protection. It
+// does not touch the filesystem or check on-disk state — that's the diff stage
+// (which also applies symlink-resolved containment).
+//
+// extraReserved lists additional reserved paths beyond the built-in magus state
+// files — callers pass the configured --manifest/--status paths so an IR can't
+// declare magus's own ledger even when it's been relocated.
+func Check(p *Policy, in *ir.IR, extraReserved ...string) []Violation {
 	var v []Violation
 
-	for _, f := range ir.Files {
+	for _, f := range in.Files {
 		if reason := p.DenyPathReason(f.Path); reason != "" {
-			v = append(v, Violation{
-				Resource: "file:" + f.Path,
-				Reason:   reason,
-			})
+			v = append(v, Violation{Resource: "file:" + f.Path, Reason: reason})
+		}
+		if reason := ReservedReason(f.Path, extraReserved...); reason != "" {
+			v = append(v, Violation{Resource: "file:" + f.Path, Reason: reason})
 		}
 		if escalated := modeEscalation(f.Mode); escalated != "" {
-			v = append(v, Violation{
-				Resource: "file:" + f.Path,
-				Reason:   escalated,
-			})
+			v = append(v, Violation{Resource: "file:" + f.Path, Reason: escalated})
 		}
 	}
 
-	for _, d := range ir.Directories {
+	for _, d := range in.Directories {
 		if reason := p.DenyPathReason(d.Path); reason != "" {
-			v = append(v, Violation{
-				Resource: "dir:" + d.Path,
-				Reason:   reason,
-			})
+			v = append(v, Violation{Resource: "dir:" + d.Path, Reason: reason})
+		}
+		if reason := ReservedReason(d.Path, extraReserved...); reason != "" {
+			v = append(v, Violation{Resource: "dir:" + d.Path, Reason: reason})
 		}
 		if escalated := modeEscalation(d.Mode); escalated != "" {
-			v = append(v, Violation{
-				Resource: "dir:" + d.Path,
-				Reason:   escalated,
-			})
+			v = append(v, Violation{Resource: "dir:" + d.Path, Reason: escalated})
 		}
 	}
 
-	for _, u := range ir.Units {
+	for _, q := range in.Quadlets {
+		// Quadlet SOURCE path: same path authority as any file (file_roots,
+		// deny.paths, reserved, mode caps).
+		if reason := p.DenyPathReason(q.Path); reason != "" {
+			v = append(v, Violation{Resource: "quadlet:" + q.Path, Reason: reason})
+		}
+		if reason := ReservedReason(q.Path, extraReserved...); reason != "" {
+			v = append(v, Violation{Resource: "quadlet:" + q.Path, Reason: reason})
+		}
+		if escalated := modeEscalation(q.Mode); escalated != "" {
+			v = append(v, Violation{Resource: "quadlet:" + q.Path, Reason: escalated})
+		}
+		// Quadlet GENERATED service: deny.units only (not unit_patterns), so a
+		// quadlet can't materialize a denied service (e.g. core-reconcile.*).
+		svc, err := ir.QuadletGeneratedService(q.Name)
+		if err != nil {
+			v = append(v, Violation{Resource: "quadlet:" + q.Path, Reason: err.Error()})
+		} else if reason := p.DenyServiceReason(svc); reason != "" {
+			v = append(v, Violation{Resource: "quadlet:" + q.Path, Reason: reason})
+		}
+	}
+
+	for _, u := range in.Units {
 		if reason := p.DenyUnitReason(u.Name); reason != "" {
 			v = append(v, Violation{
 				Resource: "unit:" + u.Name,

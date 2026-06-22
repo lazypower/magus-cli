@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"time"
 
 	"gitea.wabash.place/lab/magus-cli/internal/diff"
 	"gitea.wabash.place/lab/magus-cli/internal/hostfs"
@@ -54,7 +55,7 @@ func runPlan(args []string) int {
 		fmt.Fprintf(os.Stderr, "error: %v\n", err)
 		return 1
 	}
-	if violations := policy.Check(p, parsed); len(violations) > 0 {
+	if violations := policy.Check(p, parsed, *manifestPath, *policyPath); len(violations) > 0 {
 		for _, v := range violations {
 			fmt.Fprintf(os.Stderr, "error: %s\n", v)
 		}
@@ -66,7 +67,11 @@ func runPlan(args []string) int {
 		return 1
 	}
 
-	plan, err := diff.Compute(parsed, m, hostfs.OS())
+	// Surface (but don't persist — plan is read-only) any owned paths the
+	// current policy now denies: they show as [orphaned], not as deletes.
+	policy.OrphanDenied(p, m, time.Now().UTC())
+
+	plan, err := diff.ComputeWithPolicy(p, parsed, m, hostfs.OS())
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "error: %v\n", err)
 		return 1
