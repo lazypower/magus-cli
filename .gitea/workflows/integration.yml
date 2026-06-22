@@ -1,18 +1,15 @@
-name: Integration (experimental)
+name: Integration
 
-# EXPERIMENT: prove whether the real-environment integration suite can run on
-# the buildah runner. It is NOT a gate — manual (workflow_dispatch) plus pushes
-# to this experiment branch only, so it can never block a PR.
-#
-# Unknowns being measured:
-#   - rootless `podman run --privileged --systemd=always` booting systemd PID1
-#     in a Firecracker microVM
-#   - the buildah runner having no Go (installed here at runtime)
-#   - the 2 GB memory ceiling and the ~2 GB core-base image pull per ephemeral run
+# Real-environment suite: runs the magus binary inside a privileged systemd
+# container (core-base) on the buildah runner — proven to work (rootful
+# privileged systemd PID1 boots; ~3 min for the full suite). NOT a PR gate: it
+# runs nightly + on demand, so it catches real-env / core-base drift without
+# spending a ~2 GB image pull and a Firecracker slot on every PR. The hermetic
+# `Test` workflow remains the fast PR gate.
 on:
+  schedule:
+    - cron: "0 8 * * *" # nightly ~08:00 UTC
   workflow_dispatch:
-  push:
-    branches: [ci/integration-experiment]
 
 concurrency:
   group: integration-${{ github.ref }}
