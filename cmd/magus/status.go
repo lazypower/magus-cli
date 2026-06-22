@@ -10,29 +10,41 @@ import (
 	"time"
 
 	"gitea.wabash.place/lab/magus-cli/internal/manifest"
+	"gitea.wabash.place/lab/magus-cli/internal/status"
 )
 
 const statusUsage = `magus status — print reconciler state
 
-Usage: magus status [--json] [--manifest <path>]
+Usage: magus status [--json] [--manifest <path>] [--status <path>]
 
-Status reads the manifest only — it does not parse the Butane file or stat
-the disk. Use 'magus plan' for live diff state (conflicts, pending changes).
+Status merges two sources: the manifest (what magus OWNS — managed files and
+orphaned paths) and the observation file written by the last apply (what it
+OBSERVED — unit states, conflicts, errors, timestamp). It does not parse the
+Butane file or stat the disk; use 'magus plan' for live diff state.
 
 Flags:
   --json              Emit machine-readable JSON
   --manifest <path>   Override manifest file (default: /var/lib/magus/manifest.json)
+  --status <path>     Override observation file (default: /var/lib/magus/status.json)
 `
 
-// statusReport is the JSON shape emitted by 'magus status --json'. It maps
-// closely to the spec example, minus the conflicts/errors sections which
-// require state we don't currently persist (tracked as follow-up).
+// statusReport is the JSON shape emitted by 'magus status --json' — the full
+// spec shape, merging manifest ownership with the last-apply observation.
 type statusReport struct {
 	LastApply        *time.Time            `json:"last_apply"`
-	ManagedResources int                   `json:"managed_resources"`
 	Result           string                `json:"result"`
+	ManagedResources int                   `json:"managed_resources"`
+	Units            map[string]string     `json:"units"`
 	Files            map[string]string     `json:"files"`
+	Conflicts        []conflictReportEntry `json:"conflicts"`
 	Orphaned         []orphanedReportEntry `json:"orphaned"`
+	Errors           []errReportEntry      `json:"errors"`
+}
+
+type conflictReportEntry struct {
+	Path      string    `json:"path"`
+	Reason    string    `json:"reason"`
+	FirstSeen time.Time `json:"first_seen"`
 }
 
 type orphanedReportEntry struct {
@@ -41,11 +53,17 @@ type orphanedReportEntry struct {
 	OrphanedAt time.Time `json:"orphaned_at"`
 }
 
+type errReportEntry struct {
+	Path   string `json:"path"`
+	Reason string `json:"reason"`
+}
+
 func runStatus(args []string) int {
 	fs := flag.NewFlagSet("status", flag.ContinueOnError)
 	fs.SetOutput(os.Stderr)
 	fs.Usage = func() { fmt.Fprint(os.Stderr, statusUsage) }
 	manifestPath := fs.String("manifest", manifest.DefaultPath, "manifest file path")
+	statusPath := fs.String("status", status.DefaultPath, "status file path")
 	asJSON := fs.Bool("json", false, "emit JSON")
 	if err := fs.Parse(args); err != nil {
 		return 1
@@ -60,8 +78,9 @@ func runStatus(args []string) int {
 		fmt.Fprintf(os.Stderr, "error: %v\n", err)
 		return 1
 	}
+	obs, _ := status.Load(*statusPath) // nil = never applied; non-fatal
 
-	report := buildStatus(m)
+	report := buildStatus(m, obs)
 	if *asJSON {
 		return emitStatusJSON(os.Stdout, report)
 	}
@@ -69,15 +88,17 @@ func runStatus(args []string) int {
 	return 0
 }
 
-func buildStatus(m *manifest.Manifest) statusReport {
-	// Initialize Orphaned as an empty slice (not nil) so JSON output emits
-	// `[]` rather than `null` — friendlier for downstream consumers that
-	// expect to iterate without a null check.
+// buildStatus merges manifest ownership (files, orphaned, managed count) with
+// the last-apply observation (units, conflicts, errors, timestamp, result).
+func buildStatus(m *manifest.Manifest, obs *status.Report) statusReport {
+	// Empty (non-nil) slices/maps so JSON emits []/{} rather than null.
 	r := statusReport{
-		Files:    map[string]string{},
-		Orphaned: []orphanedReportEntry{},
+		Units:     map[string]string{},
+		Files:     map[string]string{},
+		Conflicts: []conflictReportEntry{},
+		Orphaned:  []orphanedReportEntry{},
+		Errors:    []errReportEntry{},
 	}
-	var lastApply time.Time
 
 	paths := make([]string, 0, len(m.Resources))
 	for p := range m.Resources {
@@ -85,14 +106,15 @@ func buildStatus(m *manifest.Manifest) statusReport {
 	}
 	sort.Strings(paths)
 
+	var manifestLast time.Time
 	for _, p := range paths {
 		entry := m.Resources[p]
 		switch entry.State {
 		case manifest.StateActive:
 			r.Files[p] = "ok"
 			r.ManagedResources++
-			if entry.AppliedAt.After(lastApply) {
-				lastApply = entry.AppliedAt
+			if entry.AppliedAt.After(manifestLast) {
+				manifestLast = entry.AppliedAt
 			}
 		case manifest.StateOrphaned:
 			oa := time.Time{}
@@ -107,16 +129,47 @@ func buildStatus(m *manifest.Manifest) statusReport {
 		}
 	}
 
-	if !lastApply.IsZero() {
-		r.LastApply = &lastApply
+	// Observation-derived fields.
+	obsResult := status.ResultOK
+	if obs != nil {
+		for name, state := range obs.Units {
+			r.Units[name] = state
+		}
+		for _, c := range obs.Conflicts {
+			r.Conflicts = append(r.Conflicts, conflictReportEntry{
+				Path: c.Path, Reason: c.Reason, FirstSeen: c.FirstSeen,
+			})
+		}
+		for _, e := range obs.Errors {
+			r.Errors = append(r.Errors, errReportEntry{Path: e.Path, Reason: e.Reason})
+		}
+		obsResult = obs.Result
+		if !obs.LastApply.IsZero() {
+			la := obs.LastApply
+			r.LastApply = &la
+		}
 	}
-	switch {
-	case len(r.Orphaned) > 0:
-		r.Result = "ok-with-orphans"
-	default:
-		r.Result = "ok"
+	// Fall back to the manifest's newest applied_at when there's no observation
+	// (e.g. a manifest written by a pre-status binary).
+	if r.LastApply == nil && !manifestLast.IsZero() {
+		r.LastApply = &manifestLast
 	}
+
+	r.Result = combineResult(obsResult, len(r.Orphaned) > 0)
 	return r
+}
+
+// combineResult elevates the observed result for orphaned paths (a kind of
+// skip): error dominates; otherwise any conflict/orphan downgrades ok to
+// ok-with-skips.
+func combineResult(obsResult string, hasOrphans bool) string {
+	if obsResult == status.ResultError {
+		return status.ResultError
+	}
+	if hasOrphans && obsResult == status.ResultOK {
+		return status.ResultWithSkips
+	}
+	return obsResult
 }
 
 func emitStatusJSON(w io.Writer, r statusReport) int {
@@ -138,23 +191,47 @@ func emitStatusHuman(w io.Writer, r statusReport) {
 	fmt.Fprintf(w, "managed:     %d resources\n", r.ManagedResources)
 	fmt.Fprintf(w, "result:      %s\n", r.Result)
 
+	if len(r.Units) > 0 {
+		fmt.Fprintln(w, "\nunits:")
+		for _, name := range sortedKeys(r.Units) {
+			fmt.Fprintf(w, "  %s  %s\n", r.Units[name], name)
+		}
+	}
+
 	if r.ManagedResources > 0 {
 		fmt.Fprintln(w, "\nfiles:")
-		paths := make([]string, 0, len(r.Files))
-		for p := range r.Files {
-			paths = append(paths, p)
-		}
-		sort.Strings(paths)
-		for _, p := range paths {
+		for _, p := range sortedKeys(r.Files) {
 			fmt.Fprintf(w, "  ✓ %s\n", p)
+		}
+	}
+
+	if len(r.Conflicts) > 0 {
+		fmt.Fprintln(w, "\nconflicts:")
+		for _, c := range r.Conflicts {
+			fmt.Fprintf(w, "  ✗ %s  (%s, since %s)\n", c.Path, c.Reason, c.FirstSeen.Format(time.RFC3339))
 		}
 	}
 
 	if len(r.Orphaned) > 0 {
 		fmt.Fprintln(w, "\norphaned:")
 		for _, o := range r.Orphaned {
-			fmt.Fprintf(w, "  ! %s  (%s, since %s)\n",
-				o.Path, o.Reason, o.OrphanedAt.Format(time.RFC3339))
+			fmt.Fprintf(w, "  ! %s  (%s, since %s)\n", o.Path, o.Reason, o.OrphanedAt.Format(time.RFC3339))
 		}
 	}
+
+	if len(r.Errors) > 0 {
+		fmt.Fprintln(w, "\nerrors:")
+		for _, e := range r.Errors {
+			fmt.Fprintf(w, "  ✗ %s  (%s)\n", e.Path, e.Reason)
+		}
+	}
+}
+
+func sortedKeys(m map[string]string) []string {
+	keys := make([]string, 0, len(m))
+	for k := range m {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	return keys
 }

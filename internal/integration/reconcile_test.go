@@ -357,6 +357,10 @@ func TestStandaloneUnit(t *testing.T) {
 	if a := c.isActive("magus-smoke.service"); a != "active" {
 		t.Errorf("is-active = %q, want active", a)
 	}
+	// The observation file records the unit's observed runtime state.
+	if r := c.statusJSON(t); r.Units["magus-smoke.service"] != "active" {
+		t.Errorf("status units[magus-smoke.service] = %q, want active (units=%+v)", r.Units["magus-smoke.service"], r.Units)
+	}
 }
 
 // TestQuadlet proves quadlet generation: a .container source under the workload
@@ -552,6 +556,105 @@ func TestDenyEnforcement(t *testing.T) {
 	}
 	if c.exists("/etc/core/allowed.conf") {
 		t.Errorf("allowed neighbor was written — deny was treated as per-resource skip, not a halt")
+	}
+}
+
+// statusJSON parses `magus status --json` from inside the container.
+func (c *container) statusJSON(t *testing.T) struct {
+	LastApply *string           `json:"last_apply"`
+	Result    string            `json:"result"`
+	Managed   int               `json:"managed_resources"`
+	Units     map[string]string `json:"units"`
+	Files     map[string]string `json:"files"`
+	Conflicts []struct {
+		Path      string `json:"path"`
+		FirstSeen string `json:"first_seen"`
+	} `json:"conflicts"`
+	Errors []struct {
+		Path string `json:"path"`
+	} `json:"errors"`
+} {
+	t.Helper()
+	var report struct {
+		LastApply *string           `json:"last_apply"`
+		Result    string            `json:"result"`
+		Managed   int               `json:"managed_resources"`
+		Units     map[string]string `json:"units"`
+		Files     map[string]string `json:"files"`
+		Conflicts []struct {
+			Path      string `json:"path"`
+			FirstSeen string `json:"first_seen"`
+		} `json:"conflicts"`
+		Errors []struct {
+			Path string `json:"path"`
+		} `json:"errors"`
+	}
+	out, code := c.magus("status", "--json")
+	if code != 0 {
+		t.Fatalf("status --json: exit %d\n%s", code, out)
+	}
+	if err := json.Unmarshal([]byte(out), &report); err != nil {
+		t.Fatalf("status --json invalid: %v\n%s", err, out)
+	}
+	return report
+}
+
+// TestStatusObservation proves the Phase-4 observation file end-to-end: after an
+// apply, `magus status --json` reports last_apply, the managed file, the
+// conflict, and result=ok-with-skips — and a recurring conflict's first_seen is
+// carried forward across applies (not reset).
+func TestStatusObservation(t *testing.T) {
+	c := setup(t, workloadPolicy)
+	c.put("/etc/core/conf.env", "OLD=1\n") // unowned → conflict
+
+	bu := butaneHeader + `storage:
+  files:
+    - path: /etc/core/app.conf
+      contents:
+        inline: |
+          hello
+    - path: /etc/core/conf.env
+      contents:
+        inline: |
+          NEW=1
+`
+	if out, code := c.apply(bu); code != 2 {
+		t.Fatalf("apply: exit %d (want 2)\n%s", code, out)
+	}
+
+	r := c.statusJSON(t)
+	if r.LastApply == nil || *r.LastApply == "" {
+		t.Errorf("status missing last_apply")
+	}
+	if r.Result != "ok-with-skips" {
+		t.Errorf("result = %q, want ok-with-skips", r.Result)
+	}
+	if _, ok := r.Files["/etc/core/app.conf"]; !ok {
+		t.Errorf("managed file not in status files: %+v", r.Files)
+	}
+	var firstSeen string
+	for _, cf := range r.Conflicts {
+		if cf.Path == "/etc/core/conf.env" {
+			firstSeen = cf.FirstSeen
+		}
+	}
+	if firstSeen == "" {
+		t.Fatalf("conflict /etc/core/conf.env not reported with first_seen: %+v", r.Conflicts)
+	}
+
+	// Re-apply: the conflict persists; its first_seen must be carried forward.
+	if _, code := c.apply(bu); code != 2 {
+		t.Fatalf("second apply exit %d", code)
+	}
+	r2 := c.statusJSON(t)
+	var firstSeen2 string
+	for _, cf := range r2.Conflicts {
+		if cf.Path == "/etc/core/conf.env" {
+			firstSeen2 = cf.FirstSeen
+		}
+	}
+	if firstSeen2 != firstSeen {
+		t.Errorf("first_seen not carried forward: %q → %q", firstSeen, firstSeen2)
 	}
 }
 

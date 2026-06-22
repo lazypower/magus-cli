@@ -134,12 +134,17 @@ var reservedStatePaths = []string{
 }
 
 // ReservedReason returns a non-empty reason if path is one of magus's reserved
-// state files (the built-in set plus any extra paths passed in — typically the
-// configured --manifest/--status overrides). Comparison is on the cleaned path.
+// state files — the built-in set plus any extra paths passed in (typically the
+// configured --manifest/--status/--policy overrides), AND their ".magus.tmp"
+// write-staging siblings. The tmp siblings must be reserved too: otherwise an IR
+// could pre-create one with an attacker-chosen owner/mode that the atomic
+// tmp+rename would then carry onto the real state file. Comparison is on the
+// cleaned path.
 func ReservedReason(path string, extra ...string) string {
 	clean := filepath.Clean(path)
 	for _, r := range append(reservedStatePaths, extra...) {
-		if clean == filepath.Clean(r) {
+		rc := filepath.Clean(r)
+		if clean == rc || clean == rc+".magus.tmp" {
 			return "reserved magus state path (cannot be declared in the IR)"
 		}
 	}

@@ -49,6 +49,11 @@ type Outcome struct {
 // Result is the collected outcome of one apply call.
 type Result struct {
 	Outcomes []Outcome
+	// UnitStates is the observed is-active state of each managed unit and
+	// quadlet generated service after apply settled (name → "active"/"inactive"/
+	// …). Captured for the status observation file; empty when systemd is
+	// unavailable.
+	UnitStates map[string]string
 }
 
 // Counts groups outcomes by Status for the summary line.
@@ -244,7 +249,39 @@ func ApplyWithPolicy(p *policy.Policy, plan *diff.Plan, in *ir.IR, w hostfs.Writ
 		r.Outcomes = append(r.Outcomes, outcomes...)
 	}
 
+	// Phase 4: observe the runtime state of every managed unit/quadlet service
+	// for the status file.
+	r.UnitStates = ObserveUnits(in, sd)
+
 	return r
+}
+
+// ObserveUnits queries the is-active state of every IR-declared unit and quadlet
+// generated service (name → "active"/"inactive"/"unknown"). Best-effort and
+// read-only — used to populate the status observation, including on a no-op
+// apply where the full Apply pass didn't run.
+func ObserveUnits(in *ir.IR, sd systemd.Manager) map[string]string {
+	out := map[string]string{}
+	for _, u := range in.Units {
+		out[u.Name] = activeState(sd, u.Name)
+	}
+	for _, q := range in.Quadlets {
+		if svc, err := diff.QuadletGeneratedService(q.Name); err == nil {
+			out[svc] = activeState(sd, svc)
+		}
+	}
+	return out
+}
+
+// activeState returns the observed runtime state of a service (active/inactive/
+// failed/activating/…) or "unknown" if it can't be determined. Observation
+// only — never fatal.
+func activeState(sd systemd.Manager, name string) string {
+	state, err := sd.ActiveState(name)
+	if err != nil {
+		return "unknown"
+	}
+	return state
 }
 
 func indexResources(in *ir.IR) map[string]pendingResource {

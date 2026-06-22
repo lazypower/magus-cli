@@ -48,6 +48,11 @@ type Manager interface {
 	IsEnabled(unit string) (Enablement, error)
 	// IsActive reports whether the unit is currently running.
 	IsActive(unit string) (bool, error)
+	// ActiveState returns the raw is-active state ("active", "inactive",
+	// "failed", "activating", …) or "unknown" when it can't be determined.
+	// Used for the status observation, which wants the real state, not a
+	// boolean.
+	ActiveState(unit string) (string, error)
 	// Enable persists the enablement symlinks but does not start the unit.
 	Enable(unit string) error
 	// EnableNow enables and starts the unit in one operation.
@@ -127,6 +132,18 @@ func (m *osManager) IsActive(unit string) (bool, error) {
 	return out == "active", nil
 }
 
+func (m *osManager) ActiveState(unit string) (string, error) {
+	// is-active exits non-zero for non-active states but still prints the
+	// state on stdout — parse the text, ignore the exit code. Only accept the
+	// known vocabulary; anything else (e.g. systemd unreachable) is "unknown".
+	out, _ := m.runOutput("is-active", unit)
+	switch out {
+	case "active", "inactive", "failed", "activating", "deactivating", "reloading":
+		return out, nil
+	}
+	return "unknown", nil
+}
+
 // unavailableManager is the substitute returned when systemctl isn't on PATH.
 type unavailableManager struct{}
 
@@ -134,9 +151,10 @@ func (unavailableManager) DaemonReload() error { return ErrUnavailable }
 func (unavailableManager) IsEnabled(string) (Enablement, error) {
 	return EnablementUnknown, ErrUnavailable
 }
-func (unavailableManager) IsActive(string) (bool, error) { return false, ErrUnavailable }
-func (unavailableManager) Enable(string) error           { return ErrUnavailable }
-func (unavailableManager) EnableNow(string) error        { return ErrUnavailable }
-func (unavailableManager) Disable(string) error          { return ErrUnavailable }
-func (unavailableManager) DisableNow(string) error       { return ErrUnavailable }
-func (unavailableManager) Restart(string) error          { return ErrUnavailable }
+func (unavailableManager) IsActive(string) (bool, error)      { return false, ErrUnavailable }
+func (unavailableManager) ActiveState(string) (string, error) { return "unknown", ErrUnavailable }
+func (unavailableManager) Enable(string) error                { return ErrUnavailable }
+func (unavailableManager) EnableNow(string) error             { return ErrUnavailable }
+func (unavailableManager) Disable(string) error               { return ErrUnavailable }
+func (unavailableManager) DisableNow(string) error            { return ErrUnavailable }
+func (unavailableManager) Restart(string) error               { return ErrUnavailable }
