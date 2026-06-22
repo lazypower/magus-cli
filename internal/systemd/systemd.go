@@ -108,40 +108,49 @@ func (m *osManager) IsEnabled(unit string) (Enablement, error) {
 	out, _ := m.runOutput("is-enabled", unit)
 	// systemctl is-enabled exits non-zero for "disabled" but still prints
 	// the state on stdout — so we ignore the error and parse the text.
-	switch out {
-	case "enabled", "enabled-runtime", "alias", "indirect":
-		return EnablementEnabled, nil
-	case "disabled":
-		return EnablementDisabled, nil
-	case "masked", "masked-runtime":
-		return EnablementMasked, nil
-	case "static", "transient", "generated":
-		return EnablementStatic, nil
-	}
-	if strings.Contains(out, "not loaded") || strings.Contains(out, "No such file") {
-		return EnablementNotFound, nil
-	}
-	return EnablementUnknown, nil
+	return parseEnablement(out), nil
 }
 
 func (m *osManager) IsActive(unit string) (bool, error) {
 	out, _ := m.runOutput("is-active", unit)
-	// is-active prints "active" for active and otherwise — we only care
-	// about the boolean. Non-active values include "inactive", "failed",
-	// "activating", "deactivating".
-	return out == "active", nil
+	return parseActiveState(out) == "active", nil
 }
 
 func (m *osManager) ActiveState(unit string) (string, error) {
 	// is-active exits non-zero for non-active states but still prints the
-	// state on stdout — parse the text, ignore the exit code. Only accept the
-	// known vocabulary; anything else (e.g. systemd unreachable) is "unknown".
+	// state on stdout — parse the text, ignore the exit code.
 	out, _ := m.runOutput("is-active", unit)
+	return parseActiveState(out), nil
+}
+
+// parseEnablement maps `systemctl is-enabled` output to the Enablement subset
+// magus reasons over. Pure so it's unit-testable without systemctl.
+func parseEnablement(out string) Enablement {
+	switch out {
+	case "enabled", "enabled-runtime", "alias", "indirect":
+		return EnablementEnabled
+	case "disabled":
+		return EnablementDisabled
+	case "masked", "masked-runtime":
+		return EnablementMasked
+	case "static", "transient", "generated":
+		return EnablementStatic
+	}
+	if strings.Contains(out, "not loaded") || strings.Contains(out, "No such file") {
+		return EnablementNotFound
+	}
+	return EnablementUnknown
+}
+
+// parseActiveState maps `systemctl is-active` output to the known state
+// vocabulary, or "unknown" for anything unexpected (e.g. systemd unreachable
+// noise on stderr). Pure so it's unit-testable without systemctl.
+func parseActiveState(out string) string {
 	switch out {
 	case "active", "inactive", "failed", "activating", "deactivating", "reloading":
-		return out, nil
+		return out
 	}
-	return "unknown", nil
+	return "unknown"
 }
 
 // unavailableManager is the substitute returned when systemctl isn't on PATH.
