@@ -98,7 +98,7 @@ func runApply(args []string) int {
 		return 1
 	}
 
-	printPlan(os.Stdout, butanePath, plan)
+	printPlan(os.Stdout, butanePath, plan, nil)
 
 	changes, conflicts := planCounts(plan)
 	if changes == 0 && conflicts == 0 {

@@ -8,6 +8,7 @@ import (
 	"encoding/hex"
 	"fmt"
 	"path/filepath"
+	"strings"
 
 	"gitea.wabash.place/lab/magus-cli/internal/hostfs"
 	"gitea.wabash.place/lab/magus-cli/internal/ir"
@@ -154,10 +155,23 @@ func ContainmentEscape(p *policy.Policy, r hostfs.Resolver, path string) (resolv
 	if resolved == filepath.Clean(path) {
 		return resolved, "" // no symlink rewrote the path
 	}
-	if dr := p.DenyPathReason(resolved); dr != "" {
-		return resolved, fmt.Sprintf("resolves outside authority via symlink → %s (%s)", resolved, dr)
+	// A symlink rewrote the path. It's safe only if the RESOLVED path still
+	// lands within a file_root and clears deny — compared root-resolved-to-
+	// resolved, so a legitimately symlinked file_root (e.g. /var -> /private/var
+	// on some systems) is not a false escape.
+	for _, root := range p.FileRoots {
+		rr, err := r.ResolvePath(root)
+		if err != nil {
+			continue
+		}
+		if resolved == rr || strings.HasPrefix(resolved, rr+string(filepath.Separator)) {
+			if dr := p.DenyRuleReason(resolved); dr != "" {
+				return resolved, fmt.Sprintf("resolves into a denied path via symlink → %s (%s)", resolved, dr)
+			}
+			return resolved, "" // within authority
+		}
 	}
-	return resolved, ""
+	return resolved, fmt.Sprintf("resolves outside file_roots via symlink → %s", resolved)
 }
 
 // applyContainment downgrades create/update/adopt/DELETE actions whose resolved

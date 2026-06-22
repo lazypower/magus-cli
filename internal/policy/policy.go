@@ -110,6 +110,19 @@ func (p *Policy) AllowsUnit(unit string) bool {
 	return true
 }
 
+// DenyRuleReason returns the deny.paths rule blocking path, or "" — WITHOUT the
+// file_roots membership check. Callers that have already verified containment
+// (e.g. symlink resolution against resolved roots) use this to apply deny rules
+// to the resolved path.
+func (p *Policy) DenyRuleReason(path string) string {
+	for _, d := range p.Deny.Paths {
+		if pathMatches(d, path) {
+			return fmt.Sprintf("denied by policy (rule: %s)", d)
+		}
+	}
+	return ""
+}
+
 // DenyPathReason returns the deny rule that blocks path, or "" if not denied.
 // Useful for generating actionable error messages.
 func (p *Policy) DenyPathReason(path string) string {

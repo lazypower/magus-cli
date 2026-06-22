@@ -555,6 +555,40 @@ func TestDenyEnforcement(t *testing.T) {
 	}
 }
 
+// TestPlanExplain proves the Phase-3 --explain contract end-to-end: a conflict
+// (unowned) row shows hashes only by default — the unowned file's content is
+// never written to output — and -v reveals the unified diff.
+func TestPlanExplain(t *testing.T) {
+	c := setup(t, workloadPolicy)
+	c.put("/etc/core/conf.env", "SECRET_OLD=1\n")
+	bu := butaneHeader + `storage:
+  files:
+    - path: /etc/core/conf.env
+      contents:
+        inline: |
+          SECRET_NEW=1
+`
+	c.put("/host.bu", bu)
+
+	// Default: hashes only, no leaked content.
+	out, code := c.magus("plan", "--explain", "--policy", "/policy.yaml", "/host.bu")
+	if code != 2 {
+		t.Fatalf("plan --explain: exit %d (want 2)\n%s", code, out)
+	}
+	if !strings.Contains(out, "hashes only") || !strings.Contains(out, "sha256:") {
+		t.Errorf("conflict not rendered hashes-only:\n%s", out)
+	}
+	if strings.Contains(out, "SECRET_OLD") || strings.Contains(out, "SECRET_NEW") {
+		t.Errorf("--explain leaked unowned conflict content without -v:\n%s", out)
+	}
+
+	// -v reveals the diff.
+	vout, _ := c.magus("plan", "--explain", "-v", "--policy", "/policy.yaml", "/host.bu")
+	if !strings.Contains(vout, "-SECRET_OLD=1") || !strings.Contains(vout, "+SECRET_NEW=1") {
+		t.Errorf("-v did not reveal the conflict diff:\n%s", vout)
+	}
+}
+
 // TestQuadletDeniedGeneratedService proves the Phase-2 quadlet policy gate: a
 // quadlet whose GENERATED service matches a deny.units rule
 // (core-reconcile.container → core-reconcile.service) is rejected at validate
