@@ -403,7 +403,16 @@ Applied 4 changes, 1 conflict (skipped), 0 errors.  exit 2
 
 ### `magus status`
 
-Structured surface for humans and LLMs.
+Structured surface for humans and LLMs. `status` merges two sources: the
+**manifest** (`/var/lib/magus/manifest.json` — what Magus *owns*: managed files,
+orphaned paths) and the **observation file** (`/var/lib/magus/status.json` —
+what the last apply *observed*: `last_apply`, `result`, per-unit runtime state,
+`conflicts` with a carried-forward `first_seen`, and `errors`). The observation
+file is written atomically at the end of every apply (and refreshed on a no-op
+apply so `last_apply` stays current under a timer); a missing or unreadable one
+is treated as "never applied", not an error — it's a cache, not a contract. The
+split keeps the manifest a pure ownership ledger: conflicts and errors are not
+owned resources.
 
 ```
 $ magus status --json

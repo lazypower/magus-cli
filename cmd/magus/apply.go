@@ -15,6 +15,7 @@ import (
 	"gitea.wabash.place/lab/magus-cli/internal/ir"
 	"gitea.wabash.place/lab/magus-cli/internal/manifest"
 	"gitea.wabash.place/lab/magus-cli/internal/policy"
+	"gitea.wabash.place/lab/magus-cli/internal/status"
 	"gitea.wabash.place/lab/magus-cli/internal/systemd"
 )
 
@@ -42,6 +43,7 @@ func runApply(args []string) int {
 	fs.Usage = func() { fmt.Fprint(os.Stderr, applyUsage) }
 	policyPath := fs.String("policy", policy.DefaultPath, "policy file path")
 	manifestPath := fs.String("manifest", manifest.DefaultPath, "manifest file path")
+	statusPath := fs.String("status", status.DefaultPath, "status observation file path")
 	yes := fs.Bool("yes", false, "skip confirmation prompt")
 	if err := fs.Parse(args); err != nil {
 		return 1
@@ -62,7 +64,7 @@ func runApply(args []string) int {
 		fmt.Fprintf(os.Stderr, "error: %v\n", err)
 		return 1
 	}
-	if violations := policy.Check(p, parsed, *manifestPath, *policyPath); len(violations) > 0 {
+	if violations := policy.Check(p, parsed, *manifestPath, *policyPath, *statusPath); len(violations) > 0 {
 		for _, v := range violations {
 			fmt.Fprintf(os.Stderr, "error: %s\n", v)
 		}
@@ -92,6 +94,7 @@ func runApply(args []string) int {
 	}
 
 	w := hostfs.OS()
+	sd := systemd.OS()
 	plan, err := diff.ComputeWithPolicy(p, parsed, m, w)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "error: %v\n", err)
@@ -102,6 +105,9 @@ func runApply(args []string) int {
 
 	changes, conflicts := planCounts(plan)
 	if changes == 0 && conflicts == 0 {
+		// Already converged. Refresh the observation (keeps last_apply current
+		// on a timer that mostly runs no-op applies) and exit.
+		saveStatusObservation(*statusPath, plan, nil, apply.ObserveUnits(parsed, sd), now)
 		fmt.Println("\nNothing to apply.")
 		return 0
 	}
@@ -114,7 +120,7 @@ func runApply(args []string) int {
 	}
 	fmt.Println()
 
-	result := apply.ApplyWithPolicy(p, plan, parsed, w, m, systemd.OS(), now)
+	result := apply.ApplyWithPolicy(p, plan, parsed, w, m, sd, now)
 	for _, oc := range result.Outcomes {
 		printOutcome(os.Stdout, oc)
 	}
@@ -124,11 +130,65 @@ func runApply(args []string) int {
 		return 1
 	}
 
+	saveStatusObservation(*statusPath, plan, result, nil, now)
+
 	a, _, s, e := result.Counts()
 	fmt.Println()
 	fmt.Printf("Applied %d changes, %d skipped, %d errors.  exit %d\n",
 		a, s, e, result.ExitCode())
 	return result.ExitCode()
+}
+
+// saveStatusObservation writes the post-apply observation file. Conflicts are
+// taken from the plan (so they're recorded whether or not Apply ran); errors and
+// the result come from the apply Result when Apply ran, otherwise it's a clean
+// no-op (result=ok) with the supplied observed unit states. first_seen for
+// recurring conflicts is carried forward by status.Build. A write failure is a
+// warning, never fatal — the apply already succeeded and the manifest is saved.
+func saveStatusObservation(statusPath string, plan *diff.Plan, result *apply.Result, fallbackUnits map[string]string, now time.Time) {
+	conflicts := []status.Conflict{}
+	for _, a := range plan.Actions {
+		if a.Action == diff.ActionConflict {
+			conflicts = append(conflicts, status.Conflict{Path: a.Path, Reason: a.Reason})
+		}
+	}
+
+	errs := []status.ErrEntry{}
+	res := status.ResultOK
+	units := fallbackUnits
+	if result != nil {
+		for _, oc := range result.Outcomes {
+			if oc.Status == apply.StatusErrored {
+				msg := oc.Reason
+				if oc.Err != nil {
+					msg = oc.Err.Error()
+				}
+				errs = append(errs, status.ErrEntry{Path: oc.Path, Reason: msg})
+			}
+		}
+		res = statusResultString(result.ExitCode())
+		units = result.UnitStates
+	} else if len(conflicts) > 0 {
+		res = status.ResultWithSkips
+	}
+
+	prior, _ := status.Load(statusPath)
+	rep := status.Build(now, res, units, conflicts, errs, prior)
+	if err := rep.Save(statusPath); err != nil {
+		fmt.Fprintf(os.Stderr, "warning: failed to write status observation: %v\n", err)
+	}
+}
+
+// statusResultString maps an apply exit code to the observation result string.
+func statusResultString(code int) string {
+	switch code {
+	case 0:
+		return status.ResultOK
+	case 2:
+		return status.ResultWithSkips
+	default:
+		return status.ResultError
+	}
 }
 
 // planCounts splits actions into "changes that will run" vs "conflicts that
