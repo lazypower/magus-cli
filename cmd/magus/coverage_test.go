@@ -97,7 +97,9 @@ func TestRunBadArgs(t *testing.T) {
 		{"status-extra", func() int { return runStatus([]string{"extra"}) }},
 		{"adopt-oneargs", func() int { return runAdopt([]string{"only-one"}) }},
 		{"reclaim-oneargs", func() int { return runReclaim([]string{"only-one"}) }},
-		{"plan-badflag", func() int { return runPlan([]string{"--nope"}) }},
+		// Positional supplied so the ONLY reason for exit 1 is the unknown flag,
+		// not a missing <butane-source>.
+		{"plan-badflag", func() int { return runPlan([]string{"--nope", "x.bu"}) }},
 	}
 	for _, c := range cases {
 		if code := c.fn(); code != 1 {
