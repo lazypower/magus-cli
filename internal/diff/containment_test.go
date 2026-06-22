@@ -3,6 +3,7 @@ package diff
 import (
 	"errors"
 	"testing"
+	"time"
 
 	"gitea.wabash.place/lab/magus-cli/internal/ir"
 	"gitea.wabash.place/lab/magus-cli/internal/manifest"
@@ -85,5 +86,49 @@ func TestContainmentNoOpWithoutResolver(t *testing.T) {
 	}
 	if a := findAction(t, plan, "/etc/core/x"); a.Action != ActionCreate {
 		t.Fatalf("containment ran without a Resolver: action=%s", a.Action)
+	}
+}
+
+func TestContainmentBlocksEscapingDelete(t *testing.T) {
+	// An owned file, omitted from IR, would normally be deleted — but its parent
+	// is now a symlink redirecting outside authority, so the delete is skipped.
+	m := manifest.New()
+	m.PutActive("/etc/core/link/x", manifest.KindFile, "sha256:x", manifest.OriginCreate, time.Unix(1, 0))
+	fs := resolverFS{
+		memFS:   memFS{"/etc/core/link/x": memFile{contents: []byte("x"), mode: 0o644}},
+		resolve: map[string]string{"/etc/core/link/x": "/etc/x"},
+	}
+	plan, err := ComputeWithPolicy(corePolicy(), &ir.IR{}, m, fs)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if a := findAction(t, plan, "/etc/core/link/x"); a.Action != ActionConflict {
+		t.Fatalf("escaping delete not blocked: action=%s reason=%q", a.Action, a.Reason)
+	}
+}
+
+func TestOrphanCleanupWhenFileGone(t *testing.T) {
+	m := manifest.New()
+	m.PutActive("/etc/core/gone", manifest.KindFile, "sha256:x", manifest.OriginCreate, time.Unix(1, 0))
+	m.Orphan("/etc/core/gone", "policy deny: x", time.Unix(2, 0))
+	plan, err := Compute(&ir.IR{}, m, memFS{}) // file absent on disk
+	if err != nil {
+		t.Fatal(err)
+	}
+	if a := findAction(t, plan, "/etc/core/gone"); a.Action != ActionCleanup {
+		t.Fatalf("absent orphan not aged out: action=%s", a.Action)
+	}
+}
+
+func TestOrphanHeldWhenFilePresent(t *testing.T) {
+	m := manifest.New()
+	m.PutActive("/etc/core/keep", manifest.KindFile, "sha256:x", manifest.OriginCreate, time.Unix(1, 0))
+	m.Orphan("/etc/core/keep", "policy deny: x", time.Unix(2, 0))
+	plan, err := Compute(&ir.IR{}, m, memFS{"/etc/core/keep": memFile{contents: []byte("x"), mode: 0o644}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if a := findAction(t, plan, "/etc/core/keep"); a.Action != ActionOrphaned {
+		t.Fatalf("present orphan not held: action=%s", a.Action)
 	}
 }

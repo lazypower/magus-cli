@@ -106,7 +106,7 @@ func runApply(args []string) int {
 	}
 	fmt.Println()
 
-	result := apply.Apply(plan, parsed, w, m, systemd.OS(), now)
+	result := apply.ApplyWithPolicy(p, plan, parsed, w, m, systemd.OS(), now)
 	for _, oc := range result.Outcomes {
 		printOutcome(os.Stdout, oc)
 	}

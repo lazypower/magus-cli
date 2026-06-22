@@ -61,3 +61,44 @@ deny:
 		t.Errorf("orphaned_at was not preserved: %+v", r.OrphanedAt)
 	}
 }
+
+func TestOrphanDeniedUnitByDenyUnits(t *testing.T) {
+	p := mustLoad(t, `
+version: 1
+file_roots: ["/etc/systemd/system"]
+unit_patterns: ["magus-*", "core-reconcile.*"]
+deny:
+  units: ["core-reconcile.*"]
+`)
+	m := manifest.New()
+	now := time.Unix(1000, 0).UTC()
+	// An owned unit whose name is now denied by deny.units must be ORPHANED,
+	// not deleted by the sweep.
+	m.PutActive("/etc/systemd/system/core-reconcile.service",
+		manifest.KindUnit, "sha256:x", manifest.OriginCreate, now)
+
+	OrphanDenied(p, m, time.Unix(2000, 0).UTC())
+	if r, _ := m.Get("/etc/systemd/system/core-reconcile.service"); r.State != manifest.StateOrphaned {
+		t.Errorf("deny.units'd owned unit not orphaned: %+v", r)
+	}
+}
+
+func TestOrphanDeniedQuadletByGeneratedService(t *testing.T) {
+	p := mustLoad(t, `
+version: 1
+file_roots: ["/etc/containers/systemd"]
+unit_patterns: ["*.d/10-magus.conf"]
+deny:
+  units: ["core-reconcile.*"]
+`)
+	m := manifest.New()
+	now := time.Unix(1000, 0).UTC()
+	// Owned quadlet whose GENERATED service (core-reconcile.service) is denied.
+	m.PutActive("/etc/containers/systemd/core-reconcile.container",
+		manifest.KindQuadlet, "sha256:x", manifest.OriginCreate, now)
+
+	OrphanDenied(p, m, time.Unix(2000, 0).UTC())
+	if r, _ := m.Get("/etc/containers/systemd/core-reconcile.container"); r.State != manifest.StateOrphaned {
+		t.Errorf("quadlet generating a denied service not orphaned: %+v", r)
+	}
+}

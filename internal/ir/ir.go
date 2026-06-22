@@ -81,6 +81,19 @@ type Quadlet struct {
 	Contents []byte
 }
 
+// UnitNameFromPath recovers the systemd unit name from a managed path. It
+// returns the unit's name for both unit-body paths
+// (/etc/systemd/system/foo.service) and drop-in paths
+// (/etc/systemd/system/foo.service.d/10-magus.conf). Lives in ir so the policy
+// gate can derive unit names without importing diff.
+func UnitNameFromPath(p string) string {
+	parent := filepath.Base(filepath.Dir(p))
+	if strings.HasSuffix(parent, ".d") {
+		return strings.TrimSuffix(parent, ".d")
+	}
+	return filepath.Base(p)
+}
+
 // QuadletGeneratedService returns the .service name the systemd-quadlet
 // generator materializes from a quadlet source name. v1 supported types:
 //

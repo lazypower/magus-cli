@@ -1,8 +1,10 @@
 package policy
 
 import (
+	"path/filepath"
 	"time"
 
+	"gitea.wabash.place/lab/magus-cli/internal/ir"
 	"gitea.wabash.place/lab/magus-cli/internal/manifest"
 )
 
@@ -24,10 +26,35 @@ func OrphanDenied(p *Policy, m *manifest.Manifest, now time.Time) []string {
 		if r.State != manifest.StateActive {
 			continue
 		}
-		if reason := p.DenyPathReason(path); reason != "" {
+		if reason := deniedReason(p, path, r.Kind); reason != "" {
 			m.Orphan(path, "policy deny: "+reason, now)
 			orphaned = append(orphaned, path)
 		}
 	}
 	return orphaned
+}
+
+// deniedReason reports why the policy no longer permits an owned resource, by
+// kind. Units and quadlets must consult the UNIT/SERVICE deny lists too — not
+// just the path — so that a newly deny.units'd unit/quadlet is orphaned (kept)
+// rather than deleted by the sweep.
+func deniedReason(p *Policy, path string, kind manifest.Kind) string {
+	switch kind {
+	case manifest.KindUnit:
+		if r := p.DenyPathReason(path); r != "" {
+			return r
+		}
+		return p.DenyUnitReason(ir.UnitNameFromPath(path))
+	case manifest.KindQuadlet:
+		if r := p.DenyPathReason(path); r != "" {
+			return r
+		}
+		svc, err := ir.QuadletGeneratedService(filepath.Base(path))
+		if err != nil {
+			return "" // unknown quadlet type: path authority already checked
+		}
+		return p.DenyServiceReason(svc)
+	default:
+		return p.DenyPathReason(path)
+	}
 }

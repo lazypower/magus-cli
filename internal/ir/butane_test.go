@@ -181,3 +181,48 @@ func TestIsHTTPURL(t *testing.T) {
 		}
 	}
 }
+
+func TestLoadButaneRejectsDeferredQuadlet(t *testing.T) {
+	doc := `variant: fcos
+version: "1.6.0"
+storage:
+  files:
+    - path: /etc/containers/systemd/app.kube
+      contents:
+        inline: |
+          [Kube]
+          Yaml=app.yml
+`
+	dir := t.TempDir()
+	path := filepath.Join(dir, "k.bu")
+	if err := os.WriteFile(path, []byte(doc), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	_, _, err := LoadButane(path)
+	if err == nil {
+		t.Fatal("LoadButane accepted a deferred quadlet type (.kube)")
+	}
+	if !strings.Contains(err.Error(), "not supported in v1") {
+		t.Errorf("error did not explain the deferred type: %v", err)
+	}
+}
+
+func TestDeferredQuadletType(t *testing.T) {
+	cases := map[string]string{
+		"/etc/containers/systemd/a.kube":  ".kube",
+		"/etc/containers/systemd/a.pod":   ".pod",
+		"/etc/containers/systemd/a.image": ".image",
+		"/etc/containers/systemd/a.build": ".build",
+	}
+	for path, want := range cases {
+		if got := deferredQuadletType(path); got != want {
+			t.Errorf("deferredQuadletType(%q) = %q, want %q", path, got, want)
+		}
+	}
+	// Supported types and non-quadlet locations are not deferred.
+	for _, ok := range []string{"/etc/containers/systemd/a.container", "/etc/magus.d/a.kube"} {
+		if got := deferredQuadletType(ok); got != "" {
+			t.Errorf("deferredQuadletType(%q) = %q, want \"\"", ok, got)
+		}
+	}
+}

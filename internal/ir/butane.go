@@ -78,6 +78,14 @@ const quadletRoot = "/etc/containers/systemd/"
 // mappings and aren't on the immediate use case.
 var quadletExtensions = []string{".container", ".volume", ".network"}
 
+// deferredQuadletExtensions are quadlet types systemd-quadlet recognizes but
+// magus does not support in v1. They MUST be rejected (not silently treated as
+// ordinary files): a file at /etc/containers/systemd/x.kube would be processed
+// by the generator at daemon-reload and could materialize a service magus never
+// got to gate against deny.units. Refusing at load keeps the authority boundary
+// honest.
+var deferredQuadletExtensions = []string{".pod", ".kube", ".image", ".build"}
+
 func isQuadletPath(path string) bool {
 	if !strings.HasPrefix(path, quadletRoot) {
 		return false
@@ -89,6 +97,21 @@ func isQuadletPath(path string) bool {
 		}
 	}
 	return false
+}
+
+// deferredQuadletType returns the deferred quadlet extension if path is a
+// not-yet-supported quadlet under the quadlet root, else "".
+func deferredQuadletType(path string) string {
+	if !strings.HasPrefix(path, quadletRoot) {
+		return ""
+	}
+	ext := filepath.Ext(path)
+	for _, q := range deferredQuadletExtensions {
+		if ext == q {
+			return ext
+		}
+	}
+	return ""
 }
 
 // LoadButane reads source, runs the Butane → Ignition translation, and
@@ -124,6 +147,12 @@ func LoadButane(source string) (*IR, []string, error) {
 		contents, err := decodeSource(f.Contents.Source, f.Contents.Compression)
 		if err != nil {
 			return nil, warnings, fmt.Errorf("file %s: %w", f.Path, err)
+		}
+		// Reject deferred quadlet types under the quadlet root before anything
+		// else: the generator would act on them but magus can't gate their
+		// generated service in v1.
+		if dt := deferredQuadletType(f.Path); dt != "" {
+			return nil, warnings, fmt.Errorf("file %s: quadlet type %q is not supported in v1 (deferred) but systemd-quadlet would still process it — remove it from %s", f.Path, dt, quadletRoot)
 		}
 		// Auto-promote quadlet-shaped files: anything under
 		// /etc/containers/systemd/ with a recognized quadlet extension

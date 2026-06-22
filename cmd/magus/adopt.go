@@ -11,6 +11,7 @@ import (
 	"strings"
 	"time"
 
+	"gitea.wabash.place/lab/magus-cli/internal/diff"
 	"gitea.wabash.place/lab/magus-cli/internal/hostfs"
 	"gitea.wabash.place/lab/magus-cli/internal/ir"
 	"gitea.wabash.place/lab/magus-cli/internal/manifest"
@@ -62,7 +63,7 @@ func runAdopt(args []string) int {
 		fmt.Fprintf(os.Stderr, "error: %v\n", err)
 		return 1
 	}
-	if violations := policy.Check(p, parsed); len(violations) > 0 {
+	if violations := policy.Check(p, parsed, *manifestPath); len(violations) > 0 {
 		for _, v := range violations {
 			fmt.Fprintf(os.Stderr, "error: %s\n", v)
 		}
@@ -130,6 +131,14 @@ func runAdopt(args []string) int {
 	}
 	fmt.Println()
 
+	// Symlink-resolved containment: a deliberate overwrite must still not be
+	// redirected outside authority through a symlinked ancestor.
+	if r, ok := w.(hostfs.Resolver); ok {
+		if _, reason := diff.ContainmentEscape(p, r, target); reason != "" {
+			fmt.Fprintf(os.Stderr, "error: refusing to adopt %s: %s\n", target, reason)
+			return 1
+		}
+	}
 	if err := w.WriteFile(target, declared.Contents, declared.Mode, declared.UID, declared.GID); err != nil {
 		fmt.Fprintf(os.Stderr, "error: write %s: %v\n", target, err)
 		return 1

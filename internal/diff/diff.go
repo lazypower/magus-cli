@@ -8,7 +8,6 @@ import (
 	"encoding/hex"
 	"fmt"
 	"path/filepath"
-	"strings"
 
 	"gitea.wabash.place/lab/magus-cli/internal/hostfs"
 	"gitea.wabash.place/lab/magus-cli/internal/ir"
@@ -140,10 +139,32 @@ func ComputeWithPolicy(p *policy.Policy, in *ir.IR, m *manifest.Manifest, fsys h
 	return plan, nil
 }
 
-// applyContainment downgrades write actions whose resolved path escapes the
-// policy. Scoped to path-governed kinds (file/dir/quadlet); units are governed
-// by unit_patterns (name), not file_roots, and their write is symlink-safe via
-// the tmp+rename in hostfs. Fail-closed: a resolution error becomes a conflict.
+// ContainmentEscape reports whether mutating path would land outside the
+// policy's authority because a symlink in its resolved ancestry redirects it.
+// It returns the resolved path and a non-empty reason when the mutation
+// escapes — including a fail-closed reason if resolution itself fails. An empty
+// reason means the mutation is safe. Used by both the plan-time downgrade
+// (applyContainment) and the apply-time re-check (which closes the plan→apply
+// TOCTOU window).
+func ContainmentEscape(p *policy.Policy, r hostfs.Resolver, path string) (resolved, reason string) {
+	resolved, err := r.ResolvePath(path)
+	if err != nil {
+		return "", "path resolution failed (fail-closed): " + err.Error()
+	}
+	if resolved == filepath.Clean(path) {
+		return resolved, "" // no symlink rewrote the path
+	}
+	if dr := p.DenyPathReason(resolved); dr != "" {
+		return resolved, fmt.Sprintf("resolves outside authority via symlink → %s (%s)", resolved, dr)
+	}
+	return resolved, ""
+}
+
+// applyContainment downgrades create/update/adopt/DELETE actions whose resolved
+// path escapes the policy to a Conflict (skipped). Scoped to path-governed
+// kinds (file/dir/quadlet); units are governed by unit_patterns (name), not
+// file_roots. Deletes are included because unlink follows a symlinked PARENT —
+// a redirected delete is data loss outside authority.
 func applyContainment(p *policy.Policy, plan *Plan, fsys hostfs.Reader) {
 	r, ok := fsys.(hostfs.Resolver)
 	if !ok {
@@ -157,22 +178,13 @@ func applyContainment(p *policy.Policy, plan *Plan, fsys hostfs.Reader) {
 			continue
 		}
 		switch a.Action {
-		case ActionCreate, ActionUpdate, ActionAdopt:
+		case ActionCreate, ActionUpdate, ActionAdopt, ActionDelete:
 		default:
 			continue
 		}
-		resolved, err := r.ResolvePath(a.Path)
-		if err != nil {
+		if _, reason := ContainmentEscape(p, r, a.Path); reason != "" {
 			a.Action = ActionConflict
-			a.Reason = "path resolution failed (fail-closed): " + err.Error()
-			continue
-		}
-		if resolved == filepath.Clean(a.Path) {
-			continue // no symlink rewrote the path
-		}
-		if reason := p.DenyPathReason(resolved); reason != "" {
-			a.Action = ActionConflict
-			a.Reason = fmt.Sprintf("resolves outside authority via symlink → %s (%s)", resolved, reason)
+			a.Reason = reason
 		}
 	}
 }
@@ -406,7 +418,20 @@ func diffOrphan(path string, entry manifest.Resource, fsys hostfs.Reader) (Resou
 		ra.UnitName = filepath.Base(path)
 	}
 
+	st, err := fsys.Stat(path)
+	if err != nil {
+		return ra, fmt.Errorf("stat %s: %w", path, err)
+	}
+
 	if entry.State == manifest.StateOrphaned {
+		// Orphans age out: if the underlying file is gone (removed out of band),
+		// drop the orphan entry so the manifest doesn't accumulate forever.
+		// While the file exists, the orphan is held (audit) and skip+warned.
+		if !st.Exists {
+			ra.Action = ActionCleanup
+			ra.Reason = "orphaned entry without on-disk file — aged out"
+			return ra, nil
+		}
 		ra.Action = ActionOrphaned
 		ra.Reason = "orphaned: " + entry.OrphanedReason
 		return ra, nil
@@ -414,10 +439,6 @@ func diffOrphan(path string, entry manifest.Resource, fsys hostfs.Reader) (Resou
 
 	// Active manifest entry, no IR declaration → delete, stale-clean, or
 	// (for directories) skip-with-reason since v1 does not delete dirs.
-	st, err := fsys.Stat(path)
-	if err != nil {
-		return ra, fmt.Errorf("stat %s: %w", path, err)
-	}
 	if !st.Exists {
 		ra.Action = ActionCleanup
 		ra.Reason = "manifest entry without on-disk file"
@@ -471,16 +492,10 @@ func DropInPath(unitName, dropInName string) string {
 	return filepath.Join("/etc/systemd/system", unitName+".d", dropInName)
 }
 
-// UnitNameFromPath recovers the systemd unit name from a managed path.
-// Returns the unit's name for both unit-body paths
-// (/etc/systemd/system/foo.service) and drop-in paths
-// (/etc/systemd/system/foo.service.d/10-magus.conf).
+// UnitNameFromPath is a thin alias; the implementation lives in ir so the
+// policy gate can derive unit names without an import cycle.
 func UnitNameFromPath(p string) string {
-	parent := filepath.Base(filepath.Dir(p))
-	if strings.HasSuffix(parent, ".d") {
-		return strings.TrimSuffix(parent, ".d")
-	}
-	return filepath.Base(p)
+	return ir.UnitNameFromPath(p)
 }
 
 // explainDiff produces a short reason string for update/conflict rows.
