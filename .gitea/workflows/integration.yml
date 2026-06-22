@@ -1,0 +1,82 @@
+name: Integration (experimental)
+
+# EXPERIMENT: prove whether the real-environment integration suite can run on
+# the buildah runner. It is NOT a gate — manual (workflow_dispatch) plus pushes
+# to this experiment branch only, so it can never block a PR.
+#
+# Unknowns being measured:
+#   - rootless `podman run --privileged --systemd=always` booting systemd PID1
+#     in a Firecracker microVM
+#   - the buildah runner having no Go (installed here at runtime)
+#   - the 2 GB memory ceiling and the ~2 GB core-base image pull per ephemeral run
+on:
+  workflow_dispatch:
+  push:
+    branches: [ci/integration-experiment]
+
+concurrency:
+  group: integration-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  integration:
+    runs-on: buildah
+    timeout-minutes: 30
+    env:
+      GOTOOLCHAIN: auto # let an older distro go fetch 1.26.2 over GOPROXY
+      MAGUS_IT_IMAGE: registry.wabash.place/chuck/core-base:latest
+    steps:
+      - name: Checkout
+        env:
+          TOKEN: ${{ github.token }}
+        run: |
+          host="${GITHUB_SERVER_URL#https://}"
+          git clone "https://token:${TOKEN}@${host}/${GITHUB_REPOSITORY}.git" src
+          git -C src checkout "$GITHUB_SHA"
+
+      - name: Provision Go
+        run: |
+          set -e
+          if command -v go >/dev/null 2>&1; then
+            echo "go already present"; go version; exit 0
+          fi
+          # Preferred: distro package (needs root; act_runner is typically root).
+          if microdnf install -y golang >/dev/null 2>&1; then
+            go version; exit 0
+          fi
+          # Fallback: official toolchain tarball into $HOME (works unprivileged).
+          echo "microdnf golang unavailable; fetching go1.26.2 tarball"
+          curl -fsSL https://go.dev/dl/go1.26.2.linux-amd64.tar.gz -o /tmp/go.tgz
+          mkdir -p "$HOME/.local"
+          tar -C "$HOME/.local" -xzf /tmp/go.tgz
+          echo "$HOME/.local/go/bin" >> "$GITHUB_PATH"
+          "$HOME/.local/go/bin/go" version
+
+      - name: Runtime probe
+        run: |
+          echo "whoami: $(whoami)"; id
+          podman version
+          echo "cgroups:"; ls /sys/fs/cgroup | head
+
+      - name: Smoke — rootless privileged systemd
+        # The make-or-break unknown, isolated so its result is unambiguous even
+        # if the Go suite later fails for an unrelated reason. Non-fatal: we want
+        # the suite to run regardless so both signals land in one job.
+        continue-on-error: true
+        run: |
+          set -x
+          podman rm -f smoke 2>/dev/null || true
+          podman run -d --name smoke --privileged --systemd=always "$MAGUS_IT_IMAGE"
+          ok=no
+          for i in $(seq 1 60); do
+            if podman exec smoke systemctl daemon-reload >/dev/null 2>&1; then ok=yes; break; fi
+            sleep 2
+          done
+          echo "systemd-responsive=$ok"
+          podman exec smoke systemctl is-system-running || true
+          podman exec smoke systemctl --version | head -1 || true
+          podman rm -f smoke || true
+
+      - name: Integration suite
+        working-directory: src
+        run: go test -tags integration -v -timeout 1800s ./internal/integration/
