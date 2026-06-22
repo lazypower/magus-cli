@@ -152,8 +152,16 @@ func ContainmentEscape(p *policy.Policy, r hostfs.Resolver, path string) (resolv
 		return "", "path resolution failed (fail-closed): " + err.Error()
 	}
 	if resolved == filepath.Clean(path) {
-		return resolved, "" // no symlink rewrote the path
+		return resolved, "" // no symlink anywhere in the ancestry — nothing rewrote it
 	}
+	// A symlink rewrote the path. Re-check the RESOLVED path against the policy
+	// (file_roots membership + deny) using the same lexical matcher policy.Check
+	// uses. This is fail-closed by construction: file_roots and deny.paths are
+	// expressed as real paths, so a redirect outside them — or into a denied
+	// subtree — is caught. (Requires file_roots to be real, non-symlinked paths,
+	// which holds on the bootc target; a file_root that is itself under a symlink
+	// would make every path under it read as an escape — conservative, not
+	// unsafe.)
 	if dr := p.DenyPathReason(resolved); dr != "" {
 		return resolved, fmt.Sprintf("resolves outside authority via symlink → %s (%s)", resolved, dr)
 	}

@@ -341,7 +341,9 @@ config/butane/magus.bu → 5 resources
 
 Exit codes (plan): `0` = no changes needed, `2` = changes pending or conflicts present, `1` = input-bad (parse error, policy/IR contradiction, manifest version mismatch).
 
-`--explain` augments the plan with per-resource diffs for any `[update]` or `[conflict]` actions. For units, the diff is over the canonicalized form (same bytes used for hashing). For files, it's a unified text diff. If either side is non-text, the diff is replaced with the sha256 of each side — enough to verify which version is which against external sources without dumping bytes. Mode and ownership deltas are shown as single lines.
+`--explain` augments the plan with per-resource diffs. For **`[update]`** rows (resources Magus owns) it shows a unified text diff — over the canonicalized form for units/quadlets (same bytes used for hashing), raw for files; if either side is non-text the diff is replaced with the sha256 of each side. Mode and ownership deltas are shown as single lines.
+
+For **`[conflict]`** rows the resource is *unowned*, so dumping its content into CLI/log/LLM output is an information leak. By default a conflict shows **hashes only** (`sha256` of each side). The full conflict diff is revealed only when the operator explicitly passes **`-v` / `--verbose`** — secure-by-default for unattended/logged runs, with human-in-the-loop ergonomics when someone is actually looking.
 
 ```
 $ magus plan --explain
@@ -350,12 +352,9 @@ config/butane/magus.bu → 4 resources
   [orphaned] /etc/shadow  (orphaned 2026-04-26 by policy deny — `magus reclaim` to restore)
 
   [conflict] /etc/systemd/system/legacy-thing.service
-    --- on disk (canonical)
-    +++ IR (canonical)
-    @@ -3,2 +3,2 @@
-     [Service]
-    -ExecStart=/usr/bin/old-binary
-    +ExecStart=/usr/bin/new-binary
+    content differs (hashes only; -v to show diff)
+      on disk: sha256:9f1234...
+      IR:      sha256:abc987...
 
   [update]   /etc/magus.d/ollama.env
     --- on disk
