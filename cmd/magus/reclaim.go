@@ -212,6 +212,20 @@ type declaredTarget struct {
 	diffKind diff.Kind
 }
 
+// manifestKind maps a diff.Kind to the manifest.Kind recorded for ownership.
+func manifestKind(k diff.Kind) manifest.Kind {
+	switch k {
+	case diff.KindUnit:
+		return manifest.KindUnit
+	case diff.KindQuadlet:
+		return manifest.KindQuadlet
+	case diff.KindDirectory:
+		return manifest.KindDirectory
+	default:
+		return manifest.KindFile
+	}
+}
+
 // findDeclared locates the IR resource that owns the given on-disk path across
 // files, unit bodies, drop-ins, and quadlets.
 func findDeclared(in *ir.IR, path string) (declaredTarget, bool) {

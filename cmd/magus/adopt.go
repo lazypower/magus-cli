@@ -75,7 +75,7 @@ func runAdopt(args []string) int {
 		return 1
 	}
 
-	declared, ok := findFile(parsed, target)
+	declared, ok := findDeclared(parsed, target)
 	if !ok {
 		fmt.Fprintf(os.Stderr, "error: %s is not declared in %s\n", target, butanePath)
 		return 1
@@ -108,8 +108,10 @@ func runAdopt(args []string) int {
 		fmt.Fprintf(os.Stderr, "error: read %s: %v\n", target, err)
 		return 1
 	}
-	onDisk := hashContent(body)
-	declared_ := hashContent(declared.Contents)
+	// Hash with the resource's equivalence rule (canonical for units/quadlets,
+	// raw for files) so the match check and recorded hash agree with diff.
+	onDisk := diff.HashContent(body, declared.diffKind)
+	declared_ := diff.HashContent(declared.contents, declared.diffKind)
 
 	if onDisk == declared_ {
 		fmt.Fprintf(os.Stderr, "error: %s already matches the IR — 'magus apply' will adopt it silently\n", target)
@@ -139,26 +141,17 @@ func runAdopt(args []string) int {
 			return 1
 		}
 	}
-	if err := w.WriteFile(target, declared.Contents, declared.Mode, declared.UID, declared.GID); err != nil {
+	if err := w.WriteFile(target, declared.contents, declared.mode, declared.uid, declared.gid); err != nil {
 		fmt.Fprintf(os.Stderr, "error: write %s: %v\n", target, err)
 		return 1
 	}
-	m.PutActive(target, manifest.KindFile, declared_, manifest.OriginForceAdopt, time.Now().UTC())
+	m.PutActive(target, manifestKind(declared.diffKind), declared_, manifest.OriginForceAdopt, time.Now().UTC())
 	if err := m.Save(*manifestPath); err != nil {
 		fmt.Fprintf(os.Stderr, "error: save manifest: %v\n", err)
 		return 1
 	}
 	fmt.Printf("  ✓ %s  (rewrote, recorded in manifest)\n", target)
 	return 0
-}
-
-func findFile(in *ir.IR, path string) (ir.File, bool) {
-	for _, f := range in.Files {
-		if f.Path == path {
-			return f, true
-		}
-	}
-	return ir.File{}, false
 }
 
 func hashContent(b []byte) string {
