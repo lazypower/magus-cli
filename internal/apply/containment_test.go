@@ -83,3 +83,32 @@ func TestApplyNilPolicySkipsGuard(t *testing.T) {
 		t.Errorf("nil-policy Apply should not run containment guard")
 	}
 }
+
+// TestQuadletManifestHashIsCanonical guards the diffKind quadlet mapping: a
+// quadlet's recorded manifest hash must be the CANONICAL hash (comments/blank
+// lines dropped), matching how diff and reclaim hash it — otherwise a clean
+// orphaned quadlet falsely reads as drifted on reclaim.
+func TestQuadletManifestHashIsCanonical(t *testing.T) {
+	content := []byte("[Container]\n# a comment\n\nImage=x\n")
+	q := ir.Quadlet{Path: "/etc/containers/systemd/a.container", Name: "a.container", Mode: 0o644, Contents: content}
+	in := &ir.IR{Quadlets: []ir.Quadlet{q}}
+	plan := &diff.Plan{Actions: []diff.ResourceAction{
+		{Path: q.Path, Kind: diff.KindQuadlet, UnitName: q.Name, Action: diff.ActionCreate},
+	}}
+
+	m := manifest.New()
+	Apply(plan, in, newMemWriter(), m, systemd.NewFake(), time.Unix(1, 0))
+
+	entry, ok := m.Get(q.Path)
+	if !ok {
+		t.Fatal("quadlet not recorded in manifest")
+	}
+	want := diff.HashContent(content, diff.KindQuadlet)
+	if entry.Hash != want {
+		t.Errorf("stored hash %s, want canonical %s", entry.Hash, want)
+	}
+	// Sanity: this content actually distinguishes canonical from raw.
+	if diff.HashContent(content, diff.KindQuadlet) == diff.HashContent(content, diff.KindFile) {
+		t.Fatal("test content does not exercise canonicalization")
+	}
+}

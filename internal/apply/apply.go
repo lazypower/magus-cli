@@ -573,6 +573,11 @@ func diffKind(k manifest.Kind) diff.Kind {
 	switch k {
 	case manifest.KindUnit:
 		return diff.KindUnit
+	case manifest.KindQuadlet:
+		// Quadlets canonicalize like units — without this they'd be stored with
+		// a raw hash while diff/reclaim hash them canonically, making a clean
+		// orphaned quadlet falsely read as drifted on reclaim.
+		return diff.KindQuadlet
 	case manifest.KindDirectory:
 		return diff.KindDirectory
 	default:
