@@ -63,7 +63,7 @@ func runAdopt(args []string) int {
 		fmt.Fprintf(os.Stderr, "error: %v\n", err)
 		return 1
 	}
-	if violations := policy.Check(p, parsed, *manifestPath); len(violations) > 0 {
+	if violations := policy.Check(p, parsed, *manifestPath, *policyPath); len(violations) > 0 {
 		for _, v := range violations {
 			fmt.Fprintf(os.Stderr, "error: %s\n", v)
 		}

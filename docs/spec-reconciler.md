@@ -103,6 +103,13 @@ Policy is a live control plane in this model. A change to `policy.yaml` is a beh
 
 **Policy contention with the IR.** When the IR declares a path or unit that the policy denies, that's an input-bad case: the user wrote two contradictory things. `magus apply` halts at parse-time validation, exits non-zero, applies nothing. Resolve by editing the IR or the policy.
 
+**Precedence — halt vs orphan.** These two contention rules are deliberately separated by whether the denied path is still declared:
+
+- Denied **and still in the IR** → *halt* (input-bad). The config contradicts itself; a human must fix it. Magus does not orphan here — it touches nothing and exits non-zero.
+- Denied **and owned but no longer in the IR** → *orphan* (sticky). Magus stops reconciling and refuses to delete it.
+
+One consequence is intentional: if you deny a path you still declare, then later remove the deny, management resumes — because the path was never orphaned (apply was halting, not managing). The sticky-orphan guarantee ("removing a deny does not auto-resume") protects paths Magus had *stopped touching*; a path that stayed declared was never in that state. To make a denied path sticky, remove it from the IR (so it orphans) rather than leaving it declared.
+
 ## IR contract
 
 The Butane file is the input. Magus consumes a strict subset as its intermediate representation. Anything outside this subset is invisible to Magus.

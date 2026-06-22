@@ -67,7 +67,7 @@ func runReclaim(args []string) int {
 		fmt.Fprintf(os.Stderr, "error: %v\n", err)
 		return 1
 	}
-	if violations := policy.Check(p, parsed, *manifestPath); len(violations) > 0 {
+	if violations := policy.Check(p, parsed, *manifestPath, *policyPath); len(violations) > 0 {
 		for _, v := range violations {
 			fmt.Fprintf(os.Stderr, "error: %s\n", v)
 		}
@@ -111,6 +111,15 @@ func runReclaim(args []string) int {
 	if !st.Exists {
 		fmt.Fprintf(os.Stderr, "error: %s no longer exists on disk\n", target)
 		return 1
+	}
+	// Symlink-resolved containment, unconditionally (not just on --force): a
+	// path that now resolves outside authority must not be returned to active
+	// reconciliation at all, write or no write.
+	if r, ok := w.(hostfs.Resolver); ok {
+		if _, reason := diff.ContainmentEscape(p, r, target); reason != "" {
+			fmt.Fprintf(os.Stderr, "error: refusing to reclaim %s: %s\n", target, reason)
+			return 1
+		}
 	}
 
 	body, err := w.ReadFile(target)
@@ -166,13 +175,7 @@ func runReclaim(args []string) int {
 	fmt.Println()
 
 	if *force && mismatchedFromIR {
-		// Symlink-resolved containment guards the --force overwrite too.
-		if r, ok := w.(hostfs.Resolver); ok {
-			if _, reason := diff.ContainmentEscape(p, r, target); reason != "" {
-				fmt.Fprintf(os.Stderr, "error: refusing to reclaim %s: %s\n", target, reason)
-				return 1
-			}
-		}
+		// Containment already verified above (unconditionally).
 		if err := w.WriteFile(target, declared.Contents, declared.Mode, declared.UID, declared.GID); err != nil {
 			fmt.Fprintf(os.Stderr, "error: write %s: %v\n", target, err)
 			return 1
