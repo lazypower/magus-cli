@@ -81,3 +81,76 @@ func TestSaveAtomic(t *testing.T) {
 		t.Errorf("tmp file should be gone after Save, stat: %v", err)
 	}
 }
+
+func TestDeleteRemovesEntry(t *testing.T) {
+	m := New()
+	m.PutActive("/etc/core/a", KindFile, "h", OriginCreate, time.Unix(1, 0))
+	if !m.Owns("/etc/core/a") {
+		t.Fatal("precondition: should own /etc/core/a")
+	}
+	m.Delete("/etc/core/a")
+	if _, ok := m.Get("/etc/core/a"); ok {
+		t.Errorf("Delete left the entry behind")
+	}
+	// Deleting a missing path is a no-op, not a panic.
+	m.Delete("/nope")
+}
+
+func TestLoadRejectsCorruptJSON(t *testing.T) {
+	p := filepath.Join(t.TempDir(), "manifest.json")
+	if err := os.WriteFile(p, []byte("{not json"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Load(p); err == nil {
+		t.Errorf("Load should reject corrupt JSON")
+	}
+}
+
+func TestLoadCoercesEmptyKind(t *testing.T) {
+	p := filepath.Join(t.TempDir(), "manifest.json")
+	// A pre-Kind manifest entry (no "kind") must coerce to KindFile.
+	js := `{"version":1,"resources":{"/x":{"state":"active","hash":"h","applied_at":"2026-01-01T00:00:00Z","origin":"create"}}}`
+	if err := os.WriteFile(p, []byte(js), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	m, err := Load(p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if e, _ := m.Get("/x"); e.Kind != KindFile {
+		t.Errorf("empty kind coerced to %q, want file", e.Kind)
+	}
+}
+
+func TestSaveCreatesDirAndReloads(t *testing.T) {
+	// Save into a not-yet-existing directory; it must be created, and the
+	// written file must reload to an equivalent manifest at mode 0600.
+	p := filepath.Join(t.TempDir(), "sub", "deep", "manifest.json")
+	m := New()
+	m.PutActive("/etc/core/a", KindUnit, "h", OriginAdopt, time.Unix(5, 0).UTC())
+	if err := m.Save(p); err != nil {
+		t.Fatal(err)
+	}
+	fi, err := os.Stat(p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if fi.Mode().Perm() != 0o600 {
+		t.Errorf("manifest mode = %v, want 0600", fi.Mode().Perm())
+	}
+	m2, err := Load(p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if e, ok := m2.Get("/etc/core/a"); !ok || e.Kind != KindUnit || e.Origin != OriginAdopt {
+		t.Errorf("reloaded entry wrong: %+v", e)
+	}
+}
+
+func TestOrphanMissingPathNoop(t *testing.T) {
+	m := New()
+	m.Orphan("/absent", "reason", time.Unix(1, 0)) // must not panic or create
+	if _, ok := m.Get("/absent"); ok {
+		t.Errorf("Orphan created an entry for a missing path")
+	}
+}

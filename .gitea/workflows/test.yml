@@ -1,6 +1,18 @@
 name: Test
 
-on: [push, pull_request]
+# Hermetic gate: runs on every PR and on pushes to main (post-merge). Feature
+# branches are covered via their PR, so this avoids double-running a branch that
+# also has a PR open.
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+# Cancel an in-progress run when a newer commit lands on the same ref — saves
+# scarce Firecracker runner capacity.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
   test:
@@ -16,13 +28,58 @@ jobs:
           host="${GITHUB_SERVER_URL#https://}"
           git clone "https://token:${TOKEN}@${host}/${GITHUB_REPOSITORY}.git" src
           git -C src checkout "$GITHUB_SHA"
+
+      - name: Toolchain
+        working-directory: src
+        run: go version
+
       - name: Format check
         working-directory: src
         run: |
           unformatted="$(gofmt -l .)"
           if [ -n "$unformatted" ]; then
-            echo "gofmt needed on:"; echo "$unformatted"; exit 1
+            echo "::error::gofmt needed on:"; echo "$unformatted"; exit 1
           fi
-      - name: Test
+
+      - name: Vet
         working-directory: src
-        run: go test ./...
+        run: go vet ./...
+
+      - name: Build
+        working-directory: src
+        run: go build ./...
+
+      - name: Compile integration harness
+        working-directory: src
+        # The podman/systemd integration suite can't run on this runner (no
+        # privileged nested systemd), but compiling it under the build tag keeps
+        # the harness from rotting unnoticed. -run NONE builds without executing.
+        run: go test -tags integration -run NONE ./internal/integration/
+
+      - name: Test + coverage floor
+        working-directory: src
+        env:
+          COVERAGE_MIN: "70"
+        run: |
+          go test -cover ./... > cover.txt 2>&1; rc=$?
+          cat cover.txt
+          if [ "$rc" -ne 0 ]; then
+            echo "::error::go test failed (exit $rc)"; exit "$rc"
+          fi
+          echo "--- enforcing per-package coverage floor: ${COVERAGE_MIN}% ---"
+          fail=0
+          while IFS= read -r line; do
+            case "$line" in
+              *coverage:*)
+                pct=$(printf '%s\n' "$line" | sed -n 's/.*coverage: \([0-9.]*\)%.*/\1/p')
+                if [ -n "$pct" ] && awk "BEGIN{exit !($pct < $COVERAGE_MIN)}"; then
+                  echo "::error::coverage ${pct}% is below the ${COVERAGE_MIN}% floor: $line"
+                  fail=1
+                fi
+                ;;
+            esac
+          done < cover.txt
+          if [ "$fail" -ne 0 ]; then
+            echo "::error::one or more packages are below the coverage floor"; exit 1
+          fi
+          echo "all tested packages meet the ${COVERAGE_MIN}% floor"
