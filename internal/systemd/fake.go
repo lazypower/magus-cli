@@ -13,7 +13,8 @@ type Fake struct {
 	calls       []string
 	enablement  map[string]Enablement
 	activity    map[string]bool
-	failOn      map[string]error // method-name → error to return on next call
+	states      map[string]string // raw is-active state override (for ActiveState)
+	failOn      map[string]error  // method-name → error to return on next call
 	failCounter map[string]int
 }
 
@@ -23,6 +24,7 @@ func NewFake() *Fake {
 	return &Fake{
 		enablement:  map[string]Enablement{},
 		activity:    map[string]bool{},
+		states:      map[string]string{},
 		failOn:      map[string]error{},
 		failCounter: map[string]int{},
 	}
@@ -94,6 +96,28 @@ func (f *Fake) IsActive(unit string) (bool, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	return f.activity[unit], nil
+}
+
+// SetActiveState preloads the raw is-active state ActiveState returns for unit.
+func (f *Fake) SetActiveState(unit, state string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.states[unit] = state
+}
+
+func (f *Fake) ActiveState(unit string) (string, error) {
+	if err := f.record(fmt.Sprintf("ActiveState(%s)", unit)); err != nil {
+		return "unknown", err
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if s, ok := f.states[unit]; ok {
+		return s, nil
+	}
+	if f.activity[unit] {
+		return "active", nil
+	}
+	return "inactive", nil
 }
 
 func (f *Fake) Enable(unit string) error {

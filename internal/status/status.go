@@ -90,8 +90,16 @@ func (r *Report) Save(path string) error {
 		return fmt.Errorf("marshal status: %w", err)
 	}
 	tmp := path + ".magus.tmp"
+	// Drop any pre-existing tmp first so we never inherit a foreign owner/mode
+	// from a file an IR may have pre-created at the tmp path (unlink drops a
+	// planted symlink itself, not its target); then create fresh at 0600.
+	_ = os.Remove(tmp)
 	if err := os.WriteFile(tmp, append(data, '\n'), 0o600); err != nil {
 		return fmt.Errorf("write tmp status: %w", err)
+	}
+	if err := os.Chmod(tmp, 0o600); err != nil {
+		_ = os.Remove(tmp)
+		return fmt.Errorf("chmod tmp status: %w", err)
 	}
 	if err := os.Rename(tmp, path); err != nil {
 		_ = os.Remove(tmp)

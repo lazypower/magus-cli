@@ -87,6 +87,22 @@ func TestCheckReservedStatePaths(t *testing.T) {
 	}
 }
 
+func TestCheckReservedTmpSiblings(t *testing.T) {
+	// The .magus.tmp write-staging siblings of reserved state files must also be
+	// rejected — else an IR could pre-create one with attacker-chosen perms that
+	// the atomic rename would carry onto the real state file.
+	p := mustLoad(t, workloadLike)
+	for _, path := range []string{
+		"/var/lib/magus/manifest.json.magus.tmp",
+		"/var/lib/magus/status.json.magus.tmp",
+	} {
+		in := &ir.IR{Files: []ir.File{{Path: path, Mode: 0o644}}}
+		if v := Check(p, in); !hasReason(v, "reserved magus state path") {
+			t.Errorf("reserved tmp sibling %s not rejected: %v", path, v)
+		}
+	}
+}
+
 func TestCheckReservedExtra(t *testing.T) {
 	// A relocated manifest (passed as extraReserved) is also protected.
 	p := mustLoad(t, workloadLike)

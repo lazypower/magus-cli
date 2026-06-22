@@ -131,8 +131,15 @@ func (m *Manifest) Save(path string) error {
 		return fmt.Errorf("marshal manifest: %w", err)
 	}
 	tmp := path + ".magus.tmp"
+	// Drop any pre-existing tmp first so we never inherit a foreign owner/mode
+	// from a file pre-created at the tmp path; then create fresh at 0600.
+	_ = os.Remove(tmp)
 	if err := os.WriteFile(tmp, append(data, '\n'), 0o600); err != nil {
 		return fmt.Errorf("write tmp manifest: %w", err)
+	}
+	if err := os.Chmod(tmp, 0o600); err != nil {
+		_ = os.Remove(tmp)
+		return fmt.Errorf("chmod tmp manifest: %w", err)
 	}
 	if err := os.Rename(tmp, path); err != nil {
 		_ = os.Remove(tmp)

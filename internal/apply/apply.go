@@ -273,18 +273,15 @@ func ObserveUnits(in *ir.IR, sd systemd.Manager) map[string]string {
 	return out
 }
 
-// activeState returns "active"/"inactive" for a service, or "unknown" if the
-// query failed (e.g. systemd unavailable). Observation only — never fatal.
+// activeState returns the observed runtime state of a service (active/inactive/
+// failed/activating/…) or "unknown" if it can't be determined. Observation
+// only — never fatal.
 func activeState(sd systemd.Manager, name string) string {
-	active, err := sd.IsActive(name)
-	switch {
-	case err != nil:
+	state, err := sd.ActiveState(name)
+	if err != nil {
 		return "unknown"
-	case active:
-		return "active"
-	default:
-		return "inactive"
 	}
+	return state
 }
 
 func indexResources(in *ir.IR) map[string]pendingResource {

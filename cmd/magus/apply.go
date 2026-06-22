@@ -111,6 +111,15 @@ func runApply(args []string) int {
 		fmt.Println("\nNothing to apply.")
 		return 0
 	}
+	if changes == 0 {
+		// Conflicts only: nothing to apply, but the conflicts must still be
+		// recorded so `magus status` reflects them (and the exit code is 2,
+		// "conflicts present") — regardless of --yes. No prompt: there's nothing
+		// to confirm.
+		saveStatusObservation(*statusPath, plan, nil, apply.ObserveUnits(parsed, sd), now)
+		fmt.Printf("\n%d conflict%s present, nothing to apply.\n", conflicts, plural(conflicts))
+		return 2
+	}
 
 	if !*yes {
 		if !confirm(os.Stdin, os.Stdout, changes, conflicts) {
