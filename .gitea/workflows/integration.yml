@@ -1,0 +1,87 @@
+name: Integration
+
+# Real-environment suite: runs the magus binary inside a privileged systemd
+# container (core-base) on the buildah runner — proven to work (rootful
+# privileged systemd PID1 boots; ~3 min for the full suite). NOT a PR gate: it
+# runs nightly + on demand, so it catches real-env / core-base drift without
+# spending a ~2 GB image pull and a Firecracker slot on every PR. The hermetic
+# `Test` workflow remains the fast PR gate.
+on:
+  schedule:
+    - cron: "0 8 * * *" # nightly ~08:00 UTC
+  workflow_dispatch:
+  # Opt-in PR gating: add the `integration` label to a PR touching a risky seam
+  # and the suite runs as a check on it (and re-runs on each new commit while the
+  # label stays). Unlabeled PRs never trigger it, so the common case keeps paying
+  # only the fast hermetic gate.
+  pull_request:
+    types: [opened, reopened, labeled, synchronize]
+
+concurrency:
+  group: integration-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  integration:
+    runs-on: buildah
+    timeout-minutes: 30
+    # Always run for schedule / manual dispatch; for PRs, only when the
+    # `integration` label is present.
+    if: >-
+      github.event_name != 'pull_request' ||
+      contains(github.event.pull_request.labels.*.name, 'integration')
+    env:
+      # Pin the toolchain locally: the runner's GOPROXY has GOSUMDB=off, so
+      # GOTOOLCHAIN=auto can't verify a downloaded go1.26.2. Install it directly
+      # and never let go fetch a toolchain.
+      GOTOOLCHAIN: local
+      MAGUS_IT_IMAGE: registry.wabash.place/chuck/core-base:latest
+    steps:
+      - name: Checkout
+        env:
+          TOKEN: ${{ github.token }}
+        run: |
+          host="${GITHUB_SERVER_URL#https://}"
+          git clone "https://token:${TOKEN}@${host}/${GITHUB_REPOSITORY}.git" src
+          git -C src checkout "$GITHUB_SHA"
+
+      - name: Provision Go 1.26.2
+        # The runner ships go1.24.x; install the version go.mod requires directly
+        # so GOTOOLCHAIN=local is satisfied without a (blocked) toolchain fetch.
+        run: |
+          set -e
+          ver=go1.26.2
+          curl -fsSL "https://go.dev/dl/${ver}.linux-amd64.tar.gz" -o /tmp/go.tgz
+          rm -rf /usr/local/go
+          tar -C /usr/local -xzf /tmp/go.tgz
+          echo "/usr/local/go/bin" >> "$GITHUB_PATH"
+          /usr/local/go/bin/go version
+
+      - name: Runtime probe
+        run: |
+          echo "whoami: $(whoami)"; id
+          podman version
+          echo "cgroups:"; ls /sys/fs/cgroup | head
+
+      - name: Smoke — rootless privileged systemd
+        # The make-or-break unknown, isolated so its result is unambiguous even
+        # if the Go suite later fails for an unrelated reason. Non-fatal: we want
+        # the suite to run regardless so both signals land in one job.
+        continue-on-error: true
+        run: |
+          set -x
+          podman rm -f smoke 2>/dev/null || true
+          podman run -d --name smoke --privileged --systemd=always "$MAGUS_IT_IMAGE"
+          ok=no
+          for i in $(seq 1 60); do
+            if podman exec smoke systemctl daemon-reload >/dev/null 2>&1; then ok=yes; break; fi
+            sleep 2
+          done
+          echo "systemd-responsive=$ok"
+          podman exec smoke systemctl is-system-running || true
+          podman exec smoke systemctl --version | head -1 || true
+          podman rm -f smoke || true
+
+      - name: Integration suite
+        working-directory: src
+        run: go test -tags integration -v -timeout 1800s ./internal/integration/
