@@ -10,6 +10,12 @@ on:
   schedule:
     - cron: "0 8 * * *" # nightly ~08:00 UTC
   workflow_dispatch:
+  # Opt-in PR gating: add the `integration` label to a PR touching a risky seam
+  # and the suite runs as a check on it (and re-runs on each new commit while the
+  # label stays). Unlabeled PRs never trigger it, so the common case keeps paying
+  # only the fast hermetic gate.
+  pull_request:
+    types: [opened, reopened, labeled, synchronize]
 
 concurrency:
   group: integration-${{ github.ref }}
@@ -19,6 +25,11 @@ jobs:
   integration:
     runs-on: buildah
     timeout-minutes: 30
+    # Always run for schedule / manual dispatch; for PRs, only when the
+    # `integration` label is present.
+    if: >-
+      github.event_name != 'pull_request' ||
+      contains(github.event.pull_request.labels.*.name, 'integration')
     env:
       # Pin the toolchain locally: the runner's GOPROXY has GOSUMDB=off, so
       # GOTOOLCHAIN=auto can't verify a downloaded go1.26.2. Install it directly
