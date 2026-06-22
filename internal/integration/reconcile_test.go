@@ -658,6 +658,34 @@ func TestStatusObservation(t *testing.T) {
 	}
 }
 
+// TestAdoptUnit proves `magus adopt` works on a unit (the spec's example
+// adopts a .service), not just files — the generalized findDeclared path.
+func TestAdoptUnit(t *testing.T) {
+	c := setup(t, examplePolicy)
+	unit := "/etc/systemd/system/magus-adopt.service"
+	c.put(unit, "[Service]\nExecStart=/usr/bin/old\n")
+
+	bu := butaneHeader + `systemd:
+  units:
+    - name: magus-adopt.service
+      contents: |
+        [Service]
+        ExecStart=/usr/bin/new
+`
+	c.put("/host.bu", bu)
+	out, code := c.magus("adopt", "--yes", "--policy", "/policy.yaml", "/host.bu", unit)
+	if code != 0 {
+		t.Fatalf("adopt unit: exit %d\n%s", code, out)
+	}
+	if got := c.readFile(unit); !strings.Contains(got, "ExecStart=/usr/bin/new") {
+		t.Errorf("unit not overwritten with IR content: %q", got)
+	}
+	// Recorded under force-adopt ownership (kind unit).
+	if o := c.manifestOrigin(unit); o != "force-adopt" {
+		t.Errorf("manifest origin = %q, want force-adopt", o)
+	}
+}
+
 // TestPlanExplain proves the Phase-3 --explain contract end-to-end: a conflict
 // (unowned) row shows hashes only by default — the unowned file's content is
 // never written to output — and -v reveals the unified diff.
