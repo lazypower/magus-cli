@@ -121,7 +121,7 @@ The Butane file is the input. Magus consumes a strict subset as its intermediate
 | `systemd.units`       | Create, drop-in override, delete on omission         | Drop-ins to `10-magus.conf` only. Must match `unit_patterns`. Delete = stop + disable + unlink + daemon-reload. |
 | `storage.files`       | Create, update, delete on omission                   | Atomic write. Must fall within `file_roots`.                   |
 | `storage.directories` | Create, reconcile mode/ownership                     | Never removed even on IR omission — directories may hold user data Magus didn't track. v1 exception; see open questions. |
-| Quadlets              | Create, update, delete on omission, adopt            | Auto-promoted from `storage.files` whose path is under `/etc/containers/systemd/` and ends in `.container`/`.volume`/`.network`. Equivalence is the unit canonical hash. Apply triggers `daemon-reload` + enable+start of the *generated* service (always — quadlets express intent that the thing should be running). v1 supports `.container`/`.volume`/`.network`; `.pod`/`.kube`/`.image`/`.build` are deferred. |
+| Quadlets              | Create, update, delete on omission, adopt            | Auto-promoted from `storage.files` whose path is under `/etc/containers/systemd/` and ends in `.container`/`.volume`/`.network`. Equivalence is the unit canonical hash. Apply triggers `daemon-reload` + `start` of the *generated* service (always — quadlets express intent that the thing should be running; generated units can't be enabled, so boot persistence is the quadlet's `[Install]`). v1 supports `.container`/`.volume`/`.network`; `.pod`/`.kube`/`.image`/`.build` are deferred. |
 
 **Rejected IR (consumed only by Ignition):**
 
@@ -257,7 +257,7 @@ Enablement is reconciled every apply because it's persistent. Activity is not �
 **Quadlets (create / update / adopt):**
 1. Write file atomically (same as files)
 2. `systemctl daemon-reload` once, after all unit/quadlet writes (the quadlet generator runs at daemon-reload and materializes the `.service`)
-3. **First-time start, only on creation:** `systemctl enable --now <generated-service>` — quadlets always enable+start because the .container file format expresses "this thing should be running"
+3. **First-time start, only on creation:** `systemctl start <generated-service>` — NOT `enable`: a quadlet-generated unit lives in `/run/systemd/generator/` and systemd refuses to enable a generated/transient unit. Boot persistence comes from the quadlet's own `[Install]` section, which the generator translates into the wants-symlink at `daemon-reload`. Magus only needs to start it now.
 4. **Restart on content change**, only if generated service is currently active: `systemctl restart <generated-service>`
 5. **Inactive generated services whose source changed** are rewritten only; takes effect on next start. Logged.
 6. Update manifest

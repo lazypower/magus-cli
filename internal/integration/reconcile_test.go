@@ -916,6 +916,17 @@ func (c *container) journal(unit string) string {
 // Needs image egress from the nested container (busybox). The generated service
 // name for probe.container is probe.service.
 func TestQuadletRuntime(t *testing.T) {
+	// Quadlet RUNTIME (a container actually pulling + running) needs a real
+	// bootc host: it's microVM → core-base container → workload container in CI,
+	// and double-nested podman can't run a container reliably (confirmed failing
+	// both under local emulation and on the Firecracker buildah runner). On a
+	// real host it's a single nest (host → container) and works. Gate it so the
+	// nested CI suite skips it; the substrate test sets MAGUS_IT_RUNTIME=1.
+	// The magus logic it guards (start-not-enable) is also covered by the
+	// hermetic apply unit tests.
+	if os.Getenv("MAGUS_IT_RUNTIME") == "" {
+		t.Skip("quadlet runtime needs a real bootc host; set MAGUS_IT_RUNTIME=1 (substrate test)")
+	}
 	c := setup(t, workloadPolicy)
 
 	bu := func(sleep string) string {
