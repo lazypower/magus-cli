@@ -171,3 +171,23 @@ func (f *Fake) Restart(unit string) error {
 	f.activity[unit] = true
 	return nil
 }
+
+func (f *Fake) Start(unit string) error {
+	if err := f.record(fmt.Sprintf("Start(%s)", unit)); err != nil {
+		return err
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.activity[unit] = true
+	return nil
+}
+
+func (f *Fake) Stop(unit string) error {
+	if err := f.record(fmt.Sprintf("Stop(%s)", unit)); err != nil {
+		return err
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.activity[unit] = false
+	return nil
+}

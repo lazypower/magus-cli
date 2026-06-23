@@ -18,7 +18,7 @@ Image=docker.io/ollama/ollama:latest
 WantedBy=default.target
 `
 
-func TestQuadletCreateRunsEnableNowOnGeneratedService(t *testing.T) {
+func TestQuadletCreateStartsGeneratedService(t *testing.T) {
 	w := newMemWriter()
 	sd := systemd.NewFake()
 	in := &ir.IR{Quadlets: []ir.Quadlet{
@@ -40,14 +40,14 @@ func TestQuadletCreateRunsEnableNowOnGeneratedService(t *testing.T) {
 	if !containsCall(calls, "DaemonReload") {
 		t.Errorf("expected DaemonReload (quadlet generator runs on reload), got: %v", calls)
 	}
-	// Generated service name for ollama.container is ollama.service.
-	if !containsCall(calls, "EnableNow(ollama.service)") {
-		t.Errorf("expected EnableNow on generated service, got: %v", calls)
+	// Generated units can't be enabled — magus STARTS the generated service
+	// (ollama.service), it does not enable it.
+	if !containsCall(calls, "Start(ollama.service)") {
+		t.Errorf("expected Start on generated service, got: %v", calls)
 	}
-	// The quadlet itself (ollama.container) is NOT what gets enabled.
 	for _, c := range calls {
-		if c == "EnableNow(ollama.container)" {
-			t.Errorf("EnableNow should target generated .service, not the quadlet name; got: %v", calls)
+		if c == "EnableNow(ollama.service)" || c == "Enable(ollama.service)" {
+			t.Errorf("must not enable a generated unit (systemd refuses); got: %v", calls)
 		}
 	}
 	// Manifest tracks it as a quadlet.
@@ -77,24 +77,29 @@ func TestQuadletDeleteStopsGeneratedServiceBeforeUnlink(t *testing.T) {
 	}
 	calls := sd.Calls()
 
-	// DisableNow must target the generated service (ollama.service), not
-	// the quadlet name.
-	if !containsCall(calls, "DisableNow(ollama.service)") {
-		t.Errorf("expected DisableNow on generated service, got: %v", calls)
+	// Stop (NOT disable — generated units can't be disabled) must target the
+	// generated service (ollama.service), not the quadlet name.
+	if !containsCall(calls, "Stop(ollama.service)") {
+		t.Errorf("expected Stop on generated service, got: %v", calls)
 	}
-	// And it must come before DaemonReload (so systemd stops the running
-	// container before the source is gone).
-	disableIdx, reloadIdx := -1, -1
+	for _, c := range calls {
+		if c == "DisableNow(ollama.service)" || c == "Disable(ollama.service)" {
+			t.Errorf("must not disable a generated unit (systemd refuses); got: %v", calls)
+		}
+	}
+	// Stop must come before DaemonReload (stop the running container before the
+	// source is gone and the generator drops the unit).
+	stopIdx, reloadIdx := -1, -1
 	for i, c := range calls {
 		switch c {
-		case "DisableNow(ollama.service)":
-			disableIdx = i
+		case "Stop(ollama.service)":
+			stopIdx = i
 		case "DaemonReload":
 			reloadIdx = i
 		}
 	}
-	if disableIdx < 0 || reloadIdx < 0 || disableIdx > reloadIdx {
-		t.Errorf("DisableNow must precede DaemonReload, got: %v", calls)
+	if stopIdx < 0 || reloadIdx < 0 || stopIdx > reloadIdx {
+		t.Errorf("Stop must precede DaemonReload, got: %v", calls)
 	}
 	if _, present := w.files[path]; present {
 		t.Error("quadlet source file should be removed")
