@@ -3,7 +3,7 @@ module gitea.wabash.place/lab/magus-cli
 go 1.26.2
 
 require (
-	github.com/coreos/butane v0.27.0
+	github.com/coreos/butane v0.28.0
 	github.com/coreos/vcontext v0.0.0-20260306102053-7a68b5426c74
 	github.com/pmezard/go-difflib v1.0.1-0.20181226105442-5d4384ee4fb2
 	gopkg.in/yaml.v3 v3.0.1
