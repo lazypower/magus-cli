@@ -227,11 +227,10 @@ func ApplyWithPolicy(p *policy.Policy, plan *diff.Plan, in *ir.IR, w hostfs.Writ
 		r.Outcomes = append(r.Outcomes, outcomes...)
 	}
 
-	// Phase 3b: per-IR-quadlet state reconciliation. The .container file is
-	// the quadlet source; magus drives the *generated* .service. Quadlets
-	// always reconcile to enabled (the .container format expresses "this
-	// thing should be running") — the operator opts out by removing the
-	// declaration entirely, not via a flag.
+	// Phase 3b: per-IR-quadlet state reconciliation. The .container file is the
+	// quadlet source; magus drives the *generated* .service. Generated units
+	// CANNOT be enabled (systemd refuses), so magus only starts them — boot
+	// persistence comes from the [Install] section the generator processes.
 	for _, q := range in.Quadlets {
 		svc, err := diff.QuadletGeneratedService(q.Name)
 		if err != nil {
@@ -245,7 +244,7 @@ func ApplyWithPolicy(p *policy.Policy, plan *diff.Plan, in *ir.IR, w hostfs.Writ
 		if ev == nil {
 			ev = &unitEvents{}
 		}
-		outcomes := reconcileServiceState(svc, true, ev, sd)
+		outcomes := reconcileQuadletState(svc, ev, sd)
 		r.Outcomes = append(r.Outcomes, outcomes...)
 	}
 
@@ -392,9 +391,11 @@ func applyQuadletDelete(p *policy.Policy, a diff.ResourceAction, w hostfs.Writer
 		oc.Err = err
 		return oc
 	}
-	if err := sd.DisableNow(svc); err != nil {
+	// Stop (NOT disable --now): the generated service can't be disabled. Stop
+	// the container, then unlink the source so daemon-reload drops the unit.
+	if err := sd.Stop(svc); err != nil {
 		oc.Status = StatusErrored
-		oc.Err = fmt.Errorf("disable --now %s: %w", svc, err)
+		oc.Err = fmt.Errorf("stop %s: %w", svc, err)
 		return oc
 	}
 	if err := w.Remove(a.Path); err != nil {
@@ -727,6 +728,41 @@ func reconcileServiceState(serviceName string, desiredEnabled bool, ev *unitEven
 		}
 	}
 
+	return outcomes
+}
+
+// reconcileQuadletState drives a quadlet's *generated* .service. Unlike units,
+// generated services cannot be enabled/disabled (systemd rejects it), so there
+// is no enablement reconciliation: magus starts the service on first creation
+// (boot persistence is the generator's job, from the quadlet's [Install]) and
+// restarts it if active when the source content changes.
+func reconcileQuadletState(serviceName string, ev *unitEvents, sd systemd.Manager) []Outcome {
+	if ev.bodyDeleted {
+		return nil // stop happened in the delete phase
+	}
+	var outcomes []Outcome
+
+	if ev.bodyCreated {
+		// First materialization: start (NOT enable — it's a generated unit).
+		err := sd.Start(serviceName)
+		outcomes = append(outcomes, unitOutcome(serviceName, "start", err))
+		return outcomes
+	}
+
+	if ev.hasContentMut {
+		active, _ := sd.IsActive(serviceName)
+		if active {
+			err := sd.Restart(serviceName)
+			outcomes = append(outcomes, unitOutcome(serviceName, "restart", err))
+		} else {
+			outcomes = append(outcomes, Outcome{
+				Path:   serviceName,
+				Action: diff.ActionUpdate,
+				Status: StatusApplied,
+				Reason: "content updated, inactive — change takes effect on next start",
+			})
+		}
+	}
 	return outcomes
 }
 

@@ -8,6 +8,7 @@ import (
 	"reflect"
 	"strings"
 	"testing"
+	"time"
 
 	"gitea.wabash.place/lab/magus-cli/internal/policy"
 )
@@ -881,5 +882,97 @@ func TestWorkloadPolicyMatchesCoreImage(t *testing.T) {
 
 	if !reflect.DeepEqual(live, embedded) {
 		t.Errorf("embedded workloadPolicy has drifted from the real core-image boundary\nlive:     %+v\nembedded: %+v", live, embedded)
+	}
+}
+
+// waitActive polls is-active until the unit is "active" or the timeout elapses.
+func (c *container) waitActive(unit string, timeout time.Duration) bool {
+	c.t.Helper()
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		if c.isActive(unit) == "active" {
+			return true
+		}
+		time.Sleep(2 * time.Second)
+	}
+	return false
+}
+
+// journal returns diagnostics for a unit on failure: status + journal + the
+// container runtime view (journald may not persist in the test container).
+func (c *container) journal(unit string) string {
+	st, _ := c.exec("systemctl", "status", unit, "--no-pager", "-l")
+	jr, _ := c.exec("journalctl", "-xeu", unit, "--no-pager", "-n", "50")
+	ps, _ := c.exec("podman", "ps", "-a")
+	return "## systemctl status\n" + st + "\n## journalctl\n" + jr + "\n## podman ps -a\n" + ps
+}
+
+// TestQuadletRuntime proves the REAL quadlet workload path the generation-only
+// test can't: a .container quadlet is applied, the generated service actually
+// pulls its image and the container RUNS (service active); a content change
+// restarts it; and removing it from the IR stops the container and unlinks the
+// source. This is the core core-base use case and the biggest pre-metal unknown.
+//
+// Needs image egress from the nested container (busybox). The generated service
+// name for probe.container is probe.service.
+func TestQuadletRuntime(t *testing.T) {
+	// Quadlet RUNTIME (a container actually pulling + running) needs a real
+	// bootc host: it's microVM → core-base container → workload container in CI,
+	// and double-nested podman can't run a container reliably (confirmed failing
+	// both under local emulation and on the Firecracker buildah runner). On a
+	// real host it's a single nest (host → container) and works. Gate it so the
+	// nested CI suite skips it; the substrate test sets MAGUS_IT_RUNTIME=1.
+	// The magus logic it guards (start-not-enable) is also covered by the
+	// hermetic apply unit tests.
+	if os.Getenv("MAGUS_IT_RUNTIME") == "" {
+		t.Skip("quadlet runtime needs a real bootc host; set MAGUS_IT_RUNTIME=1 (substrate test)")
+	}
+	c := setup(t, workloadPolicy)
+
+	bu := func(sleep string) string {
+		return butaneHeader + `storage:
+  files:
+    - path: /etc/containers/systemd/probe.container
+      contents:
+        inline: |
+          [Container]
+          Image=docker.io/library/busybox
+          Exec=sleep ` + sleep + `
+          [Install]
+          WantedBy=multi-user.target
+`
+	}
+
+	// Create → the container must actually run (service active).
+	out, code := c.apply(bu("3600"))
+	if !c.waitActive("probe.service", 90*time.Second) {
+		t.Fatalf("quadlet container did not reach active (apply exit %d)\n%s\n--- journal ---\n%s",
+			code, out, c.journal("probe.service"))
+	}
+
+	// Content change → magus restarts the running generated service.
+	out2, code2 := c.apply(bu("7200"))
+	if code2 != 0 {
+		t.Fatalf("quadlet update apply: exit %d\n%s", code2, out2)
+	}
+	if !c.waitActive("probe.service", 60*time.Second) {
+		t.Errorf("quadlet service not active after content-change restart\n%s", c.journal("probe.service"))
+	}
+
+	// Remove from IR → magus stops the container and unlinks the source.
+	bu3 := butaneHeader + `storage:
+  files:
+    - path: /etc/core/keep.conf
+      contents:
+        inline: keep
+`
+	if out3, code3 := c.apply(bu3); code3 != 0 {
+		t.Fatalf("quadlet delete apply: exit %d\n%s", code3, out3)
+	}
+	if c.exists("/etc/containers/systemd/probe.container") {
+		t.Errorf("quadlet source not unlinked on omission")
+	}
+	if s := c.isActive("probe.service"); s == "active" {
+		t.Errorf("quadlet container still running after removal: is-active=%s", s)
 	}
 }

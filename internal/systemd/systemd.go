@@ -64,6 +64,14 @@ type Manager interface {
 	// Restart restarts the unit. Used on content change for already-active
 	// units.
 	Restart(unit string) error
+	// Start starts the unit without touching enablement. Used for quadlet
+	// generated services, which CANNOT be enabled (systemd refuses to enable a
+	// generated unit) — their boot persistence comes from the [Install] section
+	// the quadlet generator processes, so magus only needs to start them.
+	Start(unit string) error
+	// Stop stops the unit without touching enablement. Used to tear down a
+	// quadlet's generated service before its source is unlinked.
+	Stop(unit string) error
 }
 
 // OS returns a Manager backed by the real systemctl binary. If systemctl
@@ -103,6 +111,8 @@ func (m *osManager) EnableNow(unit string) error  { return m.run("enable", "--no
 func (m *osManager) Disable(unit string) error    { return m.run("disable", unit) }
 func (m *osManager) DisableNow(unit string) error { return m.run("disable", "--now", unit) }
 func (m *osManager) Restart(unit string) error    { return m.run("restart", unit) }
+func (m *osManager) Start(unit string) error      { return m.run("start", unit) }
+func (m *osManager) Stop(unit string) error       { return m.run("stop", unit) }
 
 func (m *osManager) IsEnabled(unit string) (Enablement, error) {
 	out, _ := m.runOutput("is-enabled", unit)
@@ -167,3 +177,5 @@ func (unavailableManager) EnableNow(string) error             { return ErrUnavai
 func (unavailableManager) Disable(string) error               { return ErrUnavailable }
 func (unavailableManager) DisableNow(string) error            { return ErrUnavailable }
 func (unavailableManager) Restart(string) error               { return ErrUnavailable }
+func (unavailableManager) Start(string) error                 { return ErrUnavailable }
+func (unavailableManager) Stop(string) error                  { return ErrUnavailable }

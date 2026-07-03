@@ -16,6 +16,8 @@ func TestFakeRecordsCallsInOrder(t *testing.T) {
 	_ = f.Disable("c.service")
 	_ = f.DisableNow("d.service")
 	_ = f.Restart("e.service")
+	_ = f.Start("f.service")
+	_ = f.Stop("g.service")
 
 	want := []string{
 		"DaemonReload",
@@ -24,6 +26,8 @@ func TestFakeRecordsCallsInOrder(t *testing.T) {
 		"Disable(c.service)",
 		"DisableNow(d.service)",
 		"Restart(e.service)",
+		"Start(f.service)",
+		"Stop(g.service)",
 	}
 	got := f.Calls()
 	if len(got) != len(want) {
@@ -89,6 +93,7 @@ func TestUnavailableManager(t *testing.T) {
 	for name, fn := range map[string]func(string) error{
 		"Enable": m.Enable, "EnableNow": m.EnableNow,
 		"Disable": m.Disable, "DisableNow": m.DisableNow, "Restart": m.Restart,
+		"Start": m.Start, "Stop": m.Stop,
 	} {
 		if err := fn("x"); !errors.Is(err, ErrUnavailable) {
 			t.Errorf("%s: %v", name, err)

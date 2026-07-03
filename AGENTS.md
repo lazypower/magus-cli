@@ -24,6 +24,11 @@ contract; `docs/implementation-plan.md` for how v1 was built.
 - `make integration` — real-environment suite: runs the `magus` binary inside a
   privileged systemd `core-base` container via podman (~3 min). Needs podman +
   the image; NOT part of the hermetic gate.
+  - `TestQuadletRuntime` (a quadlet container actually pulling + running) is
+    **skipped unless `MAGUS_IT_RUNTIME=1`** — double-nested podman
+    (microVM → core-base → workload) can't run a container in CI; it's a
+    real-bootc-host check. Run it on the substrate:
+    `MAGUS_IT_RUNTIME=1 go test -tags integration -run TestQuadletRuntime ./internal/integration/`.
 - `gofmt` and `go vet ./...` must be clean.
 
 ## CI (gitea)
