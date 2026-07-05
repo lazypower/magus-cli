@@ -4,8 +4,8 @@ import (
 	"errors"
 	"testing"
 
-	"gitea.wabash.place/lab/magus-cli/internal/ir"
-	"gitea.wabash.place/lab/magus-cli/internal/systemd"
+	"github.com/lazypower/magus-cli/internal/ir"
+	"github.com/lazypower/magus-cli/internal/systemd"
 )
 
 func TestObserveUnitsReportsRawState(t *testing.T) {

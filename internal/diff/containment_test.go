@@ -5,9 +5,9 @@ import (
 	"testing"
 	"time"
 
-	"gitea.wabash.place/lab/magus-cli/internal/ir"
-	"gitea.wabash.place/lab/magus-cli/internal/manifest"
-	"gitea.wabash.place/lab/magus-cli/internal/policy"
+	"github.com/lazypower/magus-cli/internal/ir"
+	"github.com/lazypower/magus-cli/internal/manifest"
+	"github.com/lazypower/magus-cli/internal/policy"
 )
 
 // resolverFS is a memFS that also implements hostfs.Resolver, simulating

@@ -4,7 +4,7 @@ import (
 	"strings"
 	"testing"
 
-	"gitea.wabash.place/lab/magus-cli/internal/ir"
+	"github.com/lazypower/magus-cli/internal/ir"
 )
 
 // workloadLike mirrors the real core-image workload policy shape: quadlets live

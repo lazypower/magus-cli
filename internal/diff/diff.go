@@ -9,10 +9,10 @@ import (
 	"fmt"
 	"path/filepath"
 
-	"gitea.wabash.place/lab/magus-cli/internal/hostfs"
-	"gitea.wabash.place/lab/magus-cli/internal/ir"
-	"gitea.wabash.place/lab/magus-cli/internal/manifest"
-	"gitea.wabash.place/lab/magus-cli/internal/policy"
+	"github.com/lazypower/magus-cli/internal/hostfs"
+	"github.com/lazypower/magus-cli/internal/ir"
+	"github.com/lazypower/magus-cli/internal/manifest"
+	"github.com/lazypower/magus-cli/internal/policy"
 )
 
 // Action is the per-resource verb the planner picks.

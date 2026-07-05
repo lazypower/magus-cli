@@ -11,11 +11,11 @@ import (
 	"strings"
 	"time"
 
-	"gitea.wabash.place/lab/magus-cli/internal/diff"
-	"gitea.wabash.place/lab/magus-cli/internal/hostfs"
-	"gitea.wabash.place/lab/magus-cli/internal/ir"
-	"gitea.wabash.place/lab/magus-cli/internal/manifest"
-	"gitea.wabash.place/lab/magus-cli/internal/policy"
+	"github.com/lazypower/magus-cli/internal/diff"
+	"github.com/lazypower/magus-cli/internal/hostfs"
+	"github.com/lazypower/magus-cli/internal/ir"
+	"github.com/lazypower/magus-cli/internal/manifest"
+	"github.com/lazypower/magus-cli/internal/policy"
 )
 
 const adoptUsage = `magus adopt — take over an existing path that differs from the IR

@@ -1,4 +1,4 @@
-module gitea.wabash.place/lab/magus-cli
+module github.com/lazypower/magus-cli
 
 go 1.26.2
 

@@ -4,7 +4,7 @@ import (
 	"testing"
 	"time"
 
-	"gitea.wabash.place/lab/magus-cli/internal/manifest"
+	"github.com/lazypower/magus-cli/internal/manifest"
 )
 
 func TestOrphanDeniedTransitionsNewlyDeniedOwnedPath(t *testing.T) {

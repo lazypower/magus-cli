@@ -5,10 +5,10 @@ import (
 	"testing"
 	"time"
 
-	"gitea.wabash.place/lab/magus-cli/internal/diff"
-	"gitea.wabash.place/lab/magus-cli/internal/ir"
-	"gitea.wabash.place/lab/magus-cli/internal/manifest"
-	"gitea.wabash.place/lab/magus-cli/internal/systemd"
+	"github.com/lazypower/magus-cli/internal/diff"
+	"github.com/lazypower/magus-cli/internal/ir"
+	"github.com/lazypower/magus-cli/internal/manifest"
+	"github.com/lazypower/magus-cli/internal/systemd"
 )
 
 const sampleUnitBody = "[Unit]\nDescription=test\n[Service]\nExecStart=/bin/foo\n[Install]\nWantedBy=multi-user.target\n"

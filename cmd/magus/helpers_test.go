@@ -6,11 +6,11 @@ import (
 	"testing"
 	"time"
 
-	"gitea.wabash.place/lab/magus-cli/internal/apply"
-	"gitea.wabash.place/lab/magus-cli/internal/diff"
-	"gitea.wabash.place/lab/magus-cli/internal/ir"
-	"gitea.wabash.place/lab/magus-cli/internal/manifest"
-	"gitea.wabash.place/lab/magus-cli/internal/status"
+	"github.com/lazypower/magus-cli/internal/apply"
+	"github.com/lazypower/magus-cli/internal/diff"
+	"github.com/lazypower/magus-cli/internal/ir"
+	"github.com/lazypower/magus-cli/internal/manifest"
+	"github.com/lazypower/magus-cli/internal/status"
 )
 
 func TestPlanCountsAndSummary(t *testing.T) {

@@ -99,7 +99,7 @@ func buildMagus(ref string) (string, func(), error) {
 	bin := dir + "/magus"
 
 	cmd := exec.Command("go", "build", "-ldflags=-s -w", "-o", bin,
-		"gitea.wabash.place/lab/magus-cli/cmd/magus")
+		"github.com/lazypower/magus-cli/cmd/magus")
 	cmd.Dir = ".." + string(os.PathSeparator) + ".." // module root from internal/integration
 	cmd.Env = append(os.Environ(), "CGO_ENABLED=0", "GOOS=linux", "GOARCH="+arch)
 	if out, err := cmd.CombinedOutput(); err != nil {

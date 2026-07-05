@@ -10,7 +10,7 @@ import (
 	"testing"
 	"time"
 
-	"gitea.wabash.place/lab/magus-cli/internal/policy"
+	"github.com/lazypower/magus-cli/internal/policy"
 )
 
 // workloadPolicy is a byte-faithful copy of ../core-image/config/magus/policy.yaml

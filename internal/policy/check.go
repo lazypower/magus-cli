@@ -3,7 +3,7 @@ package policy
 import (
 	"fmt"
 
-	"gitea.wabash.place/lab/magus-cli/internal/ir"
+	"github.com/lazypower/magus-cli/internal/ir"
 )
 
 // Violation is a single policy-vs-IR conflict reported by Check. Each

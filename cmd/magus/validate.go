@@ -5,8 +5,8 @@ import (
 	"fmt"
 	"os"
 
-	"gitea.wabash.place/lab/magus-cli/internal/ir"
-	"gitea.wabash.place/lab/magus-cli/internal/policy"
+	"github.com/lazypower/magus-cli/internal/ir"
+	"github.com/lazypower/magus-cli/internal/policy"
 )
 
 const validateUsage = `magus validate — parse a Butane source and check it against the policy

@@ -6,10 +6,10 @@ import (
 	"testing"
 	"time"
 
-	"gitea.wabash.place/lab/magus-cli/internal/diff"
-	"gitea.wabash.place/lab/magus-cli/internal/hostfs"
-	"gitea.wabash.place/lab/magus-cli/internal/ir"
-	"gitea.wabash.place/lab/magus-cli/internal/status"
+	"github.com/lazypower/magus-cli/internal/diff"
+	"github.com/lazypower/magus-cli/internal/hostfs"
+	"github.com/lazypower/magus-cli/internal/ir"
+	"github.com/lazypower/magus-cli/internal/status"
 )
 
 func TestConfirmAdoptReclaim(t *testing.T) {

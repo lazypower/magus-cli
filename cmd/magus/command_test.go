@@ -9,7 +9,7 @@ import (
 	"testing"
 	"time"
 
-	"gitea.wabash.place/lab/magus-cli/internal/manifest"
+	"github.com/lazypower/magus-cli/internal/manifest"
 )
 
 // tempRoot returns a symlink-resolved temp dir, usable as a file_root without

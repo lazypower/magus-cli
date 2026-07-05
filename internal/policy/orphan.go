@@ -4,8 +4,8 @@ import (
 	"path/filepath"
 	"time"
 
-	"gitea.wabash.place/lab/magus-cli/internal/ir"
-	"gitea.wabash.place/lab/magus-cli/internal/manifest"
+	"github.com/lazypower/magus-cli/internal/ir"
+	"github.com/lazypower/magus-cli/internal/manifest"
 )
 
 // OrphanDenied transitions every actively-owned manifest entry whose path the

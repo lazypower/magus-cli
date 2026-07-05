@@ -6,9 +6,9 @@ import (
 	"testing"
 	"time"
 
-	"gitea.wabash.place/lab/magus-cli/internal/hostfs"
-	"gitea.wabash.place/lab/magus-cli/internal/ir"
-	"gitea.wabash.place/lab/magus-cli/internal/manifest"
+	"github.com/lazypower/magus-cli/internal/hostfs"
+	"github.com/lazypower/magus-cli/internal/ir"
+	"github.com/lazypower/magus-cli/internal/manifest"
 )
 
 // memFile is one entry in the in-memory test filesystem. isDir distinguishes
