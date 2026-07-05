@@ -1,0 +1,74 @@
+name: Test
+
+# GitHub-side hermetic gate — the second of the two gates (the first is
+# .gitea/workflows/test.yml on the homelab runner). Same checks, GitHub-native
+# plumbing (setup-go/checkout instead of the manual clone the no-node gitea
+# runner needs). The podman/systemd integration suite is NOT run here: it needs
+# the LAN-only core-base image and privileged nested systemd, so it lives on the
+# gitea buildah runner (nightly + on-demand). We still COMPILE the harness so it
+# can't rot.
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: Format check
+        run: |
+          unformatted="$(gofmt -l .)"
+          if [ -n "$unformatted" ]; then
+            echo "::error::gofmt needed on:"; echo "$unformatted"; exit 1
+          fi
+
+      - name: Vet
+        run: go vet ./...
+
+      - name: Build
+        run: go build ./...
+
+      - name: Compile integration harness
+        # Compile (don't run) the build-tagged suite so it can't rot unnoticed.
+        run: go test -tags integration -run NONE ./internal/integration/
+
+      - name: Test + coverage floor
+        env:
+          COVERAGE_MIN: "70"
+        run: |
+          go test -cover ./... > cover.txt 2>&1; rc=$?
+          cat cover.txt
+          if [ "$rc" -ne 0 ]; then
+            echo "::error::go test failed (exit $rc)"; exit "$rc"
+          fi
+          echo "--- enforcing per-package coverage floor: ${COVERAGE_MIN}% ---"
+          fail=0
+          while IFS= read -r line; do
+            case "$line" in
+              *coverage:*)
+                pct=$(printf '%s\n' "$line" | sed -n 's/.*coverage: \([0-9.]*\)%.*/\1/p')
+                if [ -n "$pct" ] && awk "BEGIN{exit !($pct < $COVERAGE_MIN)}"; then
+                  echo "::error::coverage ${pct}% is below the ${COVERAGE_MIN}% floor: $line"
+                  fail=1
+                fi
+                ;;
+            esac
+          done < cover.txt
+          if [ "$fail" -ne 0 ]; then
+            echo "::error::one or more packages are below the coverage floor"; exit 1
+          fi
+          echo "all tested packages meet the ${COVERAGE_MIN}% floor"
