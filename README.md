@@ -63,3 +63,7 @@ go test ./...
 The binary is static (`CGO_ENABLED=0`) and shells out to `systemctl`; on hosts
 without systemd, unit/quadlet operations surface as per-resource errors rather
 than crashing, so `validate`/`plan` work anywhere.
+
+## License
+
+[Apache License 2.0](LICENSE).
