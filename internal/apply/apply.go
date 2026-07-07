@@ -277,11 +277,11 @@ func ObserveUnits(in *ir.IR, sd systemd.Manager) map[string]string {
 // failed/activating/…) or "unknown" if it can't be determined. Observation
 // only — never fatal.
 func activeState(sd systemd.Manager, name string) string {
-	state, err := sd.ActiveState(name)
+	status, err := sd.Show(name)
 	if err != nil {
 		return "unknown"
 	}
-	return state
+	return status.Active
 }
 
 func indexResources(in *ir.IR) map[string]pendingResource {
@@ -398,7 +398,7 @@ func applyQuadletDelete(p *policy.Policy, a diff.ResourceAction, w hostfs.Writer
 	// isn't loaded, and `systemctl stop` on it would fail and wedge the delete
 	// forever. Tolerating "not active" lets the reconciler remove the bad source
 	// (D11). A real stop failure on a running service is still surfaced.
-	if active, _ := sd.IsActive(svc); active {
+	if status, _ := sd.Show(svc); status.IsActive() {
 		if err := sd.Stop(svc); err != nil {
 			oc.Status = StatusErrored
 			oc.Err = fmt.Errorf("stop %s: %w", svc, err)
@@ -717,16 +717,24 @@ func reconcileServiceState(serviceName string, desiredEnabled *bool, ev *unitEve
 		return outcomes
 	}
 
-	// Existing service: reconcile enablement every apply — but only when the
-	// IR actually declares it. nil means "leave enablement alone". The
+	// Existing service. Both the enablement decision and the restart decision
+	// need live state, so fetch it once (Show = enablement + active in one
+	// systemctl call) — but only when there's actually a decision to make: a
+	// unit whose enablement is undeclared (nil) and whose content didn't change
+	// needs no query at all.
+	if desiredEnabled == nil && !ev.hasContentMut {
+		return outcomes
+	}
+	status, err := sd.Show(serviceName)
+
+	// Reconcile enablement every apply — but only when the IR declares it. The
 	// enable/disable/skip decision comes from diff.EnablementOp, the single
 	// authority the planner also uses, so plan and apply never diverge.
 	if desiredEnabled != nil {
-		current, err := sd.IsEnabled(serviceName)
 		if err != nil {
-			outcomes = append(outcomes, unitOutcome(serviceName, "is-enabled", err))
+			outcomes = append(outcomes, unitOutcome(serviceName, "show", err))
 		} else {
-			switch op, reason := diff.EnablementOp(desiredEnabled, current); op {
+			switch op, reason := diff.EnablementOp(desiredEnabled, status.Enablement); op {
 			case diff.ServiceEnable:
 				outcomes = append(outcomes, unitOutcome(serviceName, "enable", sd.Enable(serviceName)))
 			case diff.ServiceDisable:
@@ -748,8 +756,7 @@ func reconcileServiceState(serviceName string, desiredEnabled *bool, ev *unitEve
 	// Inactive services whose content changed are rewritten only — the new
 	// content takes effect on next start. Logged for visibility.
 	if ev.hasContentMut {
-		active, _ := sd.IsActive(serviceName)
-		if active {
+		if err == nil && status.IsActive() {
 			err := sd.Restart(serviceName)
 			outcomes = append(outcomes, unitOutcome(serviceName, "restart", err))
 		} else {
@@ -784,8 +791,8 @@ func reconcileQuadletState(serviceName string, ev *unitEvents, sd systemd.Manage
 	}
 
 	if ev.hasContentMut {
-		active, _ := sd.IsActive(serviceName)
-		if active {
+		status, _ := sd.Show(serviceName)
+		if status.IsActive() {
 			err := sd.Restart(serviceName)
 			outcomes = append(outcomes, unitOutcome(serviceName, "restart", err))
 		} else {

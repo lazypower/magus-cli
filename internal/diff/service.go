@@ -101,11 +101,11 @@ func PlanServiceState(in *ir.IR, plan *Plan, sd systemd.Manager) {
 			}
 			continue
 		}
-		current, err := sd.IsEnabled(u.Name)
+		status, err := sd.Show(u.Name)
 		if err != nil {
 			continue // systemd unavailable — can't preview enablement
 		}
-		if op, reason := EnablementOp(u.Enabled, current); op != "" {
+		if op, reason := EnablementOp(u.Enabled, status.Enablement); op != "" {
 			plan.ServiceActions = append(plan.ServiceActions, ServiceAction{
 				Unit:   u.Name,
 				Op:     op,

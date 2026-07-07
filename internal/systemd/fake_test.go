@@ -57,18 +57,18 @@ func TestFakeFailNext(t *testing.T) {
 
 func TestFakeEnablementAndActivity(t *testing.T) {
 	f := NewFake()
-	if e, _ := f.IsEnabled("x.service"); e != EnablementDisabled {
-		t.Errorf("default enablement = %q, want disabled", e)
+	if s, _ := f.Show("x.service"); s.Enablement != EnablementDisabled {
+		t.Errorf("default enablement = %q, want disabled", s.Enablement)
 	}
 	f.SetEnablement("x.service", EnablementEnabled)
-	if e, _ := f.IsEnabled("x.service"); e != EnablementEnabled {
-		t.Errorf("SetEnablement not honored: %q", e)
+	if s, _ := f.Show("x.service"); s.Enablement != EnablementEnabled {
+		t.Errorf("SetEnablement not honored: %q", s.Enablement)
 	}
-	if a, _ := f.IsActive("x.service"); a {
+	if s, _ := f.Show("x.service"); s.IsActive() {
 		t.Errorf("default activity should be inactive")
 	}
 	f.SetActive("x.service", true)
-	if a, _ := f.IsActive("x.service"); !a {
+	if s, _ := f.Show("x.service"); !s.IsActive() {
 		t.Errorf("SetActive not honored")
 	}
 }
@@ -81,14 +81,8 @@ func TestUnavailableManager(t *testing.T) {
 	if err := m.DaemonReload(); !errors.Is(err, ErrUnavailable) {
 		t.Errorf("DaemonReload: %v", err)
 	}
-	if _, err := m.IsEnabled("x"); !errors.Is(err, ErrUnavailable) {
-		t.Errorf("IsEnabled: %v", err)
-	}
-	if _, err := m.IsActive("x"); !errors.Is(err, ErrUnavailable) {
-		t.Errorf("IsActive: %v", err)
-	}
-	if s, err := m.ActiveState("x"); s != "unknown" || !errors.Is(err, ErrUnavailable) {
-		t.Errorf("ActiveState: %q %v", s, err)
+	if s, err := m.Show("x"); !errors.Is(err, ErrUnavailable) || s.Active != "unknown" {
+		t.Errorf("Show: %+v %v", s, err)
 	}
 	for name, fn := range map[string]func(string) error{
 		"Enable": m.Enable, "EnableNow": m.EnableNow,

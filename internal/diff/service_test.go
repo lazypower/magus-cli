@@ -102,7 +102,7 @@ func TestPlanServiceStateNewUnitEnables(t *testing.T) {
 
 func TestPlanServiceStateSystemdUnavailableSkips(t *testing.T) {
 	sd := systemd.NewFake()
-	sd.FailNext("IsEnabled(magus-foo.service)", errors.New("no systemctl"))
+	sd.FailNext("Show(magus-foo.service)", errors.New("no systemctl"))
 	in := &ir.IR{Units: []ir.Unit{{Name: "magus-foo.service", Enabled: boolPtr(true)}}}
 	plan := &Plan{}
 	PlanServiceState(in, plan, sd)

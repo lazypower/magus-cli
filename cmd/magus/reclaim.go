@@ -271,7 +271,7 @@ func reloadFailed(sd systemd.Manager) bool {
 // restartIfActive restarts svc only when it is currently running, so the
 // rewritten definition takes effect immediately for an active service.
 func restartIfActive(sd systemd.Manager, svc string) {
-	if active, _ := sd.IsActive(svc); active {
+	if status, _ := sd.Show(svc); status.IsActive() {
 		if err := sd.Restart(svc); err != nil {
 			fmt.Fprintf(os.Stderr, "warning: restart %s failed: %v\n", svc, err)
 		}

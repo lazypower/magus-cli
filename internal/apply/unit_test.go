@@ -358,8 +358,8 @@ func TestUnitEnabledOmittedDoesNotDisable(t *testing.T) {
 		if c == "Disable(magus-foo.service)" || c == "DisableNow(magus-foo.service)" {
 			t.Errorf("unit with omitted enablement must not be disabled, got: %v", sd.Calls())
 		}
-		if c == "IsEnabled(magus-foo.service)" {
-			t.Errorf("nil enablement should not even query is-enabled, got: %v", sd.Calls())
+		if c == "Enable(magus-foo.service)" {
+			t.Errorf("unit with omitted enablement must not be enabled, got: %v", sd.Calls())
 		}
 	}
 }
