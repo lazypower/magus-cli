@@ -69,8 +69,7 @@ file_roots:
   - /var/data
 
 unit_patterns:
-  - "magus-*"
-  - "*.d/10-magus.conf"
+  - "magus-*"   # matches unit NAMES; drop-ins are gated by their parent unit's pattern
 
 deny:
   paths:

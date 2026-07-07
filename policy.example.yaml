@@ -7,9 +7,11 @@ file_roots:
   - /var/lib/magus
   - /var/data
 
+# Unit patterns match unit NAMES (e.g. magus-foo.service). Drop-ins are gated by
+# their parent unit's pattern — a drop-in to magus-foo.service is covered by
+# "magus-*" — so there is no separate drop-in pattern here.
 unit_patterns:
   - "magus-*"
-  - "*.d/10-magus.conf"
 
 deny:
   paths:
