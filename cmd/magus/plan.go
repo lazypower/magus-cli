@@ -1,6 +1,7 @@
 package main
 
 import (
+	"encoding/json"
 	"flag"
 	"fmt"
 	"io"
@@ -27,6 +28,8 @@ Flags:
   -v, --verbose       With --explain, reveal the content diff for conflicts
                       (unowned). Default: conflicts show hashes only, so an
                       unowned file's content is never written to logs.
+  --json              Emit the plan as machine-readable JSON (actions, service
+                      actions, hashes, summary) for a scriptable review→apply loop
   --policy <path>     Override policy file (default: /etc/magus/policy.yaml)
   --manifest <path>   Override manifest file (default: /var/lib/magus/manifest.json)
 
@@ -43,6 +46,7 @@ func runPlan(args []string) int {
 	policyPath := fs.String("policy", policy.DefaultPath, "policy file path")
 	manifestPath := fs.String("manifest", manifest.DefaultPath, "manifest file path")
 	explainFlag := fs.Bool("explain", false, "show per-resource diffs")
+	jsonOut := fs.Bool("json", false, "emit machine-readable JSON plan")
 	var verbose bool
 	fs.BoolVar(&verbose, "v", false, "reveal conflict content with --explain")
 	fs.BoolVar(&verbose, "verbose", false, "reveal conflict content with --explain")
@@ -93,14 +97,80 @@ func runPlan(args []string) int {
 	// systemd is unavailable.
 	diff.PlanServiceState(parsed, plan, systemd.OS())
 
-	var details map[string]string
-	if *explainFlag {
-		details = buildExplanations(parsed, fsys, plan, verbose)
+	if *jsonOut {
+		if code := emitPlanJSON(os.Stdout, butanePath, plan); code != 0 {
+			return code
+		}
+	} else {
+		var details map[string]string
+		if *explainFlag {
+			details = buildExplanations(parsed, fsys, plan, verbose)
+		}
+		printPlan(os.Stdout, butanePath, plan, details)
 	}
-	printPlan(os.Stdout, butanePath, plan, details)
 
 	if plan.HasChanges() {
 		return 2
+	}
+	return 0
+}
+
+// planJSON is the machine-readable shape of a plan. The spec calls Butane the
+// LLM-facing contract and status the structured surface — plan, the thing an
+// agent gates on before `apply --yes`, gets a structured surface too (UX3).
+type planJSON struct {
+	Source         string              `json:"source"`
+	HasChanges     bool                `json:"has_changes"`
+	Actions        []actionJSON        `json:"actions"`
+	ServiceActions []serviceActionJSON `json:"service_actions"`
+}
+
+type actionJSON struct {
+	Path       string `json:"path"`
+	Kind       string `json:"kind"`
+	Action     string `json:"action"`
+	Reason     string `json:"reason,omitempty"`
+	OnDiskHash string `json:"on_disk_hash,omitempty"`
+	IRHash     string `json:"ir_hash,omitempty"`
+}
+
+type serviceActionJSON struct {
+	Unit   string `json:"unit"`
+	Op     string `json:"op"`
+	Reason string `json:"reason,omitempty"`
+}
+
+// emitPlanJSON writes the plan as indented JSON. Returns 0 on success, 1 on a
+// (near-impossible) encode error.
+func emitPlanJSON(w io.Writer, source string, p *diff.Plan) int {
+	out := planJSON{
+		Source:         source,
+		HasChanges:     p.HasChanges(),
+		Actions:        make([]actionJSON, 0, len(p.Actions)),
+		ServiceActions: make([]serviceActionJSON, 0, len(p.ServiceActions)),
+	}
+	for _, a := range p.Actions {
+		out.Actions = append(out.Actions, actionJSON{
+			Path:       a.Path,
+			Kind:       string(a.Kind),
+			Action:     string(a.Action),
+			Reason:     a.Reason,
+			OnDiskHash: a.OnDiskHash,
+			IRHash:     a.IRHash,
+		})
+	}
+	for _, sa := range p.ServiceActions {
+		out.ServiceActions = append(out.ServiceActions, serviceActionJSON{
+			Unit:   sa.Unit,
+			Op:     string(sa.Op),
+			Reason: sa.Reason,
+		})
+	}
+	enc := json.NewEncoder(w)
+	enc.SetIndent("", "  ")
+	if err := enc.Encode(out); err != nil {
+		fmt.Fprintf(os.Stderr, "error: %v\n", err)
+		return 1
 	}
 	return 0
 }

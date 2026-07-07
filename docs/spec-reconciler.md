@@ -459,6 +459,8 @@ $ magus status --json
 
 `result` is one of `ok` (everything converged), `ok-with-skips` (conflicts present, or orphans warned), or `error` (mid-apply failures). `conflicts` lists every IR-declared path Magus refuses to overwrite. `orphaned` lists every path Magus once managed but no longer reconciles due to policy — kept persistently until the file is removed from disk or the operator runs `magus reclaim`.
 
+For unattended monitoring, `magus status --check` turns `result` into an exit code (`0` converged, `2` conflicts/orphans, `1` error) so a timer or health probe can gate on the exit status instead of parsing JSON; `--max-age <dur>` additionally fails (exit `1`) when the last apply is older than the given duration, catching a stopped timer.
+
 ### `magus reclaim`
 
 Restore an orphaned path to active reconciliation. Run after the policy that caused the orphan has been removed (or amended to permit the path again). The IR must declare the path; the path must exist on disk.
@@ -519,6 +521,14 @@ error: /tmp/foo is outside allowed file_roots
 ```
 
 By default `magus validate` reads `/etc/magus/policy.yaml`. Override with `--policy <path>` for testing.
+
+### `magus version`
+
+Prints the build's version and commit (`magus <version> (<commit>)`), stamped at build time via `-ldflags`. A host-deployed static binary needs a version identifier for support and upgrade tracking.
+
+### JSON surfaces for automation
+
+`magus plan --json` emits the plan (actions, service actions, per-resource hashes, and a `has_changes` flag) as structured JSON — Butane is the LLM-facing input contract and `status --json` the structured output, and `plan --json` makes the review-then-`apply --yes` loop scriptable without scraping text. Exit codes are unchanged (`0` no changes, `2` pending, `1` input-bad).
 
 ## Relationship to existing artifacts
 

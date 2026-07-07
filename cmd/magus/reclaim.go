@@ -1,14 +1,11 @@
 package main
 
 import (
-	"bufio"
 	"errors"
 	"flag"
 	"fmt"
-	"io"
 	"os"
 	"path/filepath"
-	"strings"
 	"time"
 
 	"github.com/lazypower/magus-cli/internal/diff"
@@ -193,7 +190,7 @@ func runReclaim(args []string) int {
 	}
 
 	if !*yes {
-		if !confirmReclaim(os.Stdin, os.Stdout, target) {
+		if !confirmAction(os.Stdin, os.Stdout, fmt.Sprintf("Reclaim %s? [y/N] ", target)) {
 			fmt.Println("Aborted.")
 			return 0
 		}
@@ -287,7 +284,7 @@ func reclaimDirectory(target string, entry manifest.Resource, m *manifest.Manife
 	fmt.Println("Reclaiming will resume reconciliation of its mode and ownership.")
 
 	if !yes {
-		if !confirmReclaim(os.Stdin, os.Stdout, target) {
+		if !confirmAction(os.Stdin, os.Stdout, fmt.Sprintf("Reclaim %s? [y/N] ", target)) {
 			fmt.Println("Aborted.")
 			return 0
 		}
@@ -365,15 +362,4 @@ func matchAnnotation(matches bool) string {
 		return "  (matches)"
 	}
 	return "  (differs)"
-}
-
-func confirmReclaim(in io.Reader, out io.Writer, path string) bool {
-	fmt.Fprintf(out, "Reclaim %s? [y/N] ", path)
-	r := bufio.NewReader(in)
-	line, err := r.ReadString('\n')
-	if err != nil && line == "" {
-		return false
-	}
-	answer := strings.ToLower(strings.TrimSpace(line))
-	return answer == "y" || answer == "yes"
 }

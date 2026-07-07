@@ -1,13 +1,11 @@
 package main
 
 import (
-	"bufio"
 	"errors"
 	"flag"
 	"fmt"
 	"io"
 	"os"
-	"strings"
 	"time"
 
 	"github.com/lazypower/magus-cli/internal/apply"
@@ -278,13 +276,7 @@ func confirm(in io.Reader, out io.Writer, changes, conflicts int) bool {
 			conflicts, plural(conflicts))
 		return false
 	}
-	r := bufio.NewReader(in)
-	line, err := r.ReadString('\n')
-	if err != nil && line == "" {
-		return false
-	}
-	answer := strings.ToLower(strings.TrimSpace(line))
-	return answer == "y" || answer == "yes"
+	return readYesNo(in)
 }
 
 func plural(n int) string {

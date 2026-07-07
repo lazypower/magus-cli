@@ -1,13 +1,10 @@
 package main
 
 import (
-	"bufio"
 	"errors"
 	"flag"
 	"fmt"
-	"io"
 	"os"
-	"strings"
 	"time"
 
 	"github.com/lazypower/magus-cli/internal/diff"
@@ -131,6 +128,17 @@ func runAdopt(args []string) int {
 		return 1
 	}
 
+	// Symlink-resolved containment BEFORE the prompt: a deliberate overwrite
+	// must not be redirected outside authority through a symlinked ancestor, and
+	// there's no point asking the operator to confirm something we'll refuse
+	// (UX4).
+	if r, ok := w.(hostfs.Resolver); ok {
+		if _, reason := diff.ContainmentEscape(p, r, target); reason != "" {
+			fmt.Fprintf(os.Stderr, "error: refusing to adopt %s: %s\n", target, reason)
+			return 1
+		}
+	}
+
 	fmt.Println("The path exists with content that differs from the IR.")
 	fmt.Println()
 	fmt.Printf("  - existing hash: %s\n", onDisk)
@@ -139,21 +147,13 @@ func runAdopt(args []string) int {
 	fmt.Println("Overwriting will replace the existing content with the IR's declared content.")
 
 	if !*yes {
-		if !confirmAdopt(os.Stdin, os.Stdout, target) {
+		if !confirmAction(os.Stdin, os.Stdout, fmt.Sprintf("\nTake over %s? [y/N] ", target)) {
 			fmt.Println("Aborted.")
 			return 0
 		}
 	}
 	fmt.Println()
 
-	// Symlink-resolved containment: a deliberate overwrite must still not be
-	// redirected outside authority through a symlinked ancestor.
-	if r, ok := w.(hostfs.Resolver); ok {
-		if _, reason := diff.ContainmentEscape(p, r, target); reason != "" {
-			fmt.Fprintf(os.Stderr, "error: refusing to adopt %s: %s\n", target, reason)
-			return 1
-		}
-	}
 	if err := w.WriteFile(target, declared.contents, declared.mode, declared.uid, declared.gid); err != nil {
 		fmt.Fprintf(os.Stderr, "error: write %s: %v\n", target, err)
 		return 1
@@ -167,15 +167,4 @@ func runAdopt(args []string) int {
 	}
 	fmt.Printf("  ✓ %s  (rewrote, recorded in manifest)\n", target)
 	return 0
-}
-
-func confirmAdopt(in io.Reader, out io.Writer, path string) bool {
-	fmt.Fprintf(out, "\nTake over %s? [y/N] ", path)
-	r := bufio.NewReader(in)
-	line, err := r.ReadString('\n')
-	if err != nil && line == "" {
-		return false
-	}
-	answer := strings.ToLower(strings.TrimSpace(line))
-	return answer == "y" || answer == "yes"
 }

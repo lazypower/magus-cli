@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"encoding/json"
 	"strings"
 	"testing"
 	"time"
@@ -12,6 +13,60 @@ import (
 	"github.com/lazypower/magus-cli/internal/manifest"
 	"github.com/lazypower/magus-cli/internal/status"
 )
+
+func TestStatusExitCode(t *testing.T) {
+	now := time.Unix(100000, 0).UTC()
+	recent := now.Add(-1 * time.Minute)
+	old := now.Add(-1 * time.Hour)
+	cases := []struct {
+		name   string
+		r      statusReport
+		maxAge time.Duration
+		want   int
+	}{
+		{"ok", statusReport{Result: status.ResultOK, LastApply: &recent}, 0, 0},
+		{"skips", statusReport{Result: status.ResultWithSkips, LastApply: &recent}, 0, 2},
+		{"error", statusReport{Result: status.ResultError, LastApply: &recent}, 0, 1},
+		{"stale", statusReport{Result: status.ResultOK, LastApply: &old}, 30 * time.Minute, 1},
+		{"never", statusReport{Result: status.ResultOK, LastApply: nil}, 30 * time.Minute, 1},
+		{"fresh-ok", statusReport{Result: status.ResultOK, LastApply: &recent}, 30 * time.Minute, 0},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			if got := statusExitCode(c.r, c.maxAge, now); got != c.want {
+				t.Errorf("statusExitCode = %d, want %d", got, c.want)
+			}
+		})
+	}
+}
+
+func TestEmitPlanJSON(t *testing.T) {
+	var b bytes.Buffer
+	p := &diff.Plan{
+		Actions: []diff.ResourceAction{
+			{Path: "/etc/core/a", Kind: diff.KindFile, Action: diff.ActionCreate},
+		},
+		ServiceActions: []diff.ServiceAction{
+			{Unit: "x.service", Op: diff.ServiceEnable, Reason: "drift"},
+		},
+	}
+	if code := emitPlanJSON(&b, "src.bu", p); code != 0 {
+		t.Fatalf("emitPlanJSON code = %d", code)
+	}
+	var got planJSON
+	if err := json.Unmarshal(b.Bytes(), &got); err != nil {
+		t.Fatalf("invalid JSON: %v\n%s", err, b.String())
+	}
+	if got.Source != "src.bu" || !got.HasChanges {
+		t.Errorf("top-level wrong: %+v", got)
+	}
+	if len(got.Actions) != 1 || got.Actions[0].Action != "create" {
+		t.Errorf("actions wrong: %+v", got.Actions)
+	}
+	if len(got.ServiceActions) != 1 || got.ServiceActions[0].Op != "enable" {
+		t.Errorf("service actions wrong: %+v", got.ServiceActions)
+	}
+}
 
 func TestPlanCountsAndSummary(t *testing.T) {
 	p := &diff.Plan{Actions: []diff.ResourceAction{

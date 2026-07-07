@@ -12,19 +12,19 @@ import (
 	"github.com/lazypower/magus-cli/internal/status"
 )
 
-func TestConfirmAdoptReclaim(t *testing.T) {
+func TestConfirmAction(t *testing.T) {
 	var out bytes.Buffer
-	if !confirmAdopt(strings.NewReader("y\n"), &out, "/x") {
-		t.Errorf("confirmAdopt(y) should be true")
+	if !confirmAction(strings.NewReader("y\n"), &out, "Take over /x? [y/N] ") {
+		t.Errorf("confirmAction(y) should be true")
 	}
-	if confirmAdopt(strings.NewReader("n\n"), &out, "/x") {
-		t.Errorf("confirmAdopt(n) should be false")
+	if confirmAction(strings.NewReader("n\n"), &out, "Take over /x? [y/N] ") {
+		t.Errorf("confirmAction(n) should be false")
 	}
-	if !confirmReclaim(strings.NewReader("yes\n"), &out, "/x") {
-		t.Errorf("confirmReclaim(yes) should be true")
+	if !confirmAction(strings.NewReader("yes\n"), &out, "Reclaim /x? [y/N] ") {
+		t.Errorf("confirmAction(yes) should be true")
 	}
-	if confirmReclaim(strings.NewReader("\n"), &out, "/x") {
-		t.Errorf("confirmReclaim(empty) should be false")
+	if confirmAction(strings.NewReader("\n"), &out, "Reclaim /x? [y/N] ") {
+		t.Errorf("confirmAction(empty) should be false")
 	}
 }
 
