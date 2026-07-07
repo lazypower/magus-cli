@@ -546,6 +546,18 @@ func applyDirectoryCreateOrUpdate(a diff.ResourceAction, r pendingResource, w ho
 			return oc
 		}
 	} else { // Update
+		// Re-verify the path is still a directory at apply time. If it was
+		// replaced by a regular file since planning, chmod/chown-ing it and
+		// recording a directory entry would be wrong — skip, fail-closed.
+		if st, err := w.Stat(a.Path); err != nil {
+			oc.Status = StatusErrored
+			oc.Err = err
+			return oc
+		} else if !st.Exists || !st.IsDir {
+			oc.Status = StatusSkipped
+			oc.Reason = "drifted between plan and apply (no longer a directory)"
+			return oc
+		}
 		if err := w.Chmod(a.Path, r.Mode); err != nil {
 			oc.Status = StatusErrored
 			oc.Err = err

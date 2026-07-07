@@ -296,3 +296,25 @@ func TestRunReclaimDirectory(t *testing.T) {
 		t.Errorf("reclaim recorded kind %s, want directory (corrected from stale file kind)", e.Kind)
 	}
 }
+
+func TestRunReclaimDirectoryDeclaredButFileOnDisk(t *testing.T) {
+	// Codex round-2 residual: the target is declared as a directory but a regular
+	// file sits on disk. reclaim must refuse rather than report success and
+	// record a directory entry for a non-directory.
+	f := newFixture(t)
+	writeFile(t, f.root+"/data", "x\n") // a FILE, not a directory
+	m := manifest.New()
+	m.PutActive(f.root+"/data", manifest.KindFile, "sha256:dir", manifest.OriginCreate, time.Unix(1, 0).UTC())
+	m.Orphan(f.root+"/data", "policy deny: prior", time.Unix(1, 0).UTC())
+	if err := m.Save(f.manifest); err != nil {
+		t.Fatal(err)
+	}
+	f.butaneFile(t, "storage:\n  directories:\n    - path: "+f.root+"/data\n      mode: 0755\n")
+
+	_, code := captureStdout(t, func() int {
+		return runReclaim([]string{"--yes", "--policy", f.policy, "--manifest", f.manifest, f.butane, f.root + "/data"})
+	})
+	if code != 1 {
+		t.Errorf("reclaim of a dir-declared path that is a file: exit %d, want 1", code)
+	}
+}

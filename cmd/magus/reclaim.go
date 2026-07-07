@@ -142,6 +142,10 @@ func runReclaim(args []string) int {
 	// metadata (mode/ownership), which the next apply reconciles as an update.
 	// Reclaim just re-activates the entry so it's back under reconciliation.
 	if declared.diffKind == diff.KindDirectory {
+		if !st.IsDir {
+			fmt.Fprintf(os.Stderr, "error: %s is declared as a directory but is not a directory on disk\n", target)
+			return 1
+		}
 		return reclaimDirectory(target, entry, m, *manifestPath, *yes)
 	}
 

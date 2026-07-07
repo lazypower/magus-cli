@@ -10,6 +10,35 @@ import (
 	"github.com/lazypower/magus-cli/internal/systemd"
 )
 
+func TestDirectoryUpdateDriftedToFileSkipped(t *testing.T) {
+	// Codex round-2 residual: if a declared directory is replaced by a regular
+	// file between plan and apply, the update path must re-check the type and
+	// skip (fail-closed) rather than chmod/chown the file and record it as a dir.
+	w := newMemWriter()
+	w.preload("/var/lib/magus", memFile{mode: 0o644, contents: []byte("x")})
+	in := &ir.IR{Directories: []ir.Directory{{Path: "/var/lib/magus", Mode: 0o700}}}
+	m := manifest.New()
+	m.PutActive("/var/lib/magus", manifest.KindDirectory, "sha256:dir", manifest.OriginCreate, time.Now())
+	// Hand-built plan as if planning had seen a directory needing a metadata update.
+	plan := &diff.Plan{Actions: []diff.ResourceAction{
+		{Path: "/var/lib/magus", Kind: diff.KindDirectory, Action: diff.ActionUpdate},
+	}}
+	r := Apply(plan, in, w, m, systemd.NewFake(), time.Now())
+
+	var skipped bool
+	for _, oc := range r.Outcomes {
+		if oc.Path == "/var/lib/magus" && oc.Status == StatusSkipped {
+			skipped = true
+		}
+	}
+	if !skipped {
+		t.Errorf("expected the update to skip on a non-directory, got %+v", r.Outcomes)
+	}
+	if w.files["/var/lib/magus"].mode != 0o644 {
+		t.Errorf("file mode changed to %#o; the update should have skipped without chmod", w.files["/var/lib/magus"].mode)
+	}
+}
+
 func TestDirectoryCreate(t *testing.T) {
 	w := newMemWriter()
 	in := &ir.IR{Directories: []ir.Directory{
