@@ -266,7 +266,7 @@ Enablement is reconciled every apply because it's persistent. Activity is not �
 6. Update manifest
 
 **Quadlets (delete):**
-1. `systemctl stop <generated-service>` — running container exits before its declaration disappears
+1. `systemctl stop <generated-service>` **only if it is currently active** — running container exits before its declaration disappears. A quadlet whose generated service never materialized (the generator rejected an invalid source) isn't loaded; skipping the stop lets the reconciler still remove the bad source rather than erroring on it forever.
 2. `unlink(2)` the quadlet source file
 3. `systemctl daemon-reload` (batched — generator drops the now-orphaned service)
 4. Remove the manifest entry
@@ -478,7 +478,7 @@ Reclaim /etc/shadow? [y/N] y
   ✓ /etc/shadow  (state: orphaned → active)
 ```
 
-If the on-disk content has drifted during orphan, reclaim refuses unless `--force` is passed (which writes the IR content over the existing file). Reclaim never auto-runs — the operator decides when to take a path back under management.
+If the on-disk content has drifted during orphan, reclaim refuses unless `--force` is passed (which writes the IR content over the existing file). Reclaim never auto-runs — the operator decides when to take a path back under management. Directories are reclaimable too; having no content, they skip the drift check and re-activate directly (mode/ownership is reconciled by the next apply). When `--force` rewrites a unit or quadlet, reclaim runs `daemon-reload` (and restarts it if active) so systemd picks up the new definition immediately rather than on next boot.
 
 ### `magus adopt`
 
@@ -498,7 +498,7 @@ Take over /etc/systemd/system/legacy-thing.service? [y/N] y
   ✓ /etc/systemd/system/legacy-thing.service  (rewrote, recorded in manifest)
 ```
 
-Adoption of *matching* content happens automatically during `magus apply` and does not require this command. `magus adopt` exists for the deliberate-overwrite case.
+Adoption of *matching* content happens automatically during `magus apply` and does not require this command. `magus adopt` exists for the deliberate-overwrite case. When the adopted path is a unit or quadlet, adopt runs `daemon-reload` (and restarts it if active) after the rewrite so systemd doesn't keep running the stale definition.
 
 ### `magus validate`
 

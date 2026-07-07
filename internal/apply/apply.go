@@ -392,12 +392,18 @@ func applyQuadletDelete(p *policy.Policy, a diff.ResourceAction, w hostfs.Writer
 		oc.Err = err
 		return oc
 	}
-	// Stop (NOT disable --now): the generated service can't be disabled. Stop
-	// the container, then unlink the source so daemon-reload drops the unit.
-	if err := sd.Stop(svc); err != nil {
-		oc.Status = StatusErrored
-		oc.Err = fmt.Errorf("stop %s: %w", svc, err)
-		return oc
+	// Stop (NOT disable --now): the generated service can't be disabled. Only
+	// stop it if it's actually running — a quadlet whose generated service never
+	// materialized (e.g. the generator rejected an invalid .container source)
+	// isn't loaded, and `systemctl stop` on it would fail and wedge the delete
+	// forever. Tolerating "not active" lets the reconciler remove the bad source
+	// (D11). A real stop failure on a running service is still surfaced.
+	if active, _ := sd.IsActive(svc); active {
+		if err := sd.Stop(svc); err != nil {
+			oc.Status = StatusErrored
+			oc.Err = fmt.Errorf("stop %s: %w", svc, err)
+			return oc
+		}
 	}
 	if err := w.Remove(a.Path); err != nil {
 		oc.Status = StatusErrored

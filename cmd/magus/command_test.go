@@ -242,3 +242,35 @@ func TestRunReclaim(t *testing.T) {
 		t.Errorf("reclaim did not reactivate: %+v", e)
 	}
 }
+
+func TestRunReclaimDirectory(t *testing.T) {
+	// D6: an orphaned directory must be reclaimable. Directories have no
+	// content, so reclaim can't hash/ReadFile them — it re-activates directly.
+	f := newFixture(t)
+	dir := f.root + "/data"
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	m := manifest.New()
+	m.PutActive(dir, manifest.KindDirectory, "sha256:dir", manifest.OriginCreate, time.Unix(1, 0).UTC())
+	m.Orphan(dir, "policy deny: prior", time.Unix(1, 0).UTC())
+	if err := m.Save(f.manifest); err != nil {
+		t.Fatal(err)
+	}
+	f.butaneFile(t, "storage:\n  directories:\n    - path: "+dir+"\n      mode: 0755\n")
+
+	_, code := captureStdout(t, func() int {
+		return runReclaim([]string{"--yes", "--policy", f.policy, "--manifest", f.manifest, f.butane, dir})
+	})
+	if code != 0 {
+		t.Fatalf("reclaim directory: exit %d", code)
+	}
+	m2, _ := manifest.Load(f.manifest)
+	e, _ := m2.Get(dir)
+	if e.State != manifest.StateActive {
+		t.Errorf("reclaim did not reactivate directory: %+v", e)
+	}
+	if e.Kind != manifest.KindDirectory {
+		t.Errorf("reclaim demoted directory kind to %s", e.Kind)
+	}
+}
