@@ -30,8 +30,17 @@ const maxButaneSize = 10 * 1024 * 1024
 const fetchTimeout = 30 * time.Second
 
 // readButaneSource dispatches on source scheme: local file otherwise.
-func readButaneSource(source string) ([]byte, error) {
+//
+// Plain-HTTP sources are refused unless allowInsecureHTTP is set: a
+// root-privileged process that fetches its desired state over http:// and
+// applies it is a remote-code-execution primitive for an on-path attacker (they
+// can substitute a unit file that magus then starts). https is required by
+// default; --insecure-http is the explicit opt-out (D19).
+func readButaneSource(source string, allowInsecureHTTP bool) ([]byte, error) {
 	if isHTTPURL(source) {
+		if strings.HasPrefix(source, "http://") && !allowInsecureHTTP {
+			return nil, fmt.Errorf("refusing to fetch Butane over plain HTTP (%s): an on-path attacker could substitute a unit magus runs as root — use https, or pass --insecure-http to override", source)
+		}
 		return fetchButaneHTTP(source)
 	}
 	f, err := os.Open(source)
@@ -135,8 +144,11 @@ func deferredQuadletType(path string) string {
 //
 // Translation warnings (non-fatal) are returned in warnings; translation
 // errors are returned as the error.
-func LoadButane(source string) (*IR, []string, error) {
-	data, err := readButaneSource(source)
+//
+// allowInsecureHTTP relaxes the https-by-default rule for remote sources — see
+// readButaneSource. Local sources ignore it.
+func LoadButane(source string, allowInsecureHTTP bool) (*IR, []string, error) {
+	data, err := readButaneSource(source, allowInsecureHTTP)
 	if err != nil {
 		return nil, nil, err
 	}

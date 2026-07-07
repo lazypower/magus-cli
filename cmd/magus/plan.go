@@ -30,6 +30,7 @@ Flags:
                       unowned file's content is never written to logs.
   --json              Emit the plan as machine-readable JSON (actions, service
                       actions, hashes, summary) for a scriptable review→apply loop
+  --insecure-http     Allow fetching Butane over plain HTTP (https required by default)
   --policy <path>     Override policy file (default: /etc/magus/policy.yaml)
   --manifest <path>   Override manifest file (default: /var/lib/magus/manifest.json)
 
@@ -47,6 +48,7 @@ func runPlan(args []string) int {
 	manifestPath := fs.String("manifest", manifest.DefaultPath, "manifest file path")
 	explainFlag := fs.Bool("explain", false, "show per-resource diffs")
 	jsonOut := fs.Bool("json", false, "emit machine-readable JSON plan")
+	insecureHTTP := fs.Bool("insecure-http", false, "allow fetching Butane over plain HTTP")
 	var verbose bool
 	fs.BoolVar(&verbose, "v", false, "reveal conflict content with --explain")
 	fs.BoolVar(&verbose, "verbose", false, "reveal conflict content with --explain")
@@ -64,7 +66,7 @@ func runPlan(args []string) int {
 		fmt.Fprintf(os.Stderr, "error: %v\n", err)
 		return 1
 	}
-	parsed, warnings, err := ir.LoadButane(butanePath)
+	parsed, warnings, err := ir.LoadButane(butanePath, *insecureHTTP)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "error: %v\n", err)
 		return 1

@@ -41,7 +41,7 @@ func TestLoadButaneMinimal(t *testing.T) {
 		t.Fatalf("write: %v", err)
 	}
 
-	got, _, err := LoadButane(path)
+	got, _, err := LoadButane(path, false)
 	if err != nil {
 		t.Fatalf("LoadButane: %v", err)
 	}
@@ -99,7 +99,7 @@ systemd:
 	if err := os.WriteFile(path, []byte(doc), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	got, _, err := LoadButane(path)
+	got, _, err := LoadButane(path, false)
 	if err != nil {
 		t.Fatalf("LoadButane: %v", err)
 	}
@@ -128,7 +128,7 @@ systemd:
 	if err := os.WriteFile(path, []byte(doc), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	got, _, err := LoadButane(path)
+	got, _, err := LoadButane(path, false)
 	if err != nil {
 		t.Fatalf("LoadButane: %v", err)
 	}
@@ -152,7 +152,7 @@ systemd:
 	if err := os.WriteFile(path, []byte(doc), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	_, _, err := LoadButane(path)
+	_, _, err := LoadButane(path, false)
 	if err == nil {
 		t.Fatal("LoadButane accepted mask: true")
 	}
@@ -212,12 +212,24 @@ func TestLoadButaneHTTP(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	got, _, err := LoadButane(srv.URL + "/magus.bu")
+	got, _, err := LoadButane(srv.URL+"/magus.bu", true)
 	if err != nil {
 		t.Fatalf("LoadButane: %v", err)
 	}
 	if len(got.Files) != 1 {
 		t.Errorf("Files: want 1, got %d", len(got.Files))
+	}
+}
+
+func TestLoadButaneRejectsPlainHTTP(t *testing.T) {
+	// D19: an http:// source is refused by default (no network hit — the reject
+	// happens before the fetch). --insecure-http (the bool) is the opt-out.
+	_, _, err := LoadButane("http://example.com/magus.bu", false)
+	if err == nil {
+		t.Fatal("LoadButane accepted a plain-HTTP source without --insecure-http")
+	}
+	if !strings.Contains(err.Error(), "plain HTTP") {
+		t.Errorf("error did not explain the https requirement: %v", err)
 	}
 }
 
@@ -227,7 +239,7 @@ func TestLoadButaneHTTPNon200(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	if _, _, err := LoadButane(srv.URL + "/missing.bu"); err == nil {
+	if _, _, err := LoadButane(srv.URL+"/missing.bu", true); err == nil {
 		t.Error("LoadButane: want error on HTTP 404, got nil")
 	}
 }
@@ -241,7 +253,7 @@ func TestLoadButaneHTTPSizeCap(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	_, _, err := LoadButane(srv.URL)
+	_, _, err := LoadButane(srv.URL, true)
 	if err == nil {
 		t.Fatal("LoadButane: want size-cap error, got nil")
 	}
@@ -257,7 +269,7 @@ func TestLoadButaneLocalSizeCap(t *testing.T) {
 	if err := os.WriteFile(path, []byte(strings.Repeat("x", maxButaneSize+1024)), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	_, _, err := LoadButane(path)
+	_, _, err := LoadButane(path, false)
 	if err == nil {
 		t.Fatal("LoadButane: want size-cap error on a large local file, got nil")
 	}
@@ -298,7 +310,7 @@ storage:
 	if err := os.WriteFile(path, []byte(doc), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	_, _, err := LoadButane(path)
+	_, _, err := LoadButane(path, false)
 	if err == nil {
 		t.Fatal("LoadButane accepted a deferred quadlet type (.kube)")
 	}

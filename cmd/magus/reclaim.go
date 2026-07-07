@@ -37,6 +37,7 @@ under management.
 Flags:
   --yes               Skip the confirmation prompt
   --force             Overwrite drifted on-disk content with IR content
+  --insecure-http     Allow fetching Butane over plain HTTP (https required by default)
   --policy <path>     Override policy file (default: /etc/magus/policy.yaml)
   --manifest <path>   Override manifest file (default: /var/lib/magus/manifest.json)
 `
@@ -49,6 +50,7 @@ func runReclaim(args []string) int {
 	manifestPath := fs.String("manifest", manifest.DefaultPath, "manifest file path")
 	yes := fs.Bool("yes", false, "skip confirmation prompt")
 	force := fs.Bool("force", false, "overwrite drifted on-disk content")
+	insecureHTTP := fs.Bool("insecure-http", false, "allow fetching Butane over plain HTTP")
 	if err := fs.Parse(args); err != nil {
 		return 1
 	}
@@ -75,7 +77,7 @@ func runReclaim(args []string) int {
 		fmt.Fprintf(os.Stderr, "error: %v\n", err)
 		return 1
 	}
-	parsed, warnings, err := ir.LoadButane(butanePath)
+	parsed, warnings, err := ir.LoadButane(butanePath, *insecureHTTP)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "error: %v\n", err)
 		return 1

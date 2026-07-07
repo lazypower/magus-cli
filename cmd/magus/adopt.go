@@ -30,6 +30,7 @@ silently during 'magus apply' and does not require this command.
 
 Flags:
   --yes               Skip the confirmation prompt
+  --insecure-http     Allow fetching Butane over plain HTTP (https required by default)
   --policy <path>     Override policy file (default: /etc/magus/policy.yaml)
   --manifest <path>   Override manifest file (default: /var/lib/magus/manifest.json)
 `
@@ -41,6 +42,7 @@ func runAdopt(args []string) int {
 	policyPath := fs.String("policy", policy.DefaultPath, "policy file path")
 	manifestPath := fs.String("manifest", manifest.DefaultPath, "manifest file path")
 	yes := fs.Bool("yes", false, "skip confirmation prompt")
+	insecureHTTP := fs.Bool("insecure-http", false, "allow fetching Butane over plain HTTP")
 	if err := fs.Parse(args); err != nil {
 		return 1
 	}
@@ -67,7 +69,7 @@ func runAdopt(args []string) int {
 		fmt.Fprintf(os.Stderr, "error: %v\n", err)
 		return 1
 	}
-	parsed, warnings, err := ir.LoadButane(butanePath)
+	parsed, warnings, err := ir.LoadButane(butanePath, *insecureHTTP)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "error: %v\n", err)
 		return 1

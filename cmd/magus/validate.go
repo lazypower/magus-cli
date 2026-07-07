@@ -19,6 +19,8 @@ URLs are fetched on every invocation; no caching.
 Flags:
   --policy <path>   Override the policy file location
                     (default: /etc/magus/policy.yaml)
+  --insecure-http   Allow fetching Butane over plain HTTP (https is required by
+                    default; http:// is an RCE vector for an on-path attacker)
 `
 
 func runValidate(args []string) int {
@@ -26,6 +28,7 @@ func runValidate(args []string) int {
 	fs.SetOutput(os.Stderr)
 	fs.Usage = func() { fmt.Fprint(os.Stderr, validateUsage) }
 	policyPath := fs.String("policy", policy.DefaultPath, "policy file path")
+	insecureHTTP := fs.Bool("insecure-http", false, "allow fetching Butane over plain HTTP")
 	if err := fs.Parse(args); err != nil {
 		return 1
 	}
@@ -41,7 +44,7 @@ func runValidate(args []string) int {
 		return 1
 	}
 
-	parsed, warnings, err := ir.LoadButane(butanePath)
+	parsed, warnings, err := ir.LoadButane(butanePath, *insecureHTTP)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "error: %v\n", err)
 		return 1

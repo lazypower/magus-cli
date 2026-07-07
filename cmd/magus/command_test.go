@@ -185,6 +185,25 @@ func TestRunApplyLockBusy(t *testing.T) {
 	}
 }
 
+func TestRunApplyDeclinedExitsTwo(t *testing.T) {
+	// UX5: declining the confirmation with a pending change exits 2 (changes
+	// pending), not 0 — a wrapper must tell "aborted" from "converged". In the
+	// test harness os.Stdin is at EOF, which the confirm reads as a decline.
+	f := newFixture(t)
+	f.butaneFile(t, "storage:\n  files:\n    - path: "+f.root+"/a.conf\n      contents: { inline: \"x\\n\" }\n")
+
+	_, code := captureStdout(t, func() int {
+		// No --yes, so it prompts; stdin EOF → declined.
+		return runApply([]string{"--policy", f.policy, "--manifest", f.manifest, "--status", f.status, f.butane})
+	})
+	if code != 2 {
+		t.Errorf("declined apply: exit %d, want 2", code)
+	}
+	if _, err := os.Stat(f.root + "/a.conf"); err == nil {
+		t.Error("declined apply should not have written the file")
+	}
+}
+
 func TestRunApplyNothingToApply(t *testing.T) {
 	f := newFixture(t)
 	f.butaneFile(t, "storage:\n  files:\n    - path: "+f.root+"/a.conf\n      contents: { inline: \"x\\n\" }\n")

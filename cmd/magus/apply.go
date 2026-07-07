@@ -31,10 +31,12 @@ Flags:
   --policy <path>     Override policy file (default: /etc/magus/policy.yaml)
   --manifest <path>   Override manifest file (default: /var/lib/magus/manifest.json)
   --status <path>     Override status observation file (default: /var/lib/magus/status.json)
+  --insecure-http     Allow fetching Butane over plain HTTP (https required by default)
 
 Exit codes:
   0   all declared resources are in their desired state
-  2   one or more resources skipped (conflicts, orphaned, drift)
+  2   one or more resources skipped (conflicts, orphaned, drift), OR the
+      confirmation was declined with changes still pending
   1   one or more resources errored mid-apply, OR input-bad (parse, policy)
 `
 
@@ -46,6 +48,7 @@ func runApply(args []string) int {
 	manifestPath := fs.String("manifest", manifest.DefaultPath, "manifest file path")
 	statusPath := fs.String("status", status.DefaultPath, "status observation file path")
 	yes := fs.Bool("yes", false, "skip confirmation prompt")
+	insecureHTTP := fs.Bool("insecure-http", false, "allow fetching Butane over plain HTTP")
 	if err := fs.Parse(args); err != nil {
 		return 1
 	}
@@ -75,7 +78,7 @@ func runApply(args []string) int {
 		fmt.Fprintf(os.Stderr, "error: %v\n", err)
 		return 1
 	}
-	parsed, warnings, err := ir.LoadButane(butanePath)
+	parsed, warnings, err := ir.LoadButane(butanePath, *insecureHTTP)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "error: %v\n", err)
 		return 1
@@ -147,8 +150,10 @@ func runApply(args []string) int {
 	// to record the failure (nothing is written — ActionError is fail-closed).
 	if changes > 0 && !*yes {
 		if !confirm(os.Stdin, os.Stdout, changes, conflicts) {
+			// Exit 2 (changes pending), not 0 — declining with work outstanding
+			// is not "converged", and a wrapper needs to tell them apart (UX5).
 			fmt.Println("Aborted.")
-			return 0
+			return 2
 		}
 	}
 	fmt.Println()
