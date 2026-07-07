@@ -206,12 +206,6 @@ func TestEmitStatusJSONAndHuman(t *testing.T) {
 	}
 }
 
-func TestHashContent(t *testing.T) {
-	if hashContent([]byte("x"))[:7] != "sha256:" {
-		t.Errorf("hashContent prefix wrong")
-	}
-}
-
 func TestFindDeclared(t *testing.T) {
 	in := &ir.IR{
 		Files:    []ir.File{{Path: "/etc/core/f", Contents: []byte("c"), Mode: 0o644}},

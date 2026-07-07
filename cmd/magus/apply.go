@@ -2,6 +2,7 @@ package main
 
 import (
 	"bufio"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
@@ -13,6 +14,7 @@ import (
 	"github.com/lazypower/magus-cli/internal/diff"
 	"github.com/lazypower/magus-cli/internal/hostfs"
 	"github.com/lazypower/magus-cli/internal/ir"
+	"github.com/lazypower/magus-cli/internal/lock"
 	"github.com/lazypower/magus-cli/internal/manifest"
 	"github.com/lazypower/magus-cli/internal/policy"
 	"github.com/lazypower/magus-cli/internal/status"
@@ -53,6 +55,21 @@ func runApply(args []string) int {
 		return 1
 	}
 	butanePath := fs.Arg(0)
+
+	// Serialize with any other manifest-mutating operation (a concurrent timer
+	// apply, or a human adopt/reclaim) for the whole plan→apply→save window.
+	// The manifest is the consent ledger; a lost record reads later as a
+	// spurious conflict or a skipped delete.
+	release, err := lock.Acquire(*manifestPath)
+	if err != nil {
+		if errors.Is(err, lock.ErrBusy) {
+			fmt.Fprintln(os.Stderr, "error: another magus apply is in progress (manifest is locked)")
+			return 1
+		}
+		fmt.Fprintf(os.Stderr, "error: %v\n", err)
+		return 1
+	}
+	defer func() { _ = release() }()
 
 	p, err := policy.Load(*policyPath)
 	if err != nil {

@@ -2,6 +2,7 @@ package main
 
 import (
 	"bufio"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
@@ -12,6 +13,7 @@ import (
 	"github.com/lazypower/magus-cli/internal/diff"
 	"github.com/lazypower/magus-cli/internal/hostfs"
 	"github.com/lazypower/magus-cli/internal/ir"
+	"github.com/lazypower/magus-cli/internal/lock"
 	"github.com/lazypower/magus-cli/internal/manifest"
 	"github.com/lazypower/magus-cli/internal/policy"
 )
@@ -56,6 +58,18 @@ func runReclaim(args []string) int {
 		return 1
 	}
 	butanePath, target := fs.Arg(0), fs.Arg(1)
+
+	// Serialize manifest mutation against a concurrent apply/adopt/reclaim.
+	release, err := lock.Acquire(*manifestPath)
+	if err != nil {
+		if errors.Is(err, lock.ErrBusy) {
+			fmt.Fprintln(os.Stderr, "error: another magus operation is in progress (manifest is locked)")
+			return 1
+		}
+		fmt.Fprintf(os.Stderr, "error: %v\n", err)
+		return 1
+	}
+	defer func() { _ = release() }()
 
 	p, err := policy.Load(*policyPath)
 	if err != nil {

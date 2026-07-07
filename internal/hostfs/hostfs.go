@@ -158,6 +158,13 @@ func (osImpl) WriteFile(path string, contents []byte, mode uint32, uid, gid *int
 		_ = os.Remove(tmp)
 		return err
 	}
+	// fsync before rename so a power loss can't leave the renamed file present
+	// but empty (ext4/xfs flush the rename ahead of the data otherwise).
+	if err := f.Sync(); err != nil {
+		_ = f.Close()
+		_ = os.Remove(tmp)
+		return err
+	}
 	if err := f.Close(); err != nil {
 		_ = os.Remove(tmp)
 		return err

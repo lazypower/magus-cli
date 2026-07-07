@@ -14,8 +14,9 @@ import (
 	"fmt"
 	"io/fs"
 	"os"
-	"path/filepath"
 	"time"
+
+	"github.com/lazypower/magus-cli/internal/statefile"
 )
 
 // DefaultPath is where magus reads and writes the observation file by default.
@@ -80,30 +81,15 @@ func Load(path string) (*Report, error) {
 	return &r, nil
 }
 
-// Save writes the report atomically (tmp + rename, 0600).
+// Save writes the report atomically and durably (tmp + fsync + rename via
+// statefile.WriteAtomic).
 func (r *Report) Save(path string) error {
-	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
-		return fmt.Errorf("status dir: %w", err)
-	}
 	data, err := json.MarshalIndent(r, "", "  ")
 	if err != nil {
 		return fmt.Errorf("marshal status: %w", err)
 	}
-	tmp := path + ".magus.tmp"
-	// Drop any pre-existing tmp first so we never inherit a foreign owner/mode
-	// from a file an IR may have pre-created at the tmp path (unlink drops a
-	// planted symlink itself, not its target); then create fresh at 0600.
-	_ = os.Remove(tmp)
-	if err := os.WriteFile(tmp, append(data, '\n'), 0o600); err != nil {
-		return fmt.Errorf("write tmp status: %w", err)
-	}
-	if err := os.Chmod(tmp, 0o600); err != nil {
-		_ = os.Remove(tmp)
-		return fmt.Errorf("chmod tmp status: %w", err)
-	}
-	if err := os.Rename(tmp, path); err != nil {
-		_ = os.Remove(tmp)
-		return fmt.Errorf("rename status: %w", err)
+	if err := statefile.WriteAtomic(path, append(data, '\n')); err != nil {
+		return fmt.Errorf("save status: %w", err)
 	}
 	return nil
 }

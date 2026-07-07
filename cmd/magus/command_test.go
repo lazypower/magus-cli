@@ -9,6 +9,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/lazypower/magus-cli/internal/diff"
+	"github.com/lazypower/magus-cli/internal/lock"
 	"github.com/lazypower/magus-cli/internal/manifest"
 )
 
@@ -159,6 +161,30 @@ func TestRunApplyConflict(t *testing.T) {
 	}
 }
 
+func TestRunApplyLockBusy(t *testing.T) {
+	// D4: while another operation holds the manifest lock, apply fails fast
+	// rather than racing into a concurrent read-modify-write.
+	f := newFixture(t)
+	f.butaneFile(t, "storage:\n  files:\n    - path: "+f.root+"/a.conf\n      contents: { inline: \"x\\n\" }\n")
+
+	release, err := lock.Acquire(f.manifest)
+	if err != nil {
+		t.Fatalf("pre-acquire lock: %v", err)
+	}
+	defer func() { _ = release() }()
+
+	_, code := captureStdout(t, func() int {
+		return runApply([]string{"--yes", "--policy", f.policy, "--manifest", f.manifest, "--status", f.status, f.butane})
+	})
+	if code != 1 {
+		t.Errorf("apply under contended lock: exit %d, want 1", code)
+	}
+	// Nothing should have been written — apply never got past the lock.
+	if _, err := os.Stat(f.root + "/a.conf"); err == nil {
+		t.Error("apply wrote a file despite the lock being held")
+	}
+}
+
 func TestRunApplyNothingToApply(t *testing.T) {
 	f := newFixture(t)
 	f.butaneFile(t, "storage:\n  files:\n    - path: "+f.root+"/a.conf\n      contents: { inline: \"x\\n\" }\n")
@@ -197,7 +223,7 @@ func TestRunReclaim(t *testing.T) {
 	writeFile(t, f.root+"/orph.env", "K=V\n")
 	// Pre-build a manifest with the path orphaned, on-disk hash matching.
 	m := manifest.New()
-	hash := hashContent([]byte("K=V\n"))
+	hash := diff.HashContent([]byte("K=V\n"), diff.KindFile)
 	m.PutActive(f.root+"/orph.env", manifest.KindFile, hash, manifest.OriginCreate, time.Unix(1, 0).UTC())
 	m.Orphan(f.root+"/orph.env", "policy deny: prior", time.Unix(1, 0).UTC())
 	if err := m.Save(f.manifest); err != nil {
