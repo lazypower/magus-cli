@@ -27,7 +27,7 @@ func TestUnitCreateEnabledRunsEnableNow(t *testing.T) {
 	w := newMemWriter()
 	sd := systemd.NewFake()
 	in := &ir.IR{Units: []ir.Unit{
-		{Name: "magus-foo.service", Enabled: true, Contents: sampleUnitBody},
+		{Name: "magus-foo.service", Enabled: boolPtr(true), Contents: sampleUnitBody},
 	}}
 	plan, _ := diff.Compute(in, manifest.New(), w)
 	m := manifest.New()
@@ -56,7 +56,7 @@ func TestUnitCreateDisabledDoesNotStart(t *testing.T) {
 	w := newMemWriter()
 	sd := systemd.NewFake()
 	in := &ir.IR{Units: []ir.Unit{
-		{Name: "magus-foo.service", Enabled: false, Contents: sampleUnitBody},
+		{Name: "magus-foo.service", Enabled: boolPtr(false), Contents: sampleUnitBody},
 	}}
 	plan, _ := diff.Compute(in, manifest.New(), w)
 	r := Apply(plan, in, w, manifest.New(), sd, time.Now())
@@ -87,7 +87,7 @@ func TestUnitUpdateActiveTriggersRestart(t *testing.T) {
 	w.preload(path, memFile{contents: []byte("[Service]\nExecStart=/bin/old\n"), mode: 0o644})
 
 	in := &ir.IR{Units: []ir.Unit{
-		{Name: "magus-foo.service", Enabled: true, Contents: sampleUnitBody},
+		{Name: "magus-foo.service", Enabled: boolPtr(true), Contents: sampleUnitBody},
 	}}
 	m := manifest.New()
 	m.PutActive(path, manifest.KindUnit, "sha256:old", manifest.OriginCreate, time.Now())
@@ -127,7 +127,7 @@ func TestUnitUpdateInactiveDefersStart(t *testing.T) {
 	w.preload(path, memFile{contents: []byte("[Service]\nExecStart=/bin/old\n"), mode: 0o644})
 
 	in := &ir.IR{Units: []ir.Unit{
-		{Name: "magus-foo.service", Enabled: true, Contents: sampleUnitBody},
+		{Name: "magus-foo.service", Enabled: boolPtr(true), Contents: sampleUnitBody},
 	}}
 	m := manifest.New()
 	m.PutActive(path, manifest.KindUnit, "sha256:old", manifest.OriginCreate, time.Now())
@@ -166,7 +166,7 @@ func TestUnitAdoptNoDaemonReloadNoRestart(t *testing.T) {
 	w.preload(path, memFile{contents: []byte(sampleUnitBody), mode: 0o644})
 
 	in := &ir.IR{Units: []ir.Unit{
-		{Name: "magus-foo.service", Enabled: true, Contents: sampleUnitBody},
+		{Name: "magus-foo.service", Enabled: boolPtr(true), Contents: sampleUnitBody},
 	}}
 	plan, _ := diff.Compute(in, manifest.New(), w)
 	if plan.Actions[0].Action != diff.ActionAdopt {
@@ -256,7 +256,7 @@ func TestDropInChangeTriggersDaemonReloadAndRestartParent(t *testing.T) {
 	in := &ir.IR{Units: []ir.Unit{
 		{
 			Name:    "ssh.service",
-			Enabled: true,
+			Enabled: boolPtr(true),
 			DropIns: []ir.DropIn{
 				{Name: "10-magus.conf", Contents: "[Service]\nEnvironment=X=1\n"},
 			},
@@ -283,8 +283,8 @@ func TestSingleDaemonReloadAcrossMultipleUnits(t *testing.T) {
 	w := newMemWriter()
 	sd := systemd.NewFake()
 	in := &ir.IR{Units: []ir.Unit{
-		{Name: "magus-a.service", Enabled: false, Contents: sampleUnitBody},
-		{Name: "magus-b.service", Enabled: false, Contents: sampleUnitBody},
+		{Name: "magus-a.service", Enabled: boolPtr(false), Contents: sampleUnitBody},
+		{Name: "magus-b.service", Enabled: boolPtr(false), Contents: sampleUnitBody},
 	}}
 	plan, _ := diff.Compute(in, manifest.New(), w)
 	r := Apply(plan, in, w, manifest.New(), sd, time.Now())
@@ -314,7 +314,7 @@ func TestEnablementDriftReconciledOnExistingUnit(t *testing.T) {
 	w.preload(path, memFile{contents: []byte(sampleUnitBody), mode: 0o644})
 
 	in := &ir.IR{Units: []ir.Unit{
-		{Name: "magus-foo.service", Enabled: true, Contents: sampleUnitBody},
+		{Name: "magus-foo.service", Enabled: boolPtr(true), Contents: sampleUnitBody},
 	}}
 	m := manifest.New()
 	m.PutActive(path, manifest.KindUnit, diff.HashContent([]byte(sampleUnitBody), diff.KindUnit), manifest.OriginCreate, time.Now())
@@ -330,6 +330,97 @@ func TestEnablementDriftReconciledOnExistingUnit(t *testing.T) {
 	}
 }
 
+func TestUnitEnabledOmittedDoesNotDisable(t *testing.T) {
+	// D2 regression: a unit whose IR omits `enabled` (Enabled == nil) must NOT
+	// be disabled even when it's currently enabled. Collapsing nil→false would
+	// make magus actively disable a service it was only extending.
+	w := newMemWriter()
+	sd := systemd.NewFake()
+	sd.SetEnablement("magus-foo.service", systemd.EnablementEnabled)
+
+	path := diff.UnitPath("magus-foo.service")
+	w.preload(path, memFile{contents: []byte(sampleUnitBody), mode: 0o644})
+
+	in := &ir.IR{Units: []ir.Unit{
+		{Name: "magus-foo.service", Enabled: nil, Contents: sampleUnitBody},
+	}}
+	m := manifest.New()
+	m.PutActive(path, manifest.KindUnit, diff.HashContent([]byte(sampleUnitBody), diff.KindUnit), manifest.OriginCreate, time.Now())
+
+	plan, _ := diff.Compute(in, m, w)
+	r := Apply(plan, in, w, m, sd, time.Now())
+
+	if r.ExitCode() != 0 {
+		t.Fatalf("exit = %d; outcomes: %+v", r.ExitCode(), r.Outcomes)
+	}
+	for _, c := range sd.Calls() {
+		if c == "Disable(magus-foo.service)" || c == "DisableNow(magus-foo.service)" {
+			t.Errorf("unit with omitted enablement must not be disabled, got: %v", sd.Calls())
+		}
+		if c == "IsEnabled(magus-foo.service)" {
+			t.Errorf("nil enablement should not even query is-enabled, got: %v", sd.Calls())
+		}
+	}
+}
+
+func TestUnitEnabledOmittedDropInOnlyDoesNotDisable(t *testing.T) {
+	// D2 sharpest case: a body-less unit declared only to attach a drop-in,
+	// currently enabled, must keep its enablement — extending a unit is not a
+	// reason to disable it.
+	w := newMemWriter()
+	sd := systemd.NewFake()
+	sd.SetEnablement("ssh.service", systemd.EnablementEnabled)
+	sd.SetActive("ssh.service", true)
+
+	in := &ir.IR{Units: []ir.Unit{
+		{
+			Name:    "ssh.service",
+			Enabled: nil,
+			DropIns: []ir.DropIn{
+				{Name: "10-magus.conf", Contents: "[Service]\nEnvironment=X=1\n"},
+			},
+		},
+	}}
+	plan, _ := diff.Compute(in, manifest.New(), w)
+	r := Apply(plan, in, w, manifest.New(), sd, time.Now())
+
+	if r.ExitCode() != 0 {
+		t.Fatalf("exit = %d; outcomes: %+v", r.ExitCode(), r.Outcomes)
+	}
+	for _, c := range sd.Calls() {
+		if c == "Disable(ssh.service)" || c == "DisableNow(ssh.service)" {
+			t.Errorf("drop-in-only unit must not be disabled, got: %v", sd.Calls())
+		}
+	}
+}
+
+func TestUnitEnabledFalseDisablesEnabledUnit(t *testing.T) {
+	// The other side of the tri-state: enabled=false on a currently-enabled
+	// owned unit must actively disable it.
+	w := newMemWriter()
+	sd := systemd.NewFake()
+	sd.SetEnablement("magus-foo.service", systemd.EnablementEnabled)
+
+	path := diff.UnitPath("magus-foo.service")
+	w.preload(path, memFile{contents: []byte(sampleUnitBody), mode: 0o644})
+
+	in := &ir.IR{Units: []ir.Unit{
+		{Name: "magus-foo.service", Enabled: boolPtr(false), Contents: sampleUnitBody},
+	}}
+	m := manifest.New()
+	m.PutActive(path, manifest.KindUnit, diff.HashContent([]byte(sampleUnitBody), diff.KindUnit), manifest.OriginCreate, time.Now())
+
+	plan, _ := diff.Compute(in, m, w)
+	r := Apply(plan, in, w, m, sd, time.Now())
+
+	if r.ExitCode() != 0 {
+		t.Fatalf("exit = %d", r.ExitCode())
+	}
+	if !containsCall(sd.Calls(), "Disable(magus-foo.service)") {
+		t.Errorf("expected Disable for enabled=false, got: %v", sd.Calls())
+	}
+}
+
 func TestSystemdErrorIsolation(t *testing.T) {
 	// EnableNow fails for unit A; unit B should still be processed.
 	w := newMemWriter()
@@ -337,8 +428,8 @@ func TestSystemdErrorIsolation(t *testing.T) {
 	sd.FailNext("EnableNow(magus-a.service)", errors.New("boom"))
 
 	in := &ir.IR{Units: []ir.Unit{
-		{Name: "magus-a.service", Enabled: true, Contents: sampleUnitBody},
-		{Name: "magus-b.service", Enabled: true, Contents: sampleUnitBody},
+		{Name: "magus-a.service", Enabled: boolPtr(true), Contents: sampleUnitBody},
+		{Name: "magus-b.service", Enabled: boolPtr(true), Contents: sampleUnitBody},
 	}}
 	plan, _ := diff.Compute(in, manifest.New(), w)
 	r := Apply(plan, in, w, manifest.New(), sd, time.Now())

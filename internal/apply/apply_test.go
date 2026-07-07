@@ -14,6 +14,10 @@ import (
 	"github.com/lazypower/magus-cli/internal/systemd"
 )
 
+// boolPtr returns a pointer to b — for constructing ir.Unit.Enabled tri-state
+// values in tests (nil = don't touch, &true = enable, &false = disable).
+func boolPtr(b bool) *bool { return &b }
+
 // memFile is one entry in the in-memory test filesystem.
 type memFile struct {
 	contents []byte

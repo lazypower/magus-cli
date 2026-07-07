@@ -675,38 +675,46 @@ func anyUnitMutation(events map[string]*unitEvents) bool {
 // or a quadlet's *generated* .service name) after files + daemon-reload have
 // settled. Returns one outcome per systemctl operation performed.
 //
-// The same logic governs both units and quadlets — the only difference is
-// the service name a caller passes in, and the desiredEnabled flag (units
-// honor the IR's Enabled field; quadlets always pass true since the .container
-// format expresses always-on intent).
-func reconcileServiceState(serviceName string, desiredEnabled bool, ev *unitEvents, sd systemd.Manager) []Outcome {
+// desiredEnabled carries the IR's tri-state enablement (see ir.Unit.Enabled):
+//
+//	nil   → enablement is not declared; magus does not touch it. A unit
+//	        declared only to attach a drop-in must not be enabled or disabled
+//	        as a side effect of extending it.
+//	true  → ensure enabled
+//	false → ensure disabled
+func reconcileServiceState(serviceName string, desiredEnabled *bool, ev *unitEvents, sd systemd.Manager) []Outcome {
 	if ev.bodyDeleted {
 		// Stop+disable already happened in phase 1; nothing more to do.
 		return nil
 	}
 	var outcomes []Outcome
 
-	// Newly-created service: combine enable + start if desired enabled.
+	// Newly-created service: enable+start only when explicitly declared enabled.
+	// A freshly-written unit file is not enabled by default, so nil/false need
+	// no action at creation.
 	if ev.bodyCreated {
-		if desiredEnabled {
+		if desiredEnabled != nil && *desiredEnabled {
 			err := sd.EnableNow(serviceName)
 			outcomes = append(outcomes, unitOutcome(serviceName, "enable --now", err))
 		}
 		return outcomes
 	}
 
-	// Existing service: reconcile enablement every apply.
-	current, err := sd.IsEnabled(serviceName)
-	if err != nil {
-		outcomes = append(outcomes, unitOutcome(serviceName, "is-enabled", err))
-	} else {
-		switch {
-		case desiredEnabled && (current == systemd.EnablementDisabled || current == systemd.EnablementUnknown):
-			err := sd.Enable(serviceName)
-			outcomes = append(outcomes, unitOutcome(serviceName, "enable", err))
-		case !desiredEnabled && current == systemd.EnablementEnabled:
-			err := sd.Disable(serviceName)
-			outcomes = append(outcomes, unitOutcome(serviceName, "disable", err))
+	// Existing service: reconcile enablement every apply — but only when the
+	// IR actually declares it. nil means "leave enablement alone".
+	if desiredEnabled != nil {
+		current, err := sd.IsEnabled(serviceName)
+		if err != nil {
+			outcomes = append(outcomes, unitOutcome(serviceName, "is-enabled", err))
+		} else {
+			switch {
+			case *desiredEnabled && (current == systemd.EnablementDisabled || current == systemd.EnablementUnknown):
+				err := sd.Enable(serviceName)
+				outcomes = append(outcomes, unitOutcome(serviceName, "enable", err))
+			case !*desiredEnabled && current == systemd.EnablementEnabled:
+				err := sd.Disable(serviceName)
+				outcomes = append(outcomes, unitOutcome(serviceName, "disable", err))
+			}
 		}
 	}
 

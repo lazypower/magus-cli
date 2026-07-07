@@ -74,8 +74,90 @@ func TestLoadButaneMinimal(t *testing.T) {
 	if u.Name != "magus-healthcheck.timer" {
 		t.Errorf("Units[0].Name = %q", u.Name)
 	}
-	if !u.Enabled {
-		t.Errorf("Units[0].Enabled = false, want true")
+	if u.Enabled == nil || !*u.Enabled {
+		t.Errorf("Units[0].Enabled = %v, want &true", u.Enabled)
+	}
+}
+
+// A unit that omits `enabled` must load with Enabled == nil, not &false. This
+// is the tri-state contract: nil means "magus does not touch enablement", so a
+// unit declared only to attach a drop-in isn't disabled as a side effect.
+func TestLoadButaneEnabledOmittedIsNil(t *testing.T) {
+	doc := `variant: fcos
+version: "1.6.0"
+systemd:
+  units:
+    - name: magus-foo.service
+      dropins:
+        - name: 10-magus.conf
+          contents: |
+            [Service]
+            Environment=FOO=bar
+`
+	dir := t.TempDir()
+	path := filepath.Join(dir, "dropin.bu")
+	if err := os.WriteFile(path, []byte(doc), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	got, _, err := LoadButane(path)
+	if err != nil {
+		t.Fatalf("LoadButane: %v", err)
+	}
+	if len(got.Units) != 1 {
+		t.Fatalf("Units: want 1, got %d", len(got.Units))
+	}
+	if got.Units[0].Enabled != nil {
+		t.Errorf("Units[0].Enabled = %v, want nil (enablement not declared)", *got.Units[0].Enabled)
+	}
+}
+
+// enabled: false must load with Enabled == &false so magus actively disables.
+func TestLoadButaneEnabledFalse(t *testing.T) {
+	doc := `variant: fcos
+version: "1.6.0"
+systemd:
+  units:
+    - name: magus-foo.service
+      enabled: false
+      contents: |
+        [Service]
+        ExecStart=/bin/true
+`
+	dir := t.TempDir()
+	path := filepath.Join(dir, "disabled.bu")
+	if err := os.WriteFile(path, []byte(doc), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	got, _, err := LoadButane(path)
+	if err != nil {
+		t.Fatalf("LoadButane: %v", err)
+	}
+	if got.Units[0].Enabled == nil || *got.Units[0].Enabled {
+		t.Errorf("Units[0].Enabled = %v, want &false", got.Units[0].Enabled)
+	}
+}
+
+// mask: true is a security-relevant declaration magus does not reconcile in
+// v1; loading must reject it rather than silently drop it.
+func TestLoadButaneRejectsMask(t *testing.T) {
+	doc := `variant: fcos
+version: "1.6.0"
+systemd:
+  units:
+    - name: magus-foo.service
+      mask: true
+`
+	dir := t.TempDir()
+	path := filepath.Join(dir, "masked.bu")
+	if err := os.WriteFile(path, []byte(doc), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	_, _, err := LoadButane(path)
+	if err == nil {
+		t.Fatal("LoadButane accepted mask: true")
+	}
+	if !strings.Contains(err.Error(), "mask is not supported") {
+		t.Errorf("error did not explain mask rejection: %v", err)
 	}
 }
 

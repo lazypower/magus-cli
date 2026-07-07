@@ -118,7 +118,7 @@ The Butane file is the input. Magus consumes a strict subset as its intermediate
 
 | Resource              | Actions                                              | Notes                                                          |
 |-----------------------|------------------------------------------------------|----------------------------------------------------------------|
-| `systemd.units`       | Create, drop-in override, delete on omission         | Drop-ins to `10-magus.conf` only. Must match `unit_patterns`. Delete = stop + disable + unlink + daemon-reload. |
+| `systemd.units`       | Create, drop-in override, delete on omission         | Drop-ins to `10-magus.conf` only. Must match `unit_patterns`. `enabled` is tri-state (`true`/`false`/omitted — see Apply mechanics). `mask` is **rejected at load**: v1 does not reconcile masked state, and silently dropping a security-relevant declaration is worse than refusing it. Delete = stop + disable + unlink + daemon-reload. |
 | `storage.files`       | Create, update, delete on omission                   | Atomic write. Must fall within `file_roots`.                   |
 | `storage.directories` | Create, reconcile mode/ownership                     | Never removed even on IR omission — directories may hold user data Magus didn't track. v1 exception; see open questions. |
 | Quadlets              | Create, update, delete on omission, adopt            | Auto-promoted from `storage.files` whose path is under `/etc/containers/systemd/` and ends in `.container`/`.volume`/`.network`. Equivalence is the unit canonical hash. Apply triggers `daemon-reload` + `start` of the *generated* service (always — quadlets express intent that the thing should be running; generated units can't be enabled, so boot persistence is the quadlet's `[Install]`). v1 supports `.container`/`.volume`/`.network`; `.pod`/`.kube`/`.image`/`.build` are deferred. |
@@ -225,9 +225,10 @@ The canonicalization is intentionally lossy in only two dimensions: whitespace n
 **systemd units / drop-ins (create / update):**
 1. Write file atomically (same as files), if content differs
 2. `systemctl daemon-reload` once, after all unit writes
-3. **Reconcile enablement** (persistent state, checked every apply):
-   - Declared enabled, `is-enabled` says no → `systemctl enable <unit>`
-   - Declared disabled, `is-enabled` says yes → `systemctl disable <unit>`
+3. **Reconcile enablement** (persistent state, checked every apply). Enablement is **tri-state**, following Ignition/Butane's `enabled` field:
+   - `enabled: true`, `is-enabled` says no → `systemctl enable <unit>`
+   - `enabled: false`, `is-enabled` says yes → `systemctl disable <unit>`
+   - `enabled` **omitted** → enablement is not declared; Magus does not touch it. A unit declared only to attach a drop-in (or one that simply omits `enabled`) keeps whatever enablement it has — extending a unit never enables or disables it as a side effect. This is the difference between "declared disabled" and "not declared", and collapsing the two would make Magus actively disable services it was only meant to extend.
 4. **First-time start, only on creation:** new unit declared enabled → `systemctl start <unit>` (combined with step 3 as `enable --now` for new units)
 5. **Restart on content change**, only if the unit is currently active: `systemctl restart <unit>`
 6. **Inactive units whose content changed** are rewritten only. The new content takes effect on next start. Logged at apply-time so the deferred behavior is visible.

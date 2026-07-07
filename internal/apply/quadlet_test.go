@@ -175,7 +175,7 @@ func TestQuadletAndUnitShareSingleDaemonReload(t *testing.T) {
 			{Path: "/etc/containers/systemd/ollama.container", Name: "ollama.container", Mode: 0o644, Contents: []byte(sampleContainer)},
 		},
 		Units: []ir.Unit{
-			{Name: "magus-foo.service", Enabled: true, Contents: "[Service]\nExecStart=/bin/foo\n"},
+			{Name: "magus-foo.service", Enabled: boolPtr(true), Contents: "[Service]\nExecStart=/bin/foo\n"},
 		},
 	}
 	plan, _ := diff.Compute(in, manifest.New(), w)

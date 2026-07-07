@@ -190,10 +190,20 @@ func LoadButane(source string) (*IR, []string, error) {
 	}
 
 	for _, u := range ign.Systemd.Units {
+		// Reject mask up front rather than silently dropping it. Masking is a
+		// security-relevant declaration ("this unit must not run"); magus does
+		// not reconcile mask state in v1, and honoring it partially — or
+		// ignoring it while the operator believes it took effect — is worse
+		// than refusing. This mirrors how deferred quadlet types are rejected
+		// at load: the authority boundary stays honest.
+		if u.Mask != nil && *u.Mask {
+			return nil, warnings, fmt.Errorf("unit %s: mask is not supported in v1 — magus does not reconcile masked state; remove \"mask\" or mask the unit out of band", u.Name)
+		}
 		unit := Unit{
-			Name:     u.Name,
-			Enabled:  u.Enabled != nil && *u.Enabled,
-			Mask:     u.Mask != nil && *u.Mask,
+			Name: u.Name,
+			// Preserve the tri-state directly: nil means "enablement not
+			// declared, don't touch it" — see ir.Unit.Enabled.
+			Enabled:  u.Enabled,
 			Contents: derefString(u.Contents),
 		}
 		for _, di := range u.Dropins {

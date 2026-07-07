@@ -48,10 +48,19 @@ type Directory struct {
 // Unit is a declared systemd unit. If DropIns is non-empty, the unit is
 // extended via drop-ins rather than (or in addition to) replacing the unit
 // file itself.
+//
+// Enabled is *bool, not bool, to preserve Ignition/Butane's tri-state
+// `enabled` semantic. This is load-bearing: a unit declared only to attach a
+// drop-in (or one that simply omits `enabled`) must NOT have its enablement
+// touched — collapsing nil to false would make magus actively `systemctl
+// disable` a service it was only extending.
+//
+//	nil   → enablement is not declared; magus does not reconcile it
+//	true  → magus ensures the unit is enabled
+//	false → magus ensures the unit is disabled
 type Unit struct {
 	Name     string
-	Enabled  bool
-	Mask     bool
+	Enabled  *bool
 	Contents string
 	DropIns  []DropIn
 }

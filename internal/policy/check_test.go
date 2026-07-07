@@ -18,7 +18,7 @@ unit_patterns: ["magus-*"]
 			{Path: "/etc/magus.d/ollama.env", Mode: 0o644},
 		},
 		Units: []ir.Unit{
-			{Name: "magus-healthcheck.timer", Enabled: true},
+			{Name: "magus-healthcheck.timer", Enabled: boolPtr(true)},
 		},
 	}
 	if v := Check(p, in); len(v) != 0 {
