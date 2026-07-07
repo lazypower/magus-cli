@@ -34,9 +34,19 @@ func readButaneSource(source string) ([]byte, error) {
 	if isHTTPURL(source) {
 		return fetchButaneHTTP(source)
 	}
-	data, err := os.ReadFile(source)
+	f, err := os.Open(source)
 	if err != nil {
 		return nil, fmt.Errorf("read butane: %w", err)
+	}
+	defer f.Close()
+	// Same 10 MB guard as the HTTP path (D20): read one byte past the cap to
+	// detect an oversize file rather than silently truncating.
+	data, err := io.ReadAll(io.LimitReader(f, maxButaneSize+1))
+	if err != nil {
+		return nil, fmt.Errorf("read butane: %w", err)
+	}
+	if int64(len(data)) > maxButaneSize {
+		return nil, fmt.Errorf("read butane %s: file exceeds %d bytes", source, maxButaneSize)
 	}
 	return data, nil
 }
@@ -302,13 +312,6 @@ func (p intPtr) value(def int) uint32 {
 	return uint32(*p.v)
 }
 
-func (p intPtr) intValue(def int) int {
-	if p.v == nil {
-		return def
-	}
-	return *p.v
-}
-
 func derefString(s *string) string {
 	if s == nil {
 		return ""
@@ -352,7 +355,11 @@ func decodeSource(src, compression string) ([]byte, error) {
 		}
 		raw = decoded
 	} else {
-		decoded, err := url.QueryUnescape(payload)
+		// PathUnescape, not QueryUnescape: RFC 2397 data URLs are not query
+		// strings, and QueryUnescape turns a literal '+' into a space. Any
+		// producer that emits a literal '+' (RFC 2397 permits it) would be
+		// silently corrupted otherwise (D18).
+		decoded, err := url.PathUnescape(payload)
 		if err != nil {
 			return nil, fmt.Errorf("contents.source: %w", err)
 		}

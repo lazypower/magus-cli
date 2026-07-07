@@ -169,6 +169,8 @@ func TestDecodeSourceVariants(t *testing.T) {
 		want        string
 	}{
 		{"plain", "data:,hello%20world", "", "hello world"},
+		// A literal '+' must survive (PathUnescape, not QueryUnescape — D18).
+		{"plus-literal", "data:,a+b=c", "", "a+b=c"},
 		{"base64", "data:;base64,aGVsbG8=", "", "hello"},
 		{"with-mediatype", "data:text/plain;charset=utf-8;base64,aGVsbG8=", "", "hello"},
 		{"empty", "", "", ""},
@@ -245,6 +247,22 @@ func TestLoadButaneHTTPSizeCap(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "exceeds") {
 		t.Errorf("error message should mention size cap, got: %v", err)
+	}
+}
+
+func TestLoadButaneLocalSizeCap(t *testing.T) {
+	// A local file over the cap is refused, matching the HTTP path (D20).
+	dir := t.TempDir()
+	path := filepath.Join(dir, "big.bu")
+	if err := os.WriteFile(path, []byte(strings.Repeat("x", maxButaneSize+1024)), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	_, _, err := LoadButane(path)
+	if err == nil {
+		t.Fatal("LoadButane: want size-cap error on a large local file, got nil")
+	}
+	if !strings.Contains(err.Error(), "exceeds") {
+		t.Errorf("error should mention the size cap, got: %v", err)
 	}
 }
 

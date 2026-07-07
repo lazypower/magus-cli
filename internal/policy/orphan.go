@@ -2,6 +2,7 @@ package policy
 
 import (
 	"path/filepath"
+	"sort"
 	"time"
 
 	"github.com/lazypower/magus-cli/internal/ir"
@@ -31,6 +32,9 @@ func OrphanDenied(p *Policy, m *manifest.Manifest, now time.Time) []string {
 			orphaned = append(orphaned, path)
 		}
 	}
+	// Sort so the warnings emitted from this list are stable run-to-run (the
+	// map iteration above is otherwise nondeterministic — D9).
+	sort.Strings(orphaned)
 	return orphaned
 }
 

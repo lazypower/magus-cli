@@ -639,14 +639,15 @@ func diffKind(k manifest.Kind) diff.Kind {
 }
 
 // unitEvents tracks what happened to a unit's files during phase 1, so phase 3
-// can decide whether to enable, disable, restart, or skip.
+// can decide whether to enable, start, restart, or skip. Only the three signals
+// phase 2/3 actually consume are tracked: whether the body was created (→ enable
+// --now on a new enabled unit), whether the body was deleted (→ already
+// disabled+stopped), and whether any content mutation happened (→ daemon-reload
+// and restart-if-active).
 type unitEvents struct {
 	bodyCreated   bool
-	bodyUpdated   bool
-	bodyAdopted   bool
 	bodyDeleted   bool
-	dropInChange  bool // any drop-in create/update/delete (not adopt)
-	hasContentMut bool // any mutation that requires daemon-reload (excludes adopts)
+	hasContentMut bool // any create/update/delete requiring daemon-reload (excludes adopts)
 }
 
 func recordUnitEvent(ev *unitEvents, action diff.Action, isBody bool) {
@@ -654,25 +655,14 @@ func recordUnitEvent(ev *unitEvents, action diff.Action, isBody bool) {
 	case diff.ActionCreate:
 		if isBody {
 			ev.bodyCreated = true
-		} else {
-			ev.dropInChange = true
 		}
 		ev.hasContentMut = true
 	case diff.ActionUpdate:
-		if isBody {
-			ev.bodyUpdated = true
-		} else {
-			ev.dropInChange = true
-		}
 		ev.hasContentMut = true
 	case diff.ActionAdopt:
-		if isBody {
-			ev.bodyAdopted = true
-		}
 		// adopts don't trigger daemon-reload or restart
 	case diff.ActionDelete:
-		// Drop-in deletes get here (body deletes are routed elsewhere)
-		ev.dropInChange = true
+		// Drop-in deletes get here (body deletes are routed elsewhere).
 		ev.hasContentMut = true
 	}
 }

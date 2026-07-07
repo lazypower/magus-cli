@@ -46,20 +46,27 @@ func runValidate(args []string) int {
 		fmt.Fprintf(os.Stderr, "error: %v\n", err)
 		return 1
 	}
-	for _, w := range warnings {
-		fmt.Fprintf(os.Stderr, "warning: %s\n", w)
-	}
+	printButaneWarnings(warnings)
 
 	violations := policy.Check(p, parsed, *policyPath)
 	for _, v := range violations {
 		fmt.Fprintf(os.Stderr, "error: %s\n", v)
 	}
 
-	resourceCount := len(parsed.Files) + len(parsed.Directories) + len(parsed.Units)
+	resourceCount := len(parsed.Files) + len(parsed.Directories) + len(parsed.Units) + len(parsed.Quadlets)
 	if len(violations) > 0 {
 		fmt.Fprintf(os.Stderr, "%d resources, %d policy violations\n", resourceCount, len(violations))
 		return 1
 	}
 	fmt.Printf("ok: %d resources, 0 policy violations\n", resourceCount)
 	return 0
+}
+
+// printButaneWarnings surfaces non-fatal Butane translation warnings to stderr.
+// The translator emits these on the very file the timer applies, so every
+// command that loads Butane shows them — not just validate (D16).
+func printButaneWarnings(warnings []string) {
+	for _, w := range warnings {
+		fmt.Fprintf(os.Stderr, "warning: %s\n", w)
+	}
 }

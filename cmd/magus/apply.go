@@ -32,6 +32,7 @@ Flags:
   --yes               Skip the confirmation prompt
   --policy <path>     Override policy file (default: /etc/magus/policy.yaml)
   --manifest <path>   Override manifest file (default: /var/lib/magus/manifest.json)
+  --status <path>     Override status observation file (default: /var/lib/magus/status.json)
 
 Exit codes:
   0   all declared resources are in their desired state
@@ -76,11 +77,12 @@ func runApply(args []string) int {
 		fmt.Fprintf(os.Stderr, "error: %v\n", err)
 		return 1
 	}
-	parsed, _, err := ir.LoadButane(butanePath)
+	parsed, warnings, err := ir.LoadButane(butanePath)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "error: %v\n", err)
 		return 1
 	}
+	printButaneWarnings(warnings)
 	if violations := policy.Check(p, parsed, *manifestPath, *policyPath, *statusPath); len(violations) > 0 {
 		for _, v := range violations {
 			fmt.Fprintf(os.Stderr, "error: %s\n", v)

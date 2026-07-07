@@ -171,7 +171,7 @@ This is the reconciler-pattern compromise. Magus runs unattended (timer-driven `
 
 These are not state contention; they're broken inputs. Halting forces a human to fix them before any apply runs.
 
-The user resolves an apply-time conflict manually (delete the path, move it out of `file_roots`, fix the IR to match, or `magus adopt --force` to take it over with the IR content). Until then the path stays in the conflict list, and every apply re-checks and re-skips.
+The user resolves an apply-time conflict manually (delete the path, move it out of `file_roots`, fix the IR to match, or `magus adopt <butane-source> <path>` to take it over with the IR content). Until then the path stays in the conflict list, and every apply re-checks and re-skips.
 
 **Stale manifest entries** — paths Magus claims to own but which are absent on disk (typically deleted out of band, or after a v1 unit-removal that didn't update the manifest cleanly) — are pruned silently during apply, with a log line for visibility. No reconciliation action is taken; the disk is already in the desired state.
 
@@ -408,7 +408,7 @@ Apply 4 changes? (1 conflict will be skipped) [y/N] y
   ✓ daemon-reload
   ✓ enable --now magus-healthcheck.timer
 
-Applied 4 changes, 1 conflict (skipped), 0 errors.  exit 2
+Applied 4 changes, 1 skipped, 0 errors.  exit 2
 ```
 
 ### `magus status`
@@ -463,8 +463,10 @@ $ magus status --json
 
 Restore an orphaned path to active reconciliation. Run after the policy that caused the orphan has been removed (or amended to permit the path again). The IR must declare the path; the path must exist on disk.
 
+Reclaim takes the Butane source (so it can read the declared desired state) and the path: `magus reclaim [--yes] [--force] <butane-source> <path>`.
+
 ```
-$ magus reclaim /etc/shadow
+$ magus reclaim config/butane/magus.bu /etc/shadow
 This path is orphaned (orphaned 2026-04-26 by policy deny).
 
   - manifest hash:  sha256:9f1234...
@@ -484,8 +486,10 @@ If the on-disk content has drifted during orphan, reclaim refuses unless `--forc
 
 Take over a path that exists, differs from the IR, and isn't in the manifest. **This overwrites the existing content with the IR's content**, then records the entry in the manifest. Use it when you want Magus to own a path you're willing to replace — `terraform import` with a write step. (Adoption of *matching* content needs no command — `magus apply` does it automatically.)
 
+Adopt takes the Butane source and the path: `magus adopt [--yes] <butane-source> <path>`. It always overwrites (there is no `--force` — the overwrite *is* the operation); adoption of *matching* content is the silent no-op `magus apply` already does.
+
 ```
-$ magus adopt /etc/systemd/system/legacy-thing.service
+$ magus adopt config/butane/magus.bu /etc/systemd/system/legacy-thing.service
 The path exists with content that differs from the IR.
 
   - existing hash: sha256:9f12...

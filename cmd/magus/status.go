@@ -78,7 +78,13 @@ func runStatus(args []string) int {
 		fmt.Fprintf(os.Stderr, "error: %v\n", err)
 		return 1
 	}
-	obs, _ := status.Load(*statusPath) // nil = never applied; non-fatal
+	// nil obs = never applied (or a stale cache) — non-fatal. A genuine read
+	// error (e.g. EPERM running unprivileged) is surfaced as a warning so the
+	// output isn't a misleading "last apply: (never)".
+	obs, err := status.Load(*statusPath)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "warning: %v (reporting manifest state only)\n", err)
+	}
 
 	report := buildStatus(m, obs)
 	if *asJSON {

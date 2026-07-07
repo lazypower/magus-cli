@@ -8,6 +8,7 @@ import (
 	"encoding/hex"
 	"fmt"
 	"path/filepath"
+	"sort"
 
 	"github.com/lazypower/magus-cli/internal/hostfs"
 	"github.com/lazypower/magus-cli/internal/ir"
@@ -81,17 +82,6 @@ func (p *Plan) HasChanges() bool {
 		}
 	}
 	return len(p.ServiceActions) > 0
-}
-
-// HasConflicts reports whether any resource is in conflict or orphaned —
-// both states block apply progress for the affected resource.
-func (p *Plan) HasConflicts() bool {
-	for _, a := range p.Actions {
-		if a.Action == ActionConflict || a.Action == ActionOrphaned {
-			return true
-		}
-	}
-	return false
 }
 
 // declared is the desired-state record for one path: what the IR says should
@@ -274,12 +264,19 @@ func computeCore(in *ir.IR, m *manifest.Manifest, fsys hostfs.Reader) (*Plan, er
 	}
 
 	// Manifest sweep: anything magus owns (or has orphaned) that isn't in
-	// the IR needs an action — delete, stale-clean, or orphaned-skip.
-	for path, entry := range m.Resources {
-		if declared[path] {
-			continue
+	// the IR needs an action — delete, stale-clean, or orphaned-skip. Sort the
+	// swept paths so plan/apply output is stable run-to-run (the map iteration
+	// order otherwise shuffles delete/cleanup/orphan rows — D9). The output is
+	// diffed, logged, and read by LLMs, so determinism is worth the sort.
+	swept := make([]string, 0, len(m.Resources))
+	for path := range m.Resources {
+		if !declared[path] {
+			swept = append(swept, path)
 		}
-		plan.Actions = append(plan.Actions, errorRow(diffOrphan(path, entry, fsys)))
+	}
+	sort.Strings(swept)
+	for _, path := range swept {
+		plan.Actions = append(plan.Actions, errorRow(diffOrphan(path, m.Resources[path], fsys)))
 	}
 
 	return plan, nil

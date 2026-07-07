@@ -78,11 +78,12 @@ func runReclaim(args []string) int {
 		fmt.Fprintf(os.Stderr, "error: %v\n", err)
 		return 1
 	}
-	parsed, _, err := ir.LoadButane(butanePath)
+	parsed, warnings, err := ir.LoadButane(butanePath)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "error: %v\n", err)
 		return 1
 	}
+	printButaneWarnings(warnings)
 	if violations := policy.Check(p, parsed, *manifestPath, *policyPath); len(violations) > 0 {
 		for _, v := range violations {
 			fmt.Fprintf(os.Stderr, "error: %s\n", v)
