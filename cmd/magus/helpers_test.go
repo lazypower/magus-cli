@@ -17,17 +17,20 @@ func TestPlanCountsAndSummary(t *testing.T) {
 	p := &diff.Plan{Actions: []diff.ResourceAction{
 		{Action: diff.ActionCreate}, {Action: diff.ActionUpdate}, {Action: diff.ActionAdopt},
 		{Action: diff.ActionDelete}, {Action: diff.ActionSkip}, {Action: diff.ActionConflict},
-		{Action: diff.ActionOrphaned}, {Action: diff.ActionCleanup},
+		{Action: diff.ActionOrphaned}, {Action: diff.ActionCleanup}, {Action: diff.ActionError},
 	}}
-	changes, conflicts := planCounts(p)
+	changes, conflicts, errored := planCounts(p)
 	if changes != 5 { // create,update,adopt,delete,cleanup
 		t.Errorf("changes = %d, want 5", changes)
 	}
 	if conflicts != 2 { // conflict + orphaned
 		t.Errorf("conflicts = %d, want 2", conflicts)
 	}
+	if errored != 1 { // the ActionError row
+		t.Errorf("errored = %d, want 1", errored)
+	}
 	s := summary(p)
-	for _, want := range []string{"1 creates", "1 conflicts", "1 orphaned", "1 manifest cleanup"} {
+	for _, want := range []string{"1 creates", "1 conflicts", "1 orphaned", "1 manifest cleanup", "1 errored"} {
 		if !strings.Contains(s, want) {
 			t.Errorf("summary missing %q: %s", want, s)
 		}
@@ -45,7 +48,7 @@ func TestPlanCountsIncludesServiceActions(t *testing.T) {
 			{Unit: "c.service", Op: diff.ServiceSkip},
 		},
 	}
-	changes, conflicts := planCounts(p)
+	changes, conflicts, _ := planCounts(p)
 	if changes != 2 { // enable + disable
 		t.Errorf("changes = %d, want 2 (enable+disable)", changes)
 	}

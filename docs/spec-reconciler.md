@@ -177,6 +177,8 @@ The user resolves an apply-time conflict manually (delete the path, move it out 
 
 A path inside `file_roots` that is neither in the IR nor in the manifest is simply ignored. Not a conflict, not Magus's problem.
 
+**A diff-stage read failure on one path is isolated, not fatal.** If the `stat`/`read` of a single declared path fails during planning (EPERM, transient I/O), that resource is marked errored (`[error]` row) and Magus refuses to touch it — fail-closed — while every other resource is still planned and applied. The apply exit code reflects the error (`1`), but one unreadable path does not halt convergence of the rest. This is the same per-resource posture apply takes; only *input-bad* cases (parse, policy, manifest version) halt the whole run.
+
 ## Equivalence
 
 The diff model rests on a single question: *does the on-disk state match the IR?* The answer is a fixed equivalence relation per resource type. Equivalence is part of the contract — too strict produces false conflicts on insignificant whitespace; too loose produces unsafe adoption. The rules below are version 1 and are recorded by manifest version.

@@ -6,6 +6,7 @@
 package apply
 
 import (
+	"errors"
 	"fmt"
 	"path/filepath"
 	"time"
@@ -428,6 +429,14 @@ func applyOne(p *policy.Policy, a diff.ResourceAction, resources map[string]pend
 	case diff.ActionSkip:
 		oc.Status = StatusUnchanged
 		oc.Reason = "unchanged"
+		return oc
+
+	case diff.ActionError:
+		// Diff couldn't determine this path's state (stat/read failure). Refuse
+		// to touch it — fail-closed — and surface the error. Other resources
+		// were still planned and apply normally.
+		oc.Status = StatusErrored
+		oc.Err = errors.New(a.Reason)
 		return oc
 
 	case diff.ActionConflict, diff.ActionOrphaned:

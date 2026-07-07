@@ -403,6 +403,37 @@ func TestErrorIsolation(t *testing.T) {
 	}
 }
 
+func TestApplyActionErrorFailsClosed(t *testing.T) {
+	// D5: an ActionError row (diff couldn't determine the path's state) must be
+	// surfaced as an error and NOT written — fail-closed — while the rest of
+	// the plan still applies.
+	w := newMemWriter()
+	in := &ir.IR{Files: []ir.File{
+		{Path: "/etc/core/good", Mode: 0o644, Contents: []byte("hi")},
+		{Path: "/etc/core/bad", Mode: 0o644, Contents: []byte("nope")},
+	}}
+	plan := &diff.Plan{Actions: []diff.ResourceAction{
+		{Path: "/etc/core/good", Kind: diff.KindFile, Action: diff.ActionCreate},
+		{Path: "/etc/core/bad", Kind: diff.KindFile, Action: diff.ActionError, Reason: "stat /etc/core/bad: permission denied"},
+	}}
+	m := manifest.New()
+	r := Apply(plan, in, w, m, systemd.NewFake(), time.Now())
+
+	if r.ExitCode() != 1 {
+		t.Errorf("exit = %d, want 1 (errored)", r.ExitCode())
+	}
+	// The healthy file was written; the errored path was not touched or owned.
+	if _, ok := w.files["/etc/core/good"]; !ok {
+		t.Error("healthy file should have been written")
+	}
+	if _, ok := w.files["/etc/core/bad"]; ok {
+		t.Error("errored path must not be written (fail-closed)")
+	}
+	if m.Owns("/etc/core/bad") {
+		t.Error("errored path must not be recorded in the manifest")
+	}
+}
+
 func TestExitCodePriorities(t *testing.T) {
 	// Errors dominate skips dominate clean. Verify the priority order.
 	cases := []struct {

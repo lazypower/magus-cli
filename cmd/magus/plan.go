@@ -175,7 +175,7 @@ func actionTag(a diff.Action) string {
 }
 
 func summary(p *diff.Plan) string {
-	var c, u, ad, d, s, cf, or, sc int
+	var c, u, ad, d, s, cf, or, sc, er int
 	for _, a := range p.Actions {
 		switch a.Action {
 		case diff.ActionCreate:
@@ -194,6 +194,8 @@ func summary(p *diff.Plan) string {
 			or++
 		case diff.ActionCleanup:
 			sc++
+		case diff.ActionError:
+			er++
 		}
 	}
 	out := fmt.Sprintf("%d creates, %d updates, %d adopts, %d deletes, %d skipped",
@@ -206,6 +208,9 @@ func summary(p *diff.Plan) string {
 	}
 	if sc > 0 {
 		out += fmt.Sprintf(", %d manifest cleanup", sc)
+	}
+	if er > 0 {
+		out += fmt.Sprintf(", %d errored", er)
 	}
 	if en, dis, sk := serviceCounts(p); en+dis+sk > 0 {
 		out += fmt.Sprintf(", %d enable, %d disable", en, dis)

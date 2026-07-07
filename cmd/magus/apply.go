@@ -107,15 +107,15 @@ func runApply(args []string) int {
 
 	printPlan(os.Stdout, butanePath, plan, nil)
 
-	changes, conflicts := planCounts(plan)
-	if changes == 0 && conflicts == 0 {
+	changes, conflicts, errored := planCounts(plan)
+	if changes == 0 && conflicts == 0 && errored == 0 {
 		// Already converged. Refresh the observation (keeps last_apply current
 		// on a timer that mostly runs no-op applies) and exit.
 		saveStatusObservation(*statusPath, plan, nil, apply.ObserveUnits(parsed, sd), now)
 		fmt.Println("\nNothing to apply.")
 		return 0
 	}
-	if changes == 0 {
+	if changes == 0 && errored == 0 {
 		// Conflicts only: nothing to apply, but the conflicts must still be
 		// recorded so `magus status` reflects them (and the exit code is 2,
 		// "conflicts present") — regardless of --yes. No prompt: there's nothing
@@ -125,7 +125,10 @@ func runApply(args []string) int {
 		return 2
 	}
 
-	if !*yes {
+	// There is real work (changes) and/or diff errors to surface. Confirm only
+	// when there are changes to apply; errored-only plans run straight through
+	// to record the failure (nothing is written — ActionError is fail-closed).
+	if changes > 0 && !*yes {
 		if !confirm(os.Stdin, os.Stdout, changes, conflicts) {
 			fmt.Println("Aborted.")
 			return 0
@@ -212,10 +215,11 @@ func statusResultString(code int) string {
 	}
 }
 
-// planCounts splits actions into "changes that will run" vs "conflicts that
-// will be skipped" — the two numbers the prompt needs. Enablement operations
-// count too: enable/disable are changes, a masked/static skip is a conflict.
-func planCounts(p *diff.Plan) (changes, conflicts int) {
+// planCounts splits actions into the numbers the apply flow needs: changes that
+// will run, conflicts that will be skipped, and resources that errored during
+// diff (undeterminable state, fail-closed). Enablement operations count too:
+// enable/disable are changes, a masked/static skip is a conflict.
+func planCounts(p *diff.Plan) (changes, conflicts, errored int) {
 	for _, a := range p.Actions {
 		switch a.Action {
 		case diff.ActionCreate, diff.ActionUpdate, diff.ActionAdopt,
@@ -223,6 +227,8 @@ func planCounts(p *diff.Plan) (changes, conflicts int) {
 			changes++
 		case diff.ActionConflict, diff.ActionOrphaned:
 			conflicts++
+		case diff.ActionError:
+			errored++
 		}
 	}
 	for _, sa := range p.ServiceActions {

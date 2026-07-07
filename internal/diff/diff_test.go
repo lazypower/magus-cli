@@ -39,6 +39,53 @@ func (m memFS) ReadFile(path string) ([]byte, error) {
 	return f.contents, nil
 }
 
+// erroringFS wraps a memFS and returns an I/O error for one designated path,
+// modeling an EPERM/transient failure on a single declared resource.
+type erroringFS struct {
+	memFS
+	failPath string
+}
+
+func (e erroringFS) Stat(path string) (hostfs.FileInfo, error) {
+	if path == e.failPath {
+		return hostfs.FileInfo{}, errors.New("permission denied")
+	}
+	return e.memFS.Stat(path)
+}
+
+func (e erroringFS) ReadFile(path string) ([]byte, error) {
+	if path == e.failPath {
+		return nil, errors.New("permission denied")
+	}
+	return e.memFS.ReadFile(path)
+}
+
+// D5: a stat/read failure on one declared path must degrade to a fail-closed
+// ActionError row without aborting the diff of every other resource.
+func TestDiffPerPathErrorIsolation(t *testing.T) {
+	in := &ir.IR{Files: []ir.File{
+		{Path: "/etc/magus.d/good", Mode: 0o644, Contents: []byte("hi")},
+		{Path: "/etc/magus.d/bad", Mode: 0o644, Contents: []byte("nope")},
+	}}
+	fsys := erroringFS{memFS: memFS{}, failPath: "/etc/magus.d/bad"}
+
+	plan, err := Compute(in, manifest.New(), fsys)
+	if err != nil {
+		t.Fatalf("Compute must not abort on a per-path error: %v", err)
+	}
+	good := findAction(t, plan, "/etc/magus.d/good")
+	if good.Action != ActionCreate {
+		t.Errorf("healthy resource action = %s, want create", good.Action)
+	}
+	bad := findAction(t, plan, "/etc/magus.d/bad")
+	if bad.Action != ActionError {
+		t.Errorf("failed resource action = %s, want error", bad.Action)
+	}
+	if bad.Reason == "" {
+		t.Error("error row should carry a reason")
+	}
+}
+
 // findAction returns the first action targeting path, or fails the test.
 func findAction(t *testing.T, p *Plan, path string) ResourceAction {
 	t.Helper()
