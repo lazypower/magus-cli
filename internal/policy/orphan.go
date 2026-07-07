@@ -35,15 +35,17 @@ func OrphanDenied(p *Policy, m *manifest.Manifest, now time.Time) []string {
 }
 
 // deniedReason reports why the policy no longer permits an owned resource, by
-// kind. Units and quadlets must consult the UNIT/SERVICE deny lists too — not
-// just the path — so that a newly deny.units'd unit/quadlet is orphaned (kept)
-// rather than deleted by the sweep.
+// kind. Units are governed by NAME everywhere (unit_patterns + deny.units), not
+// by path: their bodies live at a fixed /etc/systemd/system location that is an
+// implementation detail, not something the operator lists in file_roots.
+// Checking the path here too would orphan a unit that Check happily created by
+// name under a policy whose file_roots omit the systemd dir (D7) — one authority
+// per resource kind. Quadlets legitimately have both authorities: the source
+// file is path-governed (under file_roots) and the generated service is
+// name-governed (deny.units), so both are consulted for them.
 func deniedReason(p *Policy, path string, kind manifest.Kind) string {
 	switch kind {
 	case manifest.KindUnit:
-		if r := p.DenyPathReason(path); r != "" {
-			return r
-		}
 		return p.DenyUnitReason(ir.UnitNameFromPath(path))
 	case manifest.KindQuadlet:
 		if r := p.DenyPathReason(path); r != "" {

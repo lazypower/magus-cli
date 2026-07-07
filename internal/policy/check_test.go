@@ -41,6 +41,7 @@ deny:
 			{Path: "/etc/magus.d/secret"},               // explicit deny
 			{Path: "/etc/magus.d/world", Mode: 0o646},   // world-writable
 			{Path: "/etc/magus.d/setuid", Mode: 0o4755}, // setuid
+			{Path: "/etc/magus.d/sticky", Mode: 0o1755}, // sticky (D12)
 		},
 		Units: []ir.Unit{
 			{Name: "ollama.service"},     // doesn't match unit_patterns
@@ -56,6 +57,7 @@ deny:
 		"/etc/magus.d/secret", "denied by policy",
 		"world-writable",
 		"setuid",
+		"sticky bit not supported",
 		"ollama.service", "unit_patterns",
 		"magus-secret-thing", "denied by policy",
 		"20-other.conf", "10-magus.conf",
