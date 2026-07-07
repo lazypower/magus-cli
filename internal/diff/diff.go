@@ -71,17 +71,30 @@ type Plan struct {
 }
 
 // HasChanges reports whether anything other than skips/cleanup would run —
-// including an enablement operation or an undeterminable resource. Used to pick
-// exit codes (0 vs 2). Any service action (enable/disable, or a masked/static
-// skip) means the system is not in its declared state, so it counts.
+// pending work or a conflict/orphan (the "changes pending" exit-2 condition),
+// including an enablement operation. It deliberately excludes ActionError: an
+// undeterminable resource is an error, not a pending change (see HasErrors), and
+// folding it in would make `plan` exit 2 ("safe to apply") on a path it can't
+// even read.
 func (p *Plan) HasChanges() bool {
 	for _, a := range p.Actions {
 		switch a.Action {
-		case ActionCreate, ActionUpdate, ActionAdopt, ActionDelete, ActionConflict, ActionOrphaned, ActionError:
+		case ActionCreate, ActionUpdate, ActionAdopt, ActionDelete, ActionConflict, ActionOrphaned:
 			return true
 		}
 	}
 	return len(p.ServiceActions) > 0
+}
+
+// HasErrors reports whether any resource's state could not be determined during
+// diff (ActionError). These are errors (exit 1), not pending changes (exit 2).
+func (p *Plan) HasErrors() bool {
+	for _, a := range p.Actions {
+		if a.Action == ActionError {
+			return true
+		}
+	}
+	return false
 }
 
 // declared is the desired-state record for one path: what the IR says should
@@ -317,6 +330,16 @@ func diffDirectory(d ir.Directory, m *manifest.Manifest, fsys hostfs.Reader) (Re
 
 	if !st.Exists {
 		ra.Action = ActionCreate
+		return ra, nil
+	}
+
+	if !st.IsDir {
+		// A non-directory (a regular file, a symlink) sits where a directory is
+		// declared. Magus won't rm it and mkdir — that would destroy data — so
+		// it's a conflict for the operator to resolve, never a silent adopt that
+		// leaves apply reporting success without reaching the declared state.
+		ra.Action = ActionConflict
+		ra.Reason = "exists but is not a directory"
 		return ra, nil
 	}
 

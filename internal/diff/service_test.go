@@ -25,6 +25,8 @@ func TestEnablementOp(t *testing.T) {
 		{"enable-static", boolPtr(true), systemd.EnablementStatic, ServiceSkip},
 		{"enable-notfound", boolPtr(true), systemd.EnablementNotFound, ServiceSkip},
 		{"disable-drift", boolPtr(false), systemd.EnablementEnabled, ServiceDisable},
+		// Finding 5: disabled intent + unknown state fails closed (attempt disable).
+		{"disable-unknown-failsclosed", boolPtr(false), systemd.EnablementUnknown, ServiceDisable},
 		{"already-disabled", boolPtr(false), systemd.EnablementDisabled, ""},
 		{"disable-masked-noop", boolPtr(false), systemd.EnablementMasked, ""},
 		{"disable-static-noop", boolPtr(false), systemd.EnablementStatic, ""},

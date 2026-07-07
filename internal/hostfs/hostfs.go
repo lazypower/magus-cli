@@ -18,6 +18,7 @@ import (
 // not timestamps.
 type FileInfo struct {
 	Exists bool
+	IsDir  bool   // true for a directory — so a dir-declared path can't adopt a file
 	Mode   uint32 // permission bits only
 	UID    int
 	GID    int
@@ -94,6 +95,7 @@ func (osImpl) Stat(path string) (FileInfo, error) {
 	}
 	info := FileInfo{
 		Exists: true,
+		IsDir:  st.IsDir(),
 		Mode:   uint32(st.Mode().Perm()),
 	}
 	if sys, ok := st.Sys().(*syscall.Stat_t); ok {
@@ -194,7 +196,19 @@ func (osImpl) WriteFile(path string, contents []byte, mode uint32, uid, gid *int
 		_ = os.Remove(tmp)
 		return err
 	}
-	return nil
+	// fsync the parent directory so the rename survives a crash, not just the
+	// file contents (which were fsync'd before the rename above).
+	return fsyncDir(filepath.Dir(path))
+}
+
+// fsyncDir flushes a directory's metadata so a rename into it is crash-durable.
+func fsyncDir(dir string) error {
+	d, err := os.Open(dir)
+	if err != nil {
+		return err
+	}
+	defer d.Close()
+	return d.Sync()
 }
 
 func (osImpl) Remove(path string) error {

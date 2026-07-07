@@ -75,7 +75,7 @@ func (m *memWriter) Stat(path string) (hostfs.FileInfo, error) {
 		return hostfs.FileInfo{Exists: true, Mode: f.mode, UID: f.uid, GID: f.gid}, nil
 	}
 	if d, ok := m.dirs[path]; ok {
-		return hostfs.FileInfo{Exists: true, Mode: d.mode, UID: d.uid, GID: d.gid}, nil
+		return hostfs.FileInfo{Exists: true, IsDir: true, Mode: d.mode, UID: d.uid, GID: d.gid}, nil
 	}
 	return hostfs.FileInfo{Exists: false}, nil
 }

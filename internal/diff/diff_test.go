@@ -29,7 +29,7 @@ func (m memFS) Stat(path string) (hostfs.FileInfo, error) {
 	if !ok {
 		return hostfs.FileInfo{Exists: false}, nil
 	}
-	return hostfs.FileInfo{Exists: true, Mode: f.mode, UID: f.uid, GID: f.gid}, nil
+	return hostfs.FileInfo{Exists: true, IsDir: f.isDir, Mode: f.mode, UID: f.uid, GID: f.gid}, nil
 }
 
 func (m memFS) ReadFile(path string) ([]byte, error) {
@@ -59,6 +59,35 @@ func TestSweepRowsAreSorted(t *testing.T) {
 	}
 	if !sort.StringsAreSorted(paths) {
 		t.Errorf("sweep rows not in sorted order: %v", paths)
+	}
+}
+
+// Finding 4: a regular file where a directory is declared must be a conflict,
+// not a silent adopt/update that leaves apply reporting success.
+func TestDirectoryDeclaredButFileOnDisk(t *testing.T) {
+	in := &ir.IR{Directories: []ir.Directory{{Path: "/etc/core/data", Mode: 0o755}}}
+	// A regular file (isDir:false) sits at the directory path, mode matching.
+	fs := memFS{"/etc/core/data": {mode: 0o755, isDir: false}}
+
+	plan, err := Compute(in, manifest.New(), fs)
+	if err != nil {
+		t.Fatal(err)
+	}
+	a := findAction(t, plan, "/etc/core/data")
+	if a.Action != ActionConflict {
+		t.Errorf("file-at-dir-path action = %s, want conflict", a.Action)
+	}
+}
+
+// Finding 6: HasErrors is distinct from HasChanges — an ActionError is an error
+// (exit 1), not a pending change (exit 2).
+func TestPlanHasErrorsSeparateFromHasChanges(t *testing.T) {
+	p := &Plan{Actions: []ResourceAction{{Action: ActionError}}}
+	if !p.HasErrors() {
+		t.Error("plan with an ActionError should report HasErrors")
+	}
+	if p.HasChanges() {
+		t.Error("an ActionError is not a pending change")
 	}
 }
 

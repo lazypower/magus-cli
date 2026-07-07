@@ -41,8 +41,12 @@ func readButaneSource(source string, allowInsecureHTTP bool) ([]byte, error) {
 		if strings.HasPrefix(source, "http://") && !allowInsecureHTTP {
 			return nil, fmt.Errorf("refusing to fetch Butane over plain HTTP (%s): an on-path attacker could substitute a unit magus runs as root — use https, or pass --insecure-http to override", source)
 		}
-		return fetchButaneHTTP(source)
+		return fetchButaneHTTP(source, allowInsecureHTTP)
 	}
+	return readLocalButane(source)
+}
+
+func readLocalButane(source string) ([]byte, error) {
 	f, err := os.Open(source)
 	if err != nil {
 		return nil, fmt.Errorf("read butane: %w", err)
@@ -64,8 +68,28 @@ func isHTTPURL(s string) bool {
 	return strings.HasPrefix(s, "http://") || strings.HasPrefix(s, "https://")
 }
 
-func fetchButaneHTTP(rawurl string) ([]byte, error) {
-	client := &http.Client{Timeout: fetchTimeout}
+// rejectInsecureRedirect is the http.Client CheckRedirect that closes the
+// redirect hole in the https gate: an https:// source that 302s to http:// would
+// otherwise fetch over plain HTTP with no flag, reintroducing the on-path
+// substitution risk. It refuses any redirect that downgrades to http (unless
+// --insecure-http) and caps the chain length.
+func rejectInsecureRedirect(allowInsecureHTTP bool) func(*http.Request, []*http.Request) error {
+	return func(req *http.Request, via []*http.Request) error {
+		if req.URL.Scheme == "http" && !allowInsecureHTTP {
+			return fmt.Errorf("refusing redirect to plain HTTP (%s): use https, or pass --insecure-http", req.URL)
+		}
+		if len(via) >= 10 {
+			return fmt.Errorf("stopped after 10 redirects")
+		}
+		return nil
+	}
+}
+
+func fetchButaneHTTP(rawurl string, allowInsecureHTTP bool) ([]byte, error) {
+	client := &http.Client{
+		Timeout:       fetchTimeout,
+		CheckRedirect: rejectInsecureRedirect(allowInsecureHTTP),
+	}
 	resp, err := client.Get(rawurl)
 	if err != nil {
 		return nil, fmt.Errorf("fetch %s: %w", rawurl, err)

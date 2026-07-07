@@ -3,6 +3,7 @@ package ir
 import (
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
@@ -231,6 +232,37 @@ func TestLoadButaneRejectsPlainHTTP(t *testing.T) {
 	if !strings.Contains(err.Error(), "plain HTTP") {
 		t.Errorf("error did not explain the https requirement: %v", err)
 	}
+}
+
+func TestRejectInsecureRedirect(t *testing.T) {
+	// Finding 1: an https source that redirects to http must be refused unless
+	// --insecure-http, or the gate is bypassed.
+	httpReq := &http.Request{URL: mustURL(t, "http://evil.example/x")}
+	httpsReq := &http.Request{URL: mustURL(t, "https://ok.example/x")}
+
+	if err := rejectInsecureRedirect(false)(httpReq, nil); err == nil {
+		t.Error("redirect to http must be refused when insecure is off")
+	}
+	if err := rejectInsecureRedirect(true)(httpReq, nil); err != nil {
+		t.Errorf("redirect to http should be allowed with --insecure-http: %v", err)
+	}
+	if err := rejectInsecureRedirect(false)(httpsReq, nil); err != nil {
+		t.Errorf("redirect to https must be allowed: %v", err)
+	}
+	// Redirect-loop cap.
+	via := make([]*http.Request, 10)
+	if err := rejectInsecureRedirect(false)(httpsReq, via); err == nil {
+		t.Error("should stop after 10 redirects")
+	}
+}
+
+func mustURL(t *testing.T, raw string) *url.URL {
+	t.Helper()
+	u, err := url.Parse(raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return u
 }
 
 func TestLoadButaneHTTPNon200(t *testing.T) {

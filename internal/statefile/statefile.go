@@ -58,5 +58,21 @@ func WriteAtomic(path string, data []byte) (err error) {
 	if err := os.Rename(tmp, path); err != nil {
 		return fmt.Errorf("rename %s: %w", tmp, err)
 	}
+	// fsync the parent directory so the rename itself is durable — without it a
+	// power loss right after rename can lose the new directory entry (and thus
+	// the ledger), even though the file's contents were fsync'd.
+	return fsyncDir(filepath.Dir(path))
+}
+
+// fsyncDir flushes a directory's metadata so a rename into it survives a crash.
+func fsyncDir(dir string) error {
+	d, err := os.Open(dir)
+	if err != nil {
+		return fmt.Errorf("open dir %s for fsync: %w", dir, err)
+	}
+	defer d.Close()
+	if err := d.Sync(); err != nil {
+		return fmt.Errorf("fsync dir %s: %w", dir, err)
+	}
 	return nil
 }

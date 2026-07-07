@@ -60,10 +60,13 @@ func EnablementOp(desired *bool, current systemd.Enablement) (ServiceOp, string)
 		}
 		return "", ""
 	}
-	// Declared disabled: only act when the unit is actually enabled. Masked,
-	// static, and not-found are already not-running-by-enablement; nothing to do.
-	if current == systemd.EnablementEnabled {
-		return ServiceDisable, "declared disabled, currently enabled"
+	// Declared disabled. Act when the unit is enabled, and also when its state is
+	// unknown — mirroring the enable branch, disable-on-unknown fails closed
+	// toward the declared state (systemctl disable is a harmless no-op if the
+	// unit is already disabled/static). Masked and not-found are already
+	// not-running-by-enablement; nothing to do.
+	if current == systemd.EnablementEnabled || current == systemd.EnablementUnknown {
+		return ServiceDisable, "declared disabled, currently " + string(current)
 	}
 	return "", ""
 }

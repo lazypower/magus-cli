@@ -580,7 +580,7 @@ func applyDirectoryAdopt(a diff.ResourceAction, r pendingResource, w hostfs.Writ
 		oc.Err = err
 		return oc
 	}
-	if !st.Exists ||
+	if !st.Exists || !st.IsDir ||
 		st.Mode != r.Mode ||
 		(r.UID != nil && st.UID != *r.UID) ||
 		(r.GID != nil && st.GID != *r.GID) {

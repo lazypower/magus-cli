@@ -216,9 +216,12 @@ func runReclaim(args []string) int {
 	if *force && mismatchedFromIR {
 		finalHash = declaredHash
 	}
-	// Preserve the kind from the orphaned entry — reclaiming a unit must
-	// not silently demote it to a file.
-	m.PutActive(target, entry.Kind, finalHash, entry.Origin, time.Now().UTC())
+	// Record the CURRENTLY-declared kind, not the orphaned entry's kind. The
+	// entry's kind can be stale (a path reclassified from storage.files to
+	// systemd.units between orphaning and reclaim); trusting it would record a
+	// unit as a file and later delete it with file semantics — no disable --now.
+	// findDeclared already resolved the current declaration.
+	m.PutActive(target, manifestKind(declared.diffKind), finalHash, entry.Origin, time.Now().UTC())
 	if err := m.Save(*manifestPath); err != nil {
 		fmt.Fprintf(os.Stderr, "error: save manifest: %v\n", err)
 		return 1
@@ -293,7 +296,9 @@ func reclaimDirectory(target string, entry manifest.Resource, m *manifest.Manife
 	}
 	fmt.Println()
 
-	m.PutActive(target, entry.Kind, entry.Hash, entry.Origin, time.Now().UTC())
+	// This branch is only reached for a currently-declared directory, so record
+	// KindDirectory (not the possibly-stale orphaned entry's kind).
+	m.PutActive(target, manifest.KindDirectory, entry.Hash, entry.Origin, time.Now().UTC())
 	if err := m.Save(manifestPath); err != nil {
 		fmt.Fprintf(os.Stderr, "error: save manifest: %v\n", err)
 		return 1

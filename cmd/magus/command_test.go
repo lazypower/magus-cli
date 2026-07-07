@@ -271,7 +271,10 @@ func TestRunReclaimDirectory(t *testing.T) {
 		t.Fatal(err)
 	}
 	m := manifest.New()
-	m.PutActive(dir, manifest.KindDirectory, "sha256:dir", manifest.OriginCreate, time.Unix(1, 0).UTC())
+	// Seed a STALE kind (file) on the orphaned entry; reclaim must record the
+	// currently-declared kind (directory), not carry the stale one forward
+	// (finding 3).
+	m.PutActive(dir, manifest.KindFile, "sha256:dir", manifest.OriginCreate, time.Unix(1, 0).UTC())
 	m.Orphan(dir, "policy deny: prior", time.Unix(1, 0).UTC())
 	if err := m.Save(f.manifest); err != nil {
 		t.Fatal(err)
@@ -290,6 +293,6 @@ func TestRunReclaimDirectory(t *testing.T) {
 		t.Errorf("reclaim did not reactivate directory: %+v", e)
 	}
 	if e.Kind != manifest.KindDirectory {
-		t.Errorf("reclaim demoted directory kind to %s", e.Kind)
+		t.Errorf("reclaim recorded kind %s, want directory (corrected from stale file kind)", e.Kind)
 	}
 }

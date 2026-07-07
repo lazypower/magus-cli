@@ -111,6 +111,12 @@ func runPlan(args []string) int {
 		printPlan(os.Stdout, butanePath, plan, details)
 	}
 
+	// Error dominates: a path whose state couldn't be determined is exit 1, not
+	// the "changes pending" exit 2 — an agent gating on 2 as "review then apply"
+	// must not treat an unreadable path as safe.
+	if plan.HasErrors() {
+		return 1
+	}
 	if plan.HasChanges() {
 		return 2
 	}
