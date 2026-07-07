@@ -2,6 +2,7 @@ package apply
 
 import (
 	"errors"
+	"strings"
 	"testing"
 	"time"
 
@@ -418,6 +419,47 @@ func TestUnitEnabledFalseDisablesEnabledUnit(t *testing.T) {
 	}
 	if !containsCall(sd.Calls(), "Disable(magus-foo.service)") {
 		t.Errorf("expected Disable for enabled=false, got: %v", sd.Calls())
+	}
+}
+
+func TestUnitMaskedDeclaredEnabledSkips(t *testing.T) {
+	// D10: a unit declared enabled but currently masked cannot be enabled by
+	// magus (it won't unmask). This must surface as a skip outcome, not a
+	// silent exit-0 no-op.
+	w := newMemWriter()
+	sd := systemd.NewFake()
+	sd.SetEnablement("magus-foo.service", systemd.EnablementMasked)
+
+	path := diff.UnitPath("magus-foo.service")
+	w.preload(path, memFile{contents: []byte(sampleUnitBody), mode: 0o644})
+
+	in := &ir.IR{Units: []ir.Unit{
+		{Name: "magus-foo.service", Enabled: boolPtr(true), Contents: sampleUnitBody},
+	}}
+	m := manifest.New()
+	m.PutActive(path, manifest.KindUnit, diff.HashContent([]byte(sampleUnitBody), diff.KindUnit), manifest.OriginCreate, time.Now())
+
+	plan, _ := diff.Compute(in, m, w)
+	r := Apply(plan, in, w, m, sd, time.Now())
+
+	// No enable attempt on a masked unit.
+	for _, c := range sd.Calls() {
+		if c == "Enable(magus-foo.service)" || c == "EnableNow(magus-foo.service)" {
+			t.Errorf("must not enable a masked unit, got: %v", sd.Calls())
+		}
+	}
+	// A visible skip outcome carrying the masked reason.
+	var skipped *Outcome
+	for i := range r.Outcomes {
+		if r.Outcomes[i].Status == StatusSkipped && strings.Contains(r.Outcomes[i].Reason, "masked") {
+			skipped = &r.Outcomes[i]
+		}
+	}
+	if skipped == nil {
+		t.Fatalf("expected a masked skip outcome, got: %+v", r.Outcomes)
+	}
+	if r.ExitCode() != 2 {
+		t.Errorf("masked-declared-enabled should yield exit 2 (skip), got %d", r.ExitCode())
 	}
 }
 

@@ -55,14 +55,18 @@ type ResourceAction struct {
 	IRMode     uint32
 }
 
-// Plan is the full set of actions for one diff. Counts() summarizes for the
-// CLI footer.
+// Plan is the full set of actions for one diff. Actions govern on-disk
+// resources; ServiceActions govern unit enablement (persistent systemd state
+// reconciled every apply). Counts() summarizes for the CLI footer.
 type Plan struct {
-	Actions []ResourceAction
+	Actions        []ResourceAction
+	ServiceActions []ServiceAction
 }
 
-// HasChanges reports whether anything other than skips/cleanup would run.
-// Used to pick exit codes (0 vs 2).
+// HasChanges reports whether anything other than skips/cleanup would run —
+// including an enablement operation. Used to pick exit codes (0 vs 2). Any
+// service action (enable/disable, or a masked/static skip) means the system is
+// not in its declared state, so it counts.
 func (p *Plan) HasChanges() bool {
 	for _, a := range p.Actions {
 		switch a.Action {
@@ -70,7 +74,7 @@ func (p *Plan) HasChanges() bool {
 			return true
 		}
 	}
-	return false
+	return len(p.ServiceActions) > 0
 }
 
 // HasConflicts reports whether any resource is in conflict or orphaned —

@@ -34,6 +34,32 @@ func TestPlanCountsAndSummary(t *testing.T) {
 	}
 }
 
+func TestPlanCountsIncludesServiceActions(t *testing.T) {
+	// D1: an enablement drift with a clean file diff must still count as a
+	// change, so the apply path doesn't early-exit "Nothing to apply".
+	p := &diff.Plan{
+		Actions: []diff.ResourceAction{{Action: diff.ActionSkip}},
+		ServiceActions: []diff.ServiceAction{
+			{Unit: "a.service", Op: diff.ServiceEnable},
+			{Unit: "b.service", Op: diff.ServiceDisable},
+			{Unit: "c.service", Op: diff.ServiceSkip},
+		},
+	}
+	changes, conflicts := planCounts(p)
+	if changes != 2 { // enable + disable
+		t.Errorf("changes = %d, want 2 (enable+disable)", changes)
+	}
+	if conflicts != 1 { // masked/static skip
+		t.Errorf("conflicts = %d, want 1 (enablement skip)", conflicts)
+	}
+	s := summary(p)
+	for _, want := range []string{"1 enable", "1 disable", "1 enablement skipped"} {
+		if !strings.Contains(s, want) {
+			t.Errorf("summary missing %q: %s", want, s)
+		}
+	}
+}
+
 func TestPlural(t *testing.T) {
 	if plural(1) != "" || plural(0) != "s" || plural(2) != "s" {
 		t.Errorf("plural wrong: %q %q %q", plural(1), plural(0), plural(2))

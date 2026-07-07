@@ -13,6 +13,7 @@ import (
 	"github.com/lazypower/magus-cli/internal/ir"
 	"github.com/lazypower/magus-cli/internal/manifest"
 	"github.com/lazypower/magus-cli/internal/policy"
+	"github.com/lazypower/magus-cli/internal/systemd"
 )
 
 const planUsage = `magus plan — show what apply would do
@@ -86,6 +87,10 @@ func runPlan(args []string) int {
 		fmt.Fprintf(os.Stderr, "error: %v\n", err)
 		return 1
 	}
+	// Preview enablement operations too (read-only is-enabled queries) so plan
+	// honestly shows the enable/disable/skip work apply will do. No-op when
+	// systemd is unavailable.
+	diff.PlanServiceState(parsed, plan, systemd.OS())
 
 	var details map[string]string
 	if *explainFlag {
@@ -151,6 +156,16 @@ func printPlan(w io.Writer, butanePath string, p *diff.Plan, details map[string]
 		}
 	}
 
+	// Enablement operations, rendered like resource rows: [enable]/[disable]/
+	// [skip] against the unit name.
+	for _, sa := range p.ServiceActions {
+		fmt.Fprintf(w, "  %-12s%s", fmt.Sprintf("[%s]", sa.Op), sa.Unit)
+		if sa.Reason != "" {
+			fmt.Fprintf(w, "  (%s)", sa.Reason)
+		}
+		fmt.Fprintln(w)
+	}
+
 	fmt.Fprintln(w)
 	fmt.Fprintln(w, summary(p))
 }
@@ -192,5 +207,26 @@ func summary(p *diff.Plan) string {
 	if sc > 0 {
 		out += fmt.Sprintf(", %d manifest cleanup", sc)
 	}
+	if en, dis, sk := serviceCounts(p); en+dis+sk > 0 {
+		out += fmt.Sprintf(", %d enable, %d disable", en, dis)
+		if sk > 0 {
+			out += fmt.Sprintf(", %d enablement skipped", sk)
+		}
+	}
 	return out
+}
+
+// serviceCounts tallies the plan's enablement operations by kind.
+func serviceCounts(p *diff.Plan) (enable, disable, skip int) {
+	for _, sa := range p.ServiceActions {
+		switch sa.Op {
+		case diff.ServiceEnable:
+			enable++
+		case diff.ServiceDisable:
+			disable++
+		case diff.ServiceSkip:
+			skip++
+		}
+	}
+	return
 }

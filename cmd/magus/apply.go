@@ -100,6 +100,10 @@ func runApply(args []string) int {
 		fmt.Fprintf(os.Stderr, "error: %v\n", err)
 		return 1
 	}
+	// Enablement is persistent state reconciled every apply — model it as plan
+	// rows so it's previewed like everything else and a drift can't hide behind
+	// a clean file diff ("Nothing to apply" stays honest).
+	diff.PlanServiceState(parsed, plan, sd)
 
 	printPlan(os.Stdout, butanePath, plan, nil)
 
@@ -161,6 +165,14 @@ func saveStatusObservation(statusPath string, plan *diff.Plan, result *apply.Res
 			conflicts = append(conflicts, status.Conflict{Path: a.Path, Reason: a.Reason})
 		}
 	}
+	// Enablement skips (declared enabled but masked/static/not-found) are
+	// unresolved-by-magus states too — record them so `magus status` reflects
+	// the unachievable intent instead of dropping it.
+	for _, sa := range plan.ServiceActions {
+		if sa.Op == diff.ServiceSkip {
+			conflicts = append(conflicts, status.Conflict{Path: sa.Unit, Reason: sa.Reason})
+		}
+	}
 
 	errs := []status.ErrEntry{}
 	res := status.ResultOK
@@ -201,7 +213,8 @@ func statusResultString(code int) string {
 }
 
 // planCounts splits actions into "changes that will run" vs "conflicts that
-// will be skipped" — the two numbers the prompt needs.
+// will be skipped" — the two numbers the prompt needs. Enablement operations
+// count too: enable/disable are changes, a masked/static skip is a conflict.
 func planCounts(p *diff.Plan) (changes, conflicts int) {
 	for _, a := range p.Actions {
 		switch a.Action {
@@ -209,6 +222,14 @@ func planCounts(p *diff.Plan) (changes, conflicts int) {
 			diff.ActionDelete, diff.ActionCleanup:
 			changes++
 		case diff.ActionConflict, diff.ActionOrphaned:
+			conflicts++
+		}
+	}
+	for _, sa := range p.ServiceActions {
+		switch sa.Op {
+		case diff.ServiceEnable, diff.ServiceDisable:
+			changes++
+		case diff.ServiceSkip:
 			conflicts++
 		}
 	}

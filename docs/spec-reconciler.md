@@ -342,6 +342,13 @@ config/butane/magus.bu → 5 resources
 
 Exit codes (plan): `0` = no changes needed, `2` = changes pending or conflicts present, `1` = input-bad (parse error, policy/IR contradiction, manifest version mismatch).
 
+**Enablement is previewed too.** Because enablement is persistent state reconciled every apply, `plan` shows the enable/disable operations it will perform as their own rows (`[enable]`/`[disable]` against the unit name), and surfaces an unachievable declaration (`enabled: true` on a masked/static/not-found unit) as `[skip]`. This is what makes `plan` an honest preview of `apply` and keeps "Nothing to apply" true by construction — an enablement drift is a plan row, so it can't hide behind a clean file diff. `plan` queries `systemctl is-enabled` (read-only) to compute these; where systemd is unavailable, enablement simply isn't previewed.
+
+```
+  [enable]   magus-healthcheck.timer  (declared enabled, currently disabled)
+  [skip]     legacy.service           (declared enabled but unit is masked; magus will not unmask)
+```
+
 `--explain` augments the plan with per-resource diffs. For **`[update]`** rows (resources Magus owns) it shows a unified text diff — over the canonicalized form for units/quadlets (same bytes used for hashing), raw for files; if either side is non-text the diff is replaced with the sha256 of each side. Mode and ownership deltas are shown as single lines.
 
 For **`[conflict]`** rows the resource is *unowned*, so dumping its content into CLI/log/LLM output is an information leak. By default a conflict shows **hashes only** (`sha256` of each side). The full conflict diff is revealed only when the operator explicitly passes **`-v` / `--verbose`** — secure-by-default for unattended/logged runs, with human-in-the-loop ergonomics when someone is actually looking.

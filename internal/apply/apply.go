@@ -701,19 +701,28 @@ func reconcileServiceState(serviceName string, desiredEnabled *bool, ev *unitEve
 	}
 
 	// Existing service: reconcile enablement every apply — but only when the
-	// IR actually declares it. nil means "leave enablement alone".
+	// IR actually declares it. nil means "leave enablement alone". The
+	// enable/disable/skip decision comes from diff.EnablementOp, the single
+	// authority the planner also uses, so plan and apply never diverge.
 	if desiredEnabled != nil {
 		current, err := sd.IsEnabled(serviceName)
 		if err != nil {
 			outcomes = append(outcomes, unitOutcome(serviceName, "is-enabled", err))
 		} else {
-			switch {
-			case *desiredEnabled && (current == systemd.EnablementDisabled || current == systemd.EnablementUnknown):
-				err := sd.Enable(serviceName)
-				outcomes = append(outcomes, unitOutcome(serviceName, "enable", err))
-			case !*desiredEnabled && current == systemd.EnablementEnabled:
-				err := sd.Disable(serviceName)
-				outcomes = append(outcomes, unitOutcome(serviceName, "disable", err))
+			switch op, reason := diff.EnablementOp(desiredEnabled, current); op {
+			case diff.ServiceEnable:
+				outcomes = append(outcomes, unitOutcome(serviceName, "enable", sd.Enable(serviceName)))
+			case diff.ServiceDisable:
+				outcomes = append(outcomes, unitOutcome(serviceName, "disable", sd.Disable(serviceName)))
+			case diff.ServiceSkip:
+				// Declared intent is unachievable (masked/static/not-found).
+				// Surface it as a skip instead of a silent no-op (D10).
+				outcomes = append(outcomes, Outcome{
+					Path:   serviceName,
+					Action: diff.ActionSkip,
+					Status: StatusSkipped,
+					Reason: reason,
+				})
 			}
 		}
 	}
