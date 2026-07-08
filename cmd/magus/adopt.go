@@ -9,10 +9,10 @@ import (
 
 	"github.com/lazypower/magus-cli/internal/diff"
 	"github.com/lazypower/magus-cli/internal/hostfs"
-	"github.com/lazypower/magus-cli/internal/ir"
 	"github.com/lazypower/magus-cli/internal/lock"
 	"github.com/lazypower/magus-cli/internal/manifest"
 	"github.com/lazypower/magus-cli/internal/policy"
+	"github.com/lazypower/magus-cli/internal/status"
 )
 
 const adoptUsage = `magus adopt — take over an existing path that differs from the IR
@@ -41,6 +41,7 @@ func runAdopt(args []string) int {
 	fs.Usage = func() { fmt.Fprint(os.Stderr, adoptUsage) }
 	policyPath := fs.String("policy", policy.DefaultPath, "policy file path")
 	manifestPath := fs.String("manifest", manifest.DefaultPath, "manifest file path")
+	statusPath := fs.String("status", status.DefaultPath, "status observation file path (reserved-path check)")
 	yes := fs.Bool("yes", false, "skip confirmation prompt")
 	insecureHTTP := fs.Bool("insecure-http", false, "allow fetching Butane over plain HTTP")
 	if err := fs.Parse(args); err != nil {
@@ -64,26 +65,8 @@ func runAdopt(args []string) int {
 	}
 	defer func() { _ = release() }()
 
-	p, err := policy.Load(*policyPath)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "error: %v\n", err)
-		return 1
-	}
-	parsed, warnings, err := ir.LoadButane(butanePath, *insecureHTTP)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "error: %v\n", err)
-		return 1
-	}
-	printButaneWarnings(warnings)
-	if violations := policy.Check(p, parsed, *manifestPath, *policyPath); len(violations) > 0 {
-		for _, v := range violations {
-			fmt.Fprintf(os.Stderr, "error: %s\n", v)
-		}
-		return 1
-	}
-	m, err := manifest.Load(*manifestPath)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "error: %v\n", err)
+	p, parsed, m, ok := loadReconcileInputs(*policyPath, *manifestPath, *statusPath, butanePath, *insecureHTTP)
+	if !ok {
 		return 1
 	}
 

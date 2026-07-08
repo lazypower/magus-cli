@@ -185,6 +185,32 @@ func TestRunApplyLockBusy(t *testing.T) {
 	}
 }
 
+func TestReservedStatusPathConsistentAcrossCommands(t *testing.T) {
+	// UX8/D14: the reserved-path set is shared, so an IR declaring a relocated
+	// --status file is rejected identically by validate, plan, and apply — plan
+	// truthfully previews apply's gate instead of passing what apply refuses.
+	f := newFixture(t)
+	reloc := f.root + "/status.json" // inside file_roots, but reserved via --status
+	f.butaneFile(t, "storage:\n  files:\n    - path: "+reloc+"\n      contents: { inline: \"x\\n\" }\n")
+	common := []string{"--policy", f.policy, "--manifest", f.manifest, "--status", reloc}
+
+	if code := runValidate(append(append([]string{}, common...), f.butane)); code != 1 {
+		t.Errorf("validate should reject an IR declaring the reserved status path: exit %d", code)
+	}
+	_, code := captureStdout(t, func() int {
+		return runPlan(append(append([]string{}, common...), f.butane))
+	})
+	if code != 1 {
+		t.Errorf("plan should reject an IR declaring the reserved status path: exit %d", code)
+	}
+	_, code = captureStdout(t, func() int {
+		return runApply(append(append([]string{"--yes"}, common...), f.butane))
+	})
+	if code != 1 {
+		t.Errorf("apply should reject an IR declaring the reserved status path: exit %d", code)
+	}
+}
+
 func TestRunApplyDeclinedExitsTwo(t *testing.T) {
 	// UX5: declining the confirmation with a pending change exits 2 (changes
 	// pending), not 0 — a wrapper must tell "aborted" from "converged". In the

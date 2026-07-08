@@ -11,7 +11,6 @@ import (
 	"github.com/lazypower/magus-cli/internal/apply"
 	"github.com/lazypower/magus-cli/internal/diff"
 	"github.com/lazypower/magus-cli/internal/hostfs"
-	"github.com/lazypower/magus-cli/internal/ir"
 	"github.com/lazypower/magus-cli/internal/lock"
 	"github.com/lazypower/magus-cli/internal/manifest"
 	"github.com/lazypower/magus-cli/internal/policy"
@@ -73,26 +72,8 @@ func runApply(args []string) int {
 	}
 	defer func() { _ = release() }()
 
-	p, err := policy.Load(*policyPath)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "error: %v\n", err)
-		return 1
-	}
-	parsed, warnings, err := ir.LoadButane(butanePath, *insecureHTTP)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "error: %v\n", err)
-		return 1
-	}
-	printButaneWarnings(warnings)
-	if violations := policy.Check(p, parsed, *manifestPath, *policyPath, *statusPath); len(violations) > 0 {
-		for _, v := range violations {
-			fmt.Fprintf(os.Stderr, "error: %s\n", v)
-		}
-		return 1
-	}
-	m, err := manifest.Load(*manifestPath)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "error: %v\n", err)
+	p, parsed, m, ok := loadReconcileInputs(*policyPath, *manifestPath, *statusPath, butanePath, *insecureHTTP)
+	if !ok {
 		return 1
 	}
 
