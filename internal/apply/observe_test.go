@@ -12,7 +12,7 @@ func TestObserveUnitsReportsRawState(t *testing.T) {
 	sd := systemd.NewFake()
 	sd.SetActiveState("a.service", "failed") // raw state preserved, not "inactive"
 	sd.SetActive("b.service", true)          // falls back to "active"
-	sd.FailNext("ActiveState(c.service)", errors.New("systemd unreachable"))
+	sd.FailNext("Show(c.service)", errors.New("systemd unreachable"))
 
 	in := &ir.IR{Units: []ir.Unit{
 		{Name: "a.service"}, {Name: "b.service"}, {Name: "c.service"},

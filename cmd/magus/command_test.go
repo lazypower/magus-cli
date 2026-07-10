@@ -9,6 +9,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/lazypower/magus-cli/internal/diff"
+	"github.com/lazypower/magus-cli/internal/lock"
 	"github.com/lazypower/magus-cli/internal/manifest"
 )
 
@@ -159,6 +161,75 @@ func TestRunApplyConflict(t *testing.T) {
 	}
 }
 
+func TestRunApplyLockBusy(t *testing.T) {
+	// D4: while another operation holds the manifest lock, apply fails fast
+	// rather than racing into a concurrent read-modify-write.
+	f := newFixture(t)
+	f.butaneFile(t, "storage:\n  files:\n    - path: "+f.root+"/a.conf\n      contents: { inline: \"x\\n\" }\n")
+
+	release, err := lock.Acquire(f.manifest)
+	if err != nil {
+		t.Fatalf("pre-acquire lock: %v", err)
+	}
+	defer func() { _ = release() }()
+
+	_, code := captureStdout(t, func() int {
+		return runApply([]string{"--yes", "--policy", f.policy, "--manifest", f.manifest, "--status", f.status, f.butane})
+	})
+	if code != 1 {
+		t.Errorf("apply under contended lock: exit %d, want 1", code)
+	}
+	// Nothing should have been written — apply never got past the lock.
+	if _, err := os.Stat(f.root + "/a.conf"); err == nil {
+		t.Error("apply wrote a file despite the lock being held")
+	}
+}
+
+func TestReservedStatusPathConsistentAcrossCommands(t *testing.T) {
+	// UX8/D14: the reserved-path set is shared, so an IR declaring a relocated
+	// --status file is rejected identically by validate, plan, and apply — plan
+	// truthfully previews apply's gate instead of passing what apply refuses.
+	f := newFixture(t)
+	reloc := f.root + "/status.json" // inside file_roots, but reserved via --status
+	f.butaneFile(t, "storage:\n  files:\n    - path: "+reloc+"\n      contents: { inline: \"x\\n\" }\n")
+	common := []string{"--policy", f.policy, "--manifest", f.manifest, "--status", reloc}
+
+	if code := runValidate(append(append([]string{}, common...), f.butane)); code != 1 {
+		t.Errorf("validate should reject an IR declaring the reserved status path: exit %d", code)
+	}
+	_, code := captureStdout(t, func() int {
+		return runPlan(append(append([]string{}, common...), f.butane))
+	})
+	if code != 1 {
+		t.Errorf("plan should reject an IR declaring the reserved status path: exit %d", code)
+	}
+	_, code = captureStdout(t, func() int {
+		return runApply(append(append([]string{"--yes"}, common...), f.butane))
+	})
+	if code != 1 {
+		t.Errorf("apply should reject an IR declaring the reserved status path: exit %d", code)
+	}
+}
+
+func TestRunApplyDeclinedExitsTwo(t *testing.T) {
+	// UX5: declining the confirmation with a pending change exits 2 (changes
+	// pending), not 0 — a wrapper must tell "aborted" from "converged". In the
+	// test harness os.Stdin is at EOF, which the confirm reads as a decline.
+	f := newFixture(t)
+	f.butaneFile(t, "storage:\n  files:\n    - path: "+f.root+"/a.conf\n      contents: { inline: \"x\\n\" }\n")
+
+	_, code := captureStdout(t, func() int {
+		// No --yes, so it prompts; stdin EOF → declined.
+		return runApply([]string{"--policy", f.policy, "--manifest", f.manifest, "--status", f.status, f.butane})
+	})
+	if code != 2 {
+		t.Errorf("declined apply: exit %d, want 2", code)
+	}
+	if _, err := os.Stat(f.root + "/a.conf"); err == nil {
+		t.Error("declined apply should not have written the file")
+	}
+}
+
 func TestRunApplyNothingToApply(t *testing.T) {
 	f := newFixture(t)
 	f.butaneFile(t, "storage:\n  files:\n    - path: "+f.root+"/a.conf\n      contents: { inline: \"x\\n\" }\n")
@@ -197,7 +268,7 @@ func TestRunReclaim(t *testing.T) {
 	writeFile(t, f.root+"/orph.env", "K=V\n")
 	// Pre-build a manifest with the path orphaned, on-disk hash matching.
 	m := manifest.New()
-	hash := hashContent([]byte("K=V\n"))
+	hash := diff.HashContent([]byte("K=V\n"), diff.KindFile)
 	m.PutActive(f.root+"/orph.env", manifest.KindFile, hash, manifest.OriginCreate, time.Unix(1, 0).UTC())
 	m.Orphan(f.root+"/orph.env", "policy deny: prior", time.Unix(1, 0).UTC())
 	if err := m.Save(f.manifest); err != nil {
@@ -214,5 +285,62 @@ func TestRunReclaim(t *testing.T) {
 	m2, _ := manifest.Load(f.manifest)
 	if e, _ := m2.Get(f.root + "/orph.env"); e.State != manifest.StateActive {
 		t.Errorf("reclaim did not reactivate: %+v", e)
+	}
+}
+
+func TestRunReclaimDirectory(t *testing.T) {
+	// D6: an orphaned directory must be reclaimable. Directories have no
+	// content, so reclaim can't hash/ReadFile them — it re-activates directly.
+	f := newFixture(t)
+	dir := f.root + "/data"
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	m := manifest.New()
+	// Seed a STALE kind (file) on the orphaned entry; reclaim must record the
+	// currently-declared kind (directory), not carry the stale one forward
+	// (finding 3).
+	m.PutActive(dir, manifest.KindFile, "sha256:dir", manifest.OriginCreate, time.Unix(1, 0).UTC())
+	m.Orphan(dir, "policy deny: prior", time.Unix(1, 0).UTC())
+	if err := m.Save(f.manifest); err != nil {
+		t.Fatal(err)
+	}
+	f.butaneFile(t, "storage:\n  directories:\n    - path: "+dir+"\n      mode: 0755\n")
+
+	_, code := captureStdout(t, func() int {
+		return runReclaim([]string{"--yes", "--policy", f.policy, "--manifest", f.manifest, f.butane, dir})
+	})
+	if code != 0 {
+		t.Fatalf("reclaim directory: exit %d", code)
+	}
+	m2, _ := manifest.Load(f.manifest)
+	e, _ := m2.Get(dir)
+	if e.State != manifest.StateActive {
+		t.Errorf("reclaim did not reactivate directory: %+v", e)
+	}
+	if e.Kind != manifest.KindDirectory {
+		t.Errorf("reclaim recorded kind %s, want directory (corrected from stale file kind)", e.Kind)
+	}
+}
+
+func TestRunReclaimDirectoryDeclaredButFileOnDisk(t *testing.T) {
+	// Codex round-2 residual: the target is declared as a directory but a regular
+	// file sits on disk. reclaim must refuse rather than report success and
+	// record a directory entry for a non-directory.
+	f := newFixture(t)
+	writeFile(t, f.root+"/data", "x\n") // a FILE, not a directory
+	m := manifest.New()
+	m.PutActive(f.root+"/data", manifest.KindFile, "sha256:dir", manifest.OriginCreate, time.Unix(1, 0).UTC())
+	m.Orphan(f.root+"/data", "policy deny: prior", time.Unix(1, 0).UTC())
+	if err := m.Save(f.manifest); err != nil {
+		t.Fatal(err)
+	}
+	f.butaneFile(t, "storage:\n  directories:\n    - path: "+f.root+"/data\n      mode: 0755\n")
+
+	_, code := captureStdout(t, func() int {
+		return runReclaim([]string{"--yes", "--policy", f.policy, "--manifest", f.manifest, f.butane, f.root + "/data"})
+	})
+	if code != 1 {
+		t.Errorf("reclaim of a dir-declared path that is a file: exit %d, want 1", code)
 	}
 }

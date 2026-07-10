@@ -1,19 +1,21 @@
 package main
 
 import (
-	"bufio"
+	"errors"
 	"flag"
 	"fmt"
-	"io"
 	"os"
-	"strings"
+	"path/filepath"
 	"time"
 
 	"github.com/lazypower/magus-cli/internal/diff"
 	"github.com/lazypower/magus-cli/internal/hostfs"
 	"github.com/lazypower/magus-cli/internal/ir"
+	"github.com/lazypower/magus-cli/internal/lock"
 	"github.com/lazypower/magus-cli/internal/manifest"
 	"github.com/lazypower/magus-cli/internal/policy"
+	"github.com/lazypower/magus-cli/internal/status"
+	"github.com/lazypower/magus-cli/internal/systemd"
 )
 
 const reclaimUsage = `magus reclaim — restore an orphaned path to active reconciliation
@@ -36,6 +38,7 @@ under management.
 Flags:
   --yes               Skip the confirmation prompt
   --force             Overwrite drifted on-disk content with IR content
+  --insecure-http     Allow fetching Butane over plain HTTP (https required by default)
   --policy <path>     Override policy file (default: /etc/magus/policy.yaml)
   --manifest <path>   Override manifest file (default: /var/lib/magus/manifest.json)
 `
@@ -46,8 +49,10 @@ func runReclaim(args []string) int {
 	fs.Usage = func() { fmt.Fprint(os.Stderr, reclaimUsage) }
 	policyPath := fs.String("policy", policy.DefaultPath, "policy file path")
 	manifestPath := fs.String("manifest", manifest.DefaultPath, "manifest file path")
+	statusPath := fs.String("status", status.DefaultPath, "status observation file path (reserved-path check)")
 	yes := fs.Bool("yes", false, "skip confirmation prompt")
 	force := fs.Bool("force", false, "overwrite drifted on-disk content")
+	insecureHTTP := fs.Bool("insecure-http", false, "allow fetching Butane over plain HTTP")
 	if err := fs.Parse(args); err != nil {
 		return 1
 	}
@@ -57,25 +62,20 @@ func runReclaim(args []string) int {
 	}
 	butanePath, target := fs.Arg(0), fs.Arg(1)
 
-	p, err := policy.Load(*policyPath)
+	// Serialize manifest mutation against a concurrent apply/adopt/reclaim.
+	release, err := lock.Acquire(*manifestPath)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "error: %v\n", err)
-		return 1
-	}
-	parsed, _, err := ir.LoadButane(butanePath)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "error: %v\n", err)
-		return 1
-	}
-	if violations := policy.Check(p, parsed, *manifestPath, *policyPath); len(violations) > 0 {
-		for _, v := range violations {
-			fmt.Fprintf(os.Stderr, "error: %s\n", v)
+		if errors.Is(err, lock.ErrBusy) {
+			fmt.Fprintln(os.Stderr, "error: another magus operation is in progress (manifest is locked)")
+			return 1
 		}
+		fmt.Fprintf(os.Stderr, "error: %v\n", err)
 		return 1
 	}
-	m, err := manifest.Load(*manifestPath)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "error: %v\n", err)
+	defer func() { _ = release() }()
+
+	p, parsed, m, ok := loadReconcileInputs(*policyPath, *manifestPath, *statusPath, butanePath, *insecureHTTP)
+	if !ok {
 		return 1
 	}
 
@@ -120,6 +120,17 @@ func runReclaim(args []string) int {
 			fmt.Fprintf(os.Stderr, "error: refusing to reclaim %s: %s\n", target, reason)
 			return 1
 		}
+	}
+
+	// Directories have no content to hash or overwrite — equivalence is
+	// metadata (mode/ownership), which the next apply reconciles as an update.
+	// Reclaim just re-activates the entry so it's back under reconciliation.
+	if declared.diffKind == diff.KindDirectory {
+		if !st.IsDir {
+			fmt.Fprintf(os.Stderr, "error: %s is declared as a directory but is not a directory on disk\n", target)
+			return 1
+		}
+		return reclaimDirectory(target, entry, m, *manifestPath, *yes)
 	}
 
 	body, err := w.ReadFile(target)
@@ -169,7 +180,7 @@ func runReclaim(args []string) int {
 	}
 
 	if !*yes {
-		if !confirmReclaim(os.Stdin, os.Stdout, target) {
+		if !confirmAction(os.Stdin, os.Stdout, fmt.Sprintf("Reclaim %s? [y/N] ", target)) {
 			fmt.Println("Aborted.")
 			return 0
 		}
@@ -182,6 +193,8 @@ func runReclaim(args []string) int {
 			fmt.Fprintf(os.Stderr, "error: write %s: %v\n", target, err)
 			return 1
 		}
+		// A rewritten unit/quadlet is stale to systemd until daemon-reload.
+		reloadAfterUnitWrite(declared.diffKind, target)
 	}
 
 	// Transition manifest entry to active. Hash is updated to whatever now
@@ -191,9 +204,12 @@ func runReclaim(args []string) int {
 	if *force && mismatchedFromIR {
 		finalHash = declaredHash
 	}
-	// Preserve the kind from the orphaned entry — reclaiming a unit must
-	// not silently demote it to a file.
-	m.PutActive(target, entry.Kind, finalHash, entry.Origin, time.Now().UTC())
+	// Record the CURRENTLY-declared kind, not the orphaned entry's kind. The
+	// entry's kind can be stale (a path reclassified from storage.files to
+	// systemd.units between orphaning and reclaim); trusting it would record a
+	// unit as a file and later delete it with file semantics — no disable --now.
+	// findDeclared already resolved the current declaration.
+	m.PutActive(target, manifestKind(declared.diffKind), finalHash, entry.Origin, time.Now().UTC())
 	if err := m.Save(*manifestPath); err != nil {
 		fmt.Fprintf(os.Stderr, "error: save manifest: %v\n", err)
 		return 1
@@ -202,9 +218,86 @@ func runReclaim(args []string) int {
 	return 0
 }
 
+// reloadAfterUnitWrite makes systemd pick up a unit or quadlet that adopt or
+// reclaim --force just rewrote on disk. Without it the reconciler's own escape
+// hatch leaves systemd on the stale definition until the next boot: the
+// following apply sees content match, skips, and never reloads (D8). Files and
+// directories need nothing. Best-effort — a systemd failure (e.g. no systemctl
+// on a dev host) is a warning, not fatal; the write and manifest update already
+// succeeded.
+func reloadAfterUnitWrite(kind diff.Kind, target string) {
+	switch kind {
+	case diff.KindUnit:
+		if reloadFailed(systemd.OS()) {
+			return
+		}
+		restartIfActive(systemd.OS(), ir.UnitNameFromPath(target))
+	case diff.KindQuadlet:
+		if reloadFailed(systemd.OS()) {
+			return
+		}
+		if svc, err := diff.QuadletGeneratedService(filepath.Base(target)); err == nil {
+			restartIfActive(systemd.OS(), svc)
+		}
+	}
+}
+
+// reloadFailed runs daemon-reload and reports (with a warning) whether it
+// failed, so callers can skip the follow-on restart.
+func reloadFailed(sd systemd.Manager) bool {
+	if err := sd.DaemonReload(); err != nil {
+		fmt.Fprintf(os.Stderr, "warning: daemon-reload after rewrite failed (run 'systemctl daemon-reload'): %v\n", err)
+		return true
+	}
+	return false
+}
+
+// restartIfActive restarts svc only when it is currently running, so the
+// rewritten definition takes effect immediately for an active service.
+func restartIfActive(sd systemd.Manager, svc string) {
+	if status, _ := sd.Show(svc); status.IsActive() {
+		if err := sd.Restart(svc); err != nil {
+			fmt.Fprintf(os.Stderr, "warning: restart %s failed: %v\n", svc, err)
+		}
+	}
+}
+
+// reclaimDirectory restores an orphaned directory to active reconciliation.
+// Directories carry no content: the manifest hash is the dir sentinel and any
+// mode/ownership drift is reconciled by the next apply as an update, so there's
+// no drift check and no force-write — just the state transition.
+func reclaimDirectory(target string, entry manifest.Resource, m *manifest.Manifest, manifestPath string, yes bool) int {
+	orphanedAt := time.Time{}
+	if entry.OrphanedAt != nil {
+		orphanedAt = *entry.OrphanedAt
+	}
+	fmt.Printf("This directory is orphaned (orphaned %s by %s).\n",
+		orphanedAt.Format(time.RFC3339), entry.OrphanedReason)
+	fmt.Println()
+	fmt.Println("Reclaiming will resume reconciliation of its mode and ownership.")
+
+	if !yes {
+		if !confirmAction(os.Stdin, os.Stdout, fmt.Sprintf("Reclaim %s? [y/N] ", target)) {
+			fmt.Println("Aborted.")
+			return 0
+		}
+	}
+	fmt.Println()
+
+	// This branch is only reached for a currently-declared directory, so record
+	// KindDirectory (not the possibly-stale orphaned entry's kind).
+	m.PutActive(target, manifest.KindDirectory, entry.Hash, entry.Origin, time.Now().UTC())
+	if err := m.Save(manifestPath); err != nil {
+		fmt.Fprintf(os.Stderr, "error: save manifest: %v\n", err)
+		return 1
+	}
+	fmt.Printf("  ✓ %s  (state: orphaned → active)\n", target)
+	return 0
+}
+
 // declaredTarget is a path's declared desired state, normalized across IR kinds
-// so reclaim can restore a file, a unit body, a drop-in, or a quadlet — every
-// kind OrphanDenied can orphan.
+// so reclaim can restore a file, a unit body, a drop-in, a quadlet, or a
+// directory — every kind OrphanDenied can orphan.
 type declaredTarget struct {
 	contents []byte
 	mode     uint32
@@ -227,7 +320,8 @@ func manifestKind(k diff.Kind) manifest.Kind {
 }
 
 // findDeclared locates the IR resource that owns the given on-disk path across
-// files, unit bodies, drop-ins, and quadlets.
+// files, unit bodies, drop-ins, quadlets, and directories — every kind
+// OrphanDenied can orphan.
 func findDeclared(in *ir.IR, path string) (declaredTarget, bool) {
 	for _, f := range in.Files {
 		if f.Path == path {
@@ -249,6 +343,12 @@ func findDeclared(in *ir.IR, path string) (declaredTarget, bool) {
 			return declaredTarget{q.Contents, q.Mode, q.UID, q.GID, diff.KindQuadlet}, true
 		}
 	}
+	for _, d := range in.Directories {
+		if d.Path == path {
+			// Directories carry no content — equivalence is metadata only.
+			return declaredTarget{nil, d.Mode, d.UID, d.GID, diff.KindDirectory}, true
+		}
+	}
 	return declaredTarget{}, false
 }
 
@@ -257,15 +357,4 @@ func matchAnnotation(matches bool) string {
 		return "  (matches)"
 	}
 	return "  (differs)"
-}
-
-func confirmReclaim(in io.Reader, out io.Writer, path string) bool {
-	fmt.Fprintf(out, "Reclaim %s? [y/N] ", path)
-	r := bufio.NewReader(in)
-	line, err := r.ReadString('\n')
-	if err != nil && line == "" {
-		return false
-	}
-	answer := strings.ToLower(strings.TrimSpace(line))
-	return answer == "y" || answer == "yes"
 }

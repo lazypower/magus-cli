@@ -8,6 +8,7 @@ import (
 	"encoding/hex"
 	"fmt"
 	"path/filepath"
+	"sort"
 
 	"github.com/lazypower/magus-cli/internal/hostfs"
 	"github.com/lazypower/magus-cli/internal/ir"
@@ -27,6 +28,12 @@ const (
 	ActionConflict Action = "conflict"
 	ActionOrphaned Action = "orphaned"
 	ActionCleanup  Action = "cleanup"
+	// ActionError marks a resource whose state could not be determined during
+	// diff (a stat/read failure — EPERM, transient I/O). It is fail-closed:
+	// apply refuses to touch the path and surfaces the error, but planning of
+	// every other resource continues. One unreadable path does not take the
+	// whole reconcile hostage — the same per-resource posture apply uses.
+	ActionError Action = "error"
 )
 
 // Kind identifies what type of resource this action targets.
@@ -55,14 +62,20 @@ type ResourceAction struct {
 	IRMode     uint32
 }
 
-// Plan is the full set of actions for one diff. Counts() summarizes for the
-// CLI footer.
+// Plan is the full set of actions for one diff. Actions govern on-disk
+// resources; ServiceActions govern unit enablement (persistent systemd state
+// reconciled every apply). Counts() summarizes for the CLI footer.
 type Plan struct {
-	Actions []ResourceAction
+	Actions        []ResourceAction
+	ServiceActions []ServiceAction
 }
 
-// HasChanges reports whether anything other than skips/cleanup would run.
-// Used to pick exit codes (0 vs 2).
+// HasChanges reports whether anything other than skips/cleanup would run —
+// pending work or a conflict/orphan (the "changes pending" exit-2 condition),
+// including an enablement operation. It deliberately excludes ActionError: an
+// undeterminable resource is an error, not a pending change (see HasErrors), and
+// folding it in would make `plan` exit 2 ("safe to apply") on a path it can't
+// even read.
 func (p *Plan) HasChanges() bool {
 	for _, a := range p.Actions {
 		switch a.Action {
@@ -70,14 +83,14 @@ func (p *Plan) HasChanges() bool {
 			return true
 		}
 	}
-	return false
+	return len(p.ServiceActions) > 0
 }
 
-// HasConflicts reports whether any resource is in conflict or orphaned —
-// both states block apply progress for the affected resource.
-func (p *Plan) HasConflicts() bool {
+// HasErrors reports whether any resource's state could not be determined during
+// diff (ActionError). These are errors (exit 1), not pending changes (exit 2).
+func (p *Plan) HasErrors() bool {
 	for _, a := range p.Actions {
-		if a.Action == ActionConflict || a.Action == ActionOrphaned {
+		if a.Action == ActionError {
 			return true
 		}
 	}
@@ -198,25 +211,23 @@ func applyContainment(p *policy.Policy, plan *Plan, fsys hostfs.Reader) {
 }
 
 // computeCore joins the three inputs and produces a plan without policy-aware
-// containment. fsys reads disk state.
+// containment. fsys reads disk state. A per-path stat/read failure does not
+// abort the whole plan — it is degraded to a fail-closed ActionError row
+// (errorRow) and the rest of the resources are still planned.
 func computeCore(in *ir.IR, m *manifest.Manifest, fsys hostfs.Reader) (*Plan, error) {
 	plan := &Plan{}
 	declared := map[string]bool{}
 
 	for _, f := range in.Files {
 		declared[f.Path] = true
-		ra, err := diffDeclared(declaredResource{
+		plan.Actions = append(plan.Actions, errorRow(diffDeclared(declaredResource{
 			Path:     f.Path,
 			Mode:     f.Mode,
 			UID:      f.UID,
 			GID:      f.GID,
 			Contents: f.Contents,
 			Kind:     KindFile,
-		}, m, fsys)
-		if err != nil {
-			return nil, err
-		}
-		plan.Actions = append(plan.Actions, ra)
+		}, m, fsys)))
 	}
 
 	for _, u := range in.Units {
@@ -226,47 +237,35 @@ func computeCore(in *ir.IR, m *manifest.Manifest, fsys hostfs.Reader) (*Plan, er
 		if len(u.Contents) > 0 {
 			path := UnitPath(u.Name)
 			declared[path] = true
-			ra, err := diffDeclared(declaredResource{
+			plan.Actions = append(plan.Actions, errorRow(diffDeclared(declaredResource{
 				Path:     path,
 				Mode:     0o644,
 				Contents: []byte(u.Contents),
 				Kind:     KindUnit,
 				UnitName: u.Name,
-			}, m, fsys)
-			if err != nil {
-				return nil, err
-			}
-			plan.Actions = append(plan.Actions, ra)
+			}, m, fsys)))
 		}
 		for _, di := range u.DropIns {
 			path := DropInPath(u.Name, di.Name)
 			declared[path] = true
-			ra, err := diffDeclared(declaredResource{
+			plan.Actions = append(plan.Actions, errorRow(diffDeclared(declaredResource{
 				Path:     path,
 				Mode:     0o644,
 				Contents: []byte(di.Contents),
 				Kind:     KindUnit,
 				UnitName: u.Name,
-			}, m, fsys)
-			if err != nil {
-				return nil, err
-			}
-			plan.Actions = append(plan.Actions, ra)
+			}, m, fsys)))
 		}
 	}
 
 	for _, d := range in.Directories {
 		declared[d.Path] = true
-		ra, err := diffDirectory(d, m, fsys)
-		if err != nil {
-			return nil, err
-		}
-		plan.Actions = append(plan.Actions, ra)
+		plan.Actions = append(plan.Actions, errorRow(diffDirectory(d, m, fsys)))
 	}
 
 	for _, q := range in.Quadlets {
 		declared[q.Path] = true
-		ra, err := diffDeclared(declaredResource{
+		plan.Actions = append(plan.Actions, errorRow(diffDeclared(declaredResource{
 			Path:     q.Path,
 			Mode:     q.Mode,
 			UID:      q.UID,
@@ -274,27 +273,38 @@ func computeCore(in *ir.IR, m *manifest.Manifest, fsys hostfs.Reader) (*Plan, er
 			Contents: q.Contents,
 			Kind:     KindQuadlet,
 			UnitName: q.Name,
-		}, m, fsys)
-		if err != nil {
-			return nil, err
-		}
-		plan.Actions = append(plan.Actions, ra)
+		}, m, fsys)))
 	}
 
 	// Manifest sweep: anything magus owns (or has orphaned) that isn't in
-	// the IR needs an action — delete, stale-clean, or orphaned-skip.
-	for path, entry := range m.Resources {
-		if declared[path] {
-			continue
+	// the IR needs an action — delete, stale-clean, or orphaned-skip. Sort the
+	// swept paths so plan/apply output is stable run-to-run (the map iteration
+	// order otherwise shuffles delete/cleanup/orphan rows — D9). The output is
+	// diffed, logged, and read by LLMs, so determinism is worth the sort.
+	swept := make([]string, 0, len(m.Resources))
+	for path := range m.Resources {
+		if !declared[path] {
+			swept = append(swept, path)
 		}
-		ra, err := diffOrphan(path, entry, fsys)
-		if err != nil {
-			return nil, err
-		}
-		plan.Actions = append(plan.Actions, ra)
+	}
+	sort.Strings(swept)
+	for _, path := range swept {
+		plan.Actions = append(plan.Actions, errorRow(diffOrphan(path, m.Resources[path], fsys)))
 	}
 
 	return plan, nil
+}
+
+// errorRow degrades a diff-stage failure into a fail-closed ActionError row.
+// The partially-populated ResourceAction the diff* helpers return on error
+// already carries the identifying fields (Path, Kind, UnitName); we only stamp
+// the action and reason. On success it passes the row through unchanged.
+func errorRow(ra ResourceAction, err error) ResourceAction {
+	if err != nil {
+		ra.Action = ActionError
+		ra.Reason = err.Error()
+	}
+	return ra
 }
 
 // diffDirectory diffs an IR-declared directory. Equivalence is metadata-only:
@@ -320,6 +330,16 @@ func diffDirectory(d ir.Directory, m *manifest.Manifest, fsys hostfs.Reader) (Re
 
 	if !st.Exists {
 		ra.Action = ActionCreate
+		return ra, nil
+	}
+
+	if !st.IsDir {
+		// A non-directory (a regular file, a symlink) sits where a directory is
+		// declared. Magus won't rm it and mkdir — that would destroy data — so
+		// it's a conflict for the operator to resolve, never a silent adopt that
+		// leaves apply reporting success without reaching the declared state.
+		ra.Action = ActionConflict
+		ra.Reason = "exists but is not a directory"
 		return ra, nil
 	}
 

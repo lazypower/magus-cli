@@ -24,6 +24,10 @@ Butane file or stat the disk; use 'magus plan' for live diff state.
 
 Flags:
   --json              Emit machine-readable JSON
+  --check             Exit nonzero on unhealthy state (for timers/monitoring):
+                      0 = converged, 2 = conflicts/orphans present, 1 = error
+  --max-age <dur>     With --check, also fail (exit 1) if the last apply is older
+                      than this (e.g. 30m) — catches a stopped timer
   --manifest <path>   Override manifest file (default: /var/lib/magus/manifest.json)
   --status <path>     Override observation file (default: /var/lib/magus/status.json)
 `
@@ -65,6 +69,8 @@ func runStatus(args []string) int {
 	manifestPath := fs.String("manifest", manifest.DefaultPath, "manifest file path")
 	statusPath := fs.String("status", status.DefaultPath, "status file path")
 	asJSON := fs.Bool("json", false, "emit JSON")
+	check := fs.Bool("check", false, "exit nonzero on unhealthy state")
+	maxAge := fs.Duration("max-age", 0, "with --check, fail if last apply older than this")
 	if err := fs.Parse(args); err != nil {
 		return 1
 	}
@@ -78,14 +84,44 @@ func runStatus(args []string) int {
 		fmt.Fprintf(os.Stderr, "error: %v\n", err)
 		return 1
 	}
-	obs, _ := status.Load(*statusPath) // nil = never applied; non-fatal
+	// nil obs = never applied (or a stale cache) — non-fatal. A genuine read
+	// error (e.g. EPERM running unprivileged) is surfaced as a warning so the
+	// output isn't a misleading "last apply: (never)".
+	obs, err := status.Load(*statusPath)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "warning: %v (reporting manifest state only)\n", err)
+	}
 
 	report := buildStatus(m, obs)
 	if *asJSON {
-		return emitStatusJSON(os.Stdout, report)
+		if code := emitStatusJSON(os.Stdout, report); code != 0 {
+			return code
+		}
+	} else {
+		emitStatusHuman(os.Stdout, report)
 	}
-	emitStatusHuman(os.Stdout, report)
+	if *check {
+		return statusExitCode(report, *maxAge, time.Now().UTC())
+	}
 	return 0
+}
+
+// statusExitCode maps the merged status to a health exit code for --check:
+// error → 1, conflicts/orphans → 2, converged → 0. With maxAge > 0 a last apply
+// older than maxAge (or none at all) is exit 1 — a stopped timer is unhealthy
+// no matter what the last result was.
+func statusExitCode(r statusReport, maxAge time.Duration, now time.Time) int {
+	if maxAge > 0 && (r.LastApply == nil || now.Sub(*r.LastApply) > maxAge) {
+		return 1
+	}
+	switch r.Result {
+	case status.ResultError:
+		return 1
+	case status.ResultWithSkips:
+		return 2
+	default:
+		return 0
+	}
 }
 
 // buildStatus merges manifest ownership (files, orphaned, managed count) with

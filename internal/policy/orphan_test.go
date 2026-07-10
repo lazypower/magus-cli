@@ -83,6 +83,30 @@ deny:
 	}
 }
 
+func TestOrphanDeniedUnitGovernedByNameNotPath(t *testing.T) {
+	// D7: units are governed by name, not path. Under a policy whose file_roots
+	// omit /etc/systemd/system, a unit whose name matches unit_patterns must NOT
+	// be orphaned for being "outside file_roots" — that would flap a unit Check
+	// happily created by name.
+	p := mustLoad(t, `
+version: 1
+file_roots: ["/etc/magus.d"]
+unit_patterns: ["magus-*"]
+`)
+	m := manifest.New()
+	now := time.Unix(1000, 0).UTC()
+	m.PutActive("/etc/systemd/system/magus-foo.service",
+		manifest.KindUnit, "sha256:x", manifest.OriginCreate, now)
+
+	got := OrphanDenied(p, m, time.Unix(2000, 0).UTC())
+	if r, _ := m.Get("/etc/systemd/system/magus-foo.service"); r.State != manifest.StateActive {
+		t.Errorf("name-permitted unit orphaned by path: %+v", r)
+	}
+	if len(got) != 0 {
+		t.Errorf("expected no orphans, got %v", got)
+	}
+}
+
 func TestOrphanDeniedQuadletByGeneratedService(t *testing.T) {
 	p := mustLoad(t, `
 version: 1

@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"encoding/json"
 	"strings"
 	"testing"
 	"time"
@@ -13,21 +14,104 @@ import (
 	"github.com/lazypower/magus-cli/internal/status"
 )
 
+func TestStatusExitCode(t *testing.T) {
+	now := time.Unix(100000, 0).UTC()
+	recent := now.Add(-1 * time.Minute)
+	old := now.Add(-1 * time.Hour)
+	cases := []struct {
+		name   string
+		r      statusReport
+		maxAge time.Duration
+		want   int
+	}{
+		{"ok", statusReport{Result: status.ResultOK, LastApply: &recent}, 0, 0},
+		{"skips", statusReport{Result: status.ResultWithSkips, LastApply: &recent}, 0, 2},
+		{"error", statusReport{Result: status.ResultError, LastApply: &recent}, 0, 1},
+		{"stale", statusReport{Result: status.ResultOK, LastApply: &old}, 30 * time.Minute, 1},
+		{"never", statusReport{Result: status.ResultOK, LastApply: nil}, 30 * time.Minute, 1},
+		{"fresh-ok", statusReport{Result: status.ResultOK, LastApply: &recent}, 30 * time.Minute, 0},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			if got := statusExitCode(c.r, c.maxAge, now); got != c.want {
+				t.Errorf("statusExitCode = %d, want %d", got, c.want)
+			}
+		})
+	}
+}
+
+func TestEmitPlanJSON(t *testing.T) {
+	var b bytes.Buffer
+	p := &diff.Plan{
+		Actions: []diff.ResourceAction{
+			{Path: "/etc/core/a", Kind: diff.KindFile, Action: diff.ActionCreate},
+		},
+		ServiceActions: []diff.ServiceAction{
+			{Unit: "x.service", Op: diff.ServiceEnable, Reason: "drift"},
+		},
+	}
+	if code := emitPlanJSON(&b, "src.bu", p); code != 0 {
+		t.Fatalf("emitPlanJSON code = %d", code)
+	}
+	var got planJSON
+	if err := json.Unmarshal(b.Bytes(), &got); err != nil {
+		t.Fatalf("invalid JSON: %v\n%s", err, b.String())
+	}
+	if got.Source != "src.bu" || !got.HasChanges {
+		t.Errorf("top-level wrong: %+v", got)
+	}
+	if len(got.Actions) != 1 || got.Actions[0].Action != "create" {
+		t.Errorf("actions wrong: %+v", got.Actions)
+	}
+	if len(got.ServiceActions) != 1 || got.ServiceActions[0].Op != "enable" {
+		t.Errorf("service actions wrong: %+v", got.ServiceActions)
+	}
+}
+
 func TestPlanCountsAndSummary(t *testing.T) {
 	p := &diff.Plan{Actions: []diff.ResourceAction{
 		{Action: diff.ActionCreate}, {Action: diff.ActionUpdate}, {Action: diff.ActionAdopt},
 		{Action: diff.ActionDelete}, {Action: diff.ActionSkip}, {Action: diff.ActionConflict},
-		{Action: diff.ActionOrphaned}, {Action: diff.ActionCleanup},
+		{Action: diff.ActionOrphaned}, {Action: diff.ActionCleanup}, {Action: diff.ActionError},
 	}}
-	changes, conflicts := planCounts(p)
+	changes, conflicts, errored := planCounts(p)
 	if changes != 5 { // create,update,adopt,delete,cleanup
 		t.Errorf("changes = %d, want 5", changes)
 	}
 	if conflicts != 2 { // conflict + orphaned
 		t.Errorf("conflicts = %d, want 2", conflicts)
 	}
+	if errored != 1 { // the ActionError row
+		t.Errorf("errored = %d, want 1", errored)
+	}
 	s := summary(p)
-	for _, want := range []string{"1 creates", "1 conflicts", "1 orphaned", "1 manifest cleanup"} {
+	for _, want := range []string{"1 creates", "1 conflicts", "1 orphaned", "1 manifest cleanup", "1 errored"} {
+		if !strings.Contains(s, want) {
+			t.Errorf("summary missing %q: %s", want, s)
+		}
+	}
+}
+
+func TestPlanCountsIncludesServiceActions(t *testing.T) {
+	// D1: an enablement drift with a clean file diff must still count as a
+	// change, so the apply path doesn't early-exit "Nothing to apply".
+	p := &diff.Plan{
+		Actions: []diff.ResourceAction{{Action: diff.ActionSkip}},
+		ServiceActions: []diff.ServiceAction{
+			{Unit: "a.service", Op: diff.ServiceEnable},
+			{Unit: "b.service", Op: diff.ServiceDisable},
+			{Unit: "c.service", Op: diff.ServiceSkip},
+		},
+	}
+	changes, conflicts, _ := planCounts(p)
+	if changes != 2 { // enable + disable
+		t.Errorf("changes = %d, want 2 (enable+disable)", changes)
+	}
+	if conflicts != 1 { // masked/static skip
+		t.Errorf("conflicts = %d, want 1 (enablement skip)", conflicts)
+	}
+	s := summary(p)
+	for _, want := range []string{"1 enable", "1 disable", "1 enablement skipped"} {
 		if !strings.Contains(s, want) {
 			t.Errorf("summary missing %q: %s", want, s)
 		}
@@ -174,12 +258,6 @@ func TestEmitStatusJSONAndHuman(t *testing.T) {
 	emitStatusHuman(&h, r)
 	if !strings.Contains(h.String(), "x.service") || !strings.Contains(h.String(), "/etc/core/a") {
 		t.Errorf("human output wrong: %s", h.String())
-	}
-}
-
-func TestHashContent(t *testing.T) {
-	if hashContent([]byte("x"))[:7] != "sha256:" {
-		t.Errorf("hashContent prefix wrong")
 	}
 }
 

@@ -12,7 +12,6 @@ func TestUnitCreate(t *testing.T) {
 	in := &ir.IR{Units: []ir.Unit{
 		{
 			Name:     "magus-foo.service",
-			Enabled:  true,
 			Contents: "[Unit]\nDescription=foo\n[Service]\nExecStart=/bin/foo\n",
 		},
 	}}

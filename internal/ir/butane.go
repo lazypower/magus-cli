@@ -30,13 +30,36 @@ const maxButaneSize = 10 * 1024 * 1024
 const fetchTimeout = 30 * time.Second
 
 // readButaneSource dispatches on source scheme: local file otherwise.
-func readButaneSource(source string) ([]byte, error) {
+//
+// Plain-HTTP sources are refused unless allowInsecureHTTP is set: a
+// root-privileged process that fetches its desired state over http:// and
+// applies it is a remote-code-execution primitive for an on-path attacker (they
+// can substitute a unit file that magus then starts). https is required by
+// default; --insecure-http is the explicit opt-out (D19).
+func readButaneSource(source string, allowInsecureHTTP bool) ([]byte, error) {
 	if isHTTPURL(source) {
-		return fetchButaneHTTP(source)
+		if strings.HasPrefix(source, "http://") && !allowInsecureHTTP {
+			return nil, fmt.Errorf("refusing to fetch Butane over plain HTTP (%s): an on-path attacker could substitute a unit magus runs as root — use https, or pass --insecure-http to override", source)
+		}
+		return fetchButaneHTTP(source, allowInsecureHTTP)
 	}
-	data, err := os.ReadFile(source)
+	return readLocalButane(source)
+}
+
+func readLocalButane(source string) ([]byte, error) {
+	f, err := os.Open(source)
 	if err != nil {
 		return nil, fmt.Errorf("read butane: %w", err)
+	}
+	defer f.Close()
+	// Same 10 MB guard as the HTTP path (D20): read one byte past the cap to
+	// detect an oversize file rather than silently truncating.
+	data, err := io.ReadAll(io.LimitReader(f, maxButaneSize+1))
+	if err != nil {
+		return nil, fmt.Errorf("read butane: %w", err)
+	}
+	if int64(len(data)) > maxButaneSize {
+		return nil, fmt.Errorf("read butane %s: file exceeds %d bytes", source, maxButaneSize)
 	}
 	return data, nil
 }
@@ -45,8 +68,28 @@ func isHTTPURL(s string) bool {
 	return strings.HasPrefix(s, "http://") || strings.HasPrefix(s, "https://")
 }
 
-func fetchButaneHTTP(rawurl string) ([]byte, error) {
-	client := &http.Client{Timeout: fetchTimeout}
+// rejectInsecureRedirect is the http.Client CheckRedirect that closes the
+// redirect hole in the https gate: an https:// source that 302s to http:// would
+// otherwise fetch over plain HTTP with no flag, reintroducing the on-path
+// substitution risk. It refuses any redirect that downgrades to http (unless
+// --insecure-http) and caps the chain length.
+func rejectInsecureRedirect(allowInsecureHTTP bool) func(*http.Request, []*http.Request) error {
+	return func(req *http.Request, via []*http.Request) error {
+		if req.URL.Scheme == "http" && !allowInsecureHTTP {
+			return fmt.Errorf("refusing redirect to plain HTTP (%s): use https, or pass --insecure-http", req.URL)
+		}
+		if len(via) >= 10 {
+			return fmt.Errorf("stopped after 10 redirects")
+		}
+		return nil
+	}
+}
+
+func fetchButaneHTTP(rawurl string, allowInsecureHTTP bool) ([]byte, error) {
+	client := &http.Client{
+		Timeout:       fetchTimeout,
+		CheckRedirect: rejectInsecureRedirect(allowInsecureHTTP),
+	}
 	resp, err := client.Get(rawurl)
 	if err != nil {
 		return nil, fmt.Errorf("fetch %s: %w", rawurl, err)
@@ -125,8 +168,11 @@ func deferredQuadletType(path string) string {
 //
 // Translation warnings (non-fatal) are returned in warnings; translation
 // errors are returned as the error.
-func LoadButane(source string) (*IR, []string, error) {
-	data, err := readButaneSource(source)
+//
+// allowInsecureHTTP relaxes the https-by-default rule for remote sources — see
+// readButaneSource. Local sources ignore it.
+func LoadButane(source string, allowInsecureHTTP bool) (*IR, []string, error) {
+	data, err := readButaneSource(source, allowInsecureHTTP)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -190,10 +236,20 @@ func LoadButane(source string) (*IR, []string, error) {
 	}
 
 	for _, u := range ign.Systemd.Units {
+		// Reject mask up front rather than silently dropping it. Masking is a
+		// security-relevant declaration ("this unit must not run"); magus does
+		// not reconcile mask state in v1, and honoring it partially — or
+		// ignoring it while the operator believes it took effect — is worse
+		// than refusing. This mirrors how deferred quadlet types are rejected
+		// at load: the authority boundary stays honest.
+		if u.Mask != nil && *u.Mask {
+			return nil, warnings, fmt.Errorf("unit %s: mask is not supported in v1 — magus does not reconcile masked state; remove \"mask\" or mask the unit out of band", u.Name)
+		}
 		unit := Unit{
-			Name:     u.Name,
-			Enabled:  u.Enabled != nil && *u.Enabled,
-			Mask:     u.Mask != nil && *u.Mask,
+			Name: u.Name,
+			// Preserve the tri-state directly: nil means "enablement not
+			// declared, don't touch it" — see ir.Unit.Enabled.
+			Enabled:  u.Enabled,
 			Contents: derefString(u.Contents),
 		}
 		for _, di := range u.Dropins {
@@ -292,13 +348,6 @@ func (p intPtr) value(def int) uint32 {
 	return uint32(*p.v)
 }
 
-func (p intPtr) intValue(def int) int {
-	if p.v == nil {
-		return def
-	}
-	return *p.v
-}
-
 func derefString(s *string) string {
 	if s == nil {
 		return ""
@@ -342,7 +391,11 @@ func decodeSource(src, compression string) ([]byte, error) {
 		}
 		raw = decoded
 	} else {
-		decoded, err := url.QueryUnescape(payload)
+		// PathUnescape, not QueryUnescape: RFC 2397 data URLs are not query
+		// strings, and QueryUnescape turns a literal '+' into a space. Any
+		// producer that emits a literal '+' (RFC 2397 permits it) would be
+		// silently corrupted otherwise (D18).
+		decoded, err := url.PathUnescape(payload)
 		if err != nil {
 			return nil, fmt.Errorf("contents.source: %w", err)
 		}

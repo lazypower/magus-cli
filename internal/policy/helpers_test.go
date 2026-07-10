@@ -6,6 +6,9 @@ import (
 	"testing"
 )
 
+// boolPtr returns a pointer to b — for ir.Unit.Enabled tri-state in tests.
+func boolPtr(b bool) *bool { return &b }
+
 func writeTemp(t *testing.T, contents string) string {
 	t.Helper()
 	dir := t.TempDir()

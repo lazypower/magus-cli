@@ -77,47 +77,33 @@ func (f *Fake) DaemonReload() error {
 	return f.record("DaemonReload")
 }
 
-func (f *Fake) IsEnabled(unit string) (Enablement, error) {
-	if err := f.record(fmt.Sprintf("IsEnabled(%s)", unit)); err != nil {
-		return EnablementUnknown, err
-	}
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	if e, ok := f.enablement[unit]; ok {
-		return e, nil
-	}
-	return EnablementDisabled, nil
-}
-
-func (f *Fake) IsActive(unit string) (bool, error) {
-	if err := f.record(fmt.Sprintf("IsActive(%s)", unit)); err != nil {
-		return false, err
-	}
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	return f.activity[unit], nil
-}
-
-// SetActiveState preloads the raw is-active state ActiveState returns for unit.
+// SetActiveState preloads the raw is-active state Show returns for unit.
 func (f *Fake) SetActiveState(unit, state string) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.states[unit] = state
 }
 
-func (f *Fake) ActiveState(unit string) (string, error) {
-	if err := f.record(fmt.Sprintf("ActiveState(%s)", unit)); err != nil {
-		return "unknown", err
+// Show returns the preloaded enablement + active state in one call, mirroring
+// the real `systemctl show` consolidation. Enablement defaults to disabled and
+// active state to inactive until set via SetEnablement / SetActive(State).
+func (f *Fake) Show(unit string) (UnitStatus, error) {
+	if err := f.record(fmt.Sprintf("Show(%s)", unit)); err != nil {
+		return UnitStatus{Enablement: EnablementUnknown, Active: "unknown"}, err
 	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	enb := EnablementDisabled
+	if e, ok := f.enablement[unit]; ok {
+		enb = e
+	}
+	active := "inactive"
 	if s, ok := f.states[unit]; ok {
-		return s, nil
+		active = s
+	} else if f.activity[unit] {
+		active = "active"
 	}
-	if f.activity[unit] {
-		return "active", nil
-	}
-	return "inactive", nil
+	return UnitStatus{Enablement: enb, Active: active}, nil
 }
 
 func (f *Fake) Enable(unit string) error {

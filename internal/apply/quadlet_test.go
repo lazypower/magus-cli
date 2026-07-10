@@ -1,6 +1,7 @@
 package apply
 
 import (
+	"errors"
 	"testing"
 	"time"
 
@@ -106,6 +107,40 @@ func TestQuadletDeleteStopsGeneratedServiceBeforeUnlink(t *testing.T) {
 	}
 }
 
+func TestQuadletDeleteToleratesNeverMaterializedService(t *testing.T) {
+	// D11: a quadlet whose generated service never loaded (e.g. the generator
+	// rejected an invalid source) is not active. Deleting it must not wedge on a
+	// Stop that would fail — the source is removed and the entry cleaned up.
+	w := newMemWriter()
+	sd := systemd.NewFake()
+	// Generated service is NOT active (never materialized). A Stop would error.
+	sd.FailNext("Stop(ollama.service)", errors.New("Unit ollama.service not loaded"))
+
+	path := "/etc/containers/systemd/ollama.container"
+	w.preload(path, memFile{contents: []byte(sampleContainer), mode: 0o644})
+
+	m := manifest.New()
+	m.PutActive(path, manifest.KindQuadlet, "sha256:x", manifest.OriginCreate, time.Now())
+
+	plan, _ := diff.Compute(&ir.IR{}, m, w)
+	r := Apply(plan, &ir.IR{}, w, m, sd, time.Now())
+
+	if r.ExitCode() != 0 {
+		t.Fatalf("exit = %d; outcomes: %+v", r.ExitCode(), r.Outcomes)
+	}
+	// Stop must have been skipped (service inactive), so the primed failure
+	// never fired and the source was removed.
+	if containsCall(sd.Calls(), "Stop(ollama.service)") {
+		t.Errorf("must not Stop an inactive generated service, got: %v", sd.Calls())
+	}
+	if _, present := w.files[path]; present {
+		t.Error("quadlet source should be removed even when the service never loaded")
+	}
+	if m.Owns(path) {
+		t.Error("manifest entry should be cleaned up")
+	}
+}
+
 func TestQuadletUpdateActiveTriggersRestart(t *testing.T) {
 	w := newMemWriter()
 	sd := systemd.NewFake()
@@ -175,7 +210,7 @@ func TestQuadletAndUnitShareSingleDaemonReload(t *testing.T) {
 			{Path: "/etc/containers/systemd/ollama.container", Name: "ollama.container", Mode: 0o644, Contents: []byte(sampleContainer)},
 		},
 		Units: []ir.Unit{
-			{Name: "magus-foo.service", Enabled: true, Contents: "[Service]\nExecStart=/bin/foo\n"},
+			{Name: "magus-foo.service", Enabled: boolPtr(true), Contents: "[Service]\nExecStart=/bin/foo\n"},
 		},
 	}
 	plan, _ := diff.Compute(in, manifest.New(), w)

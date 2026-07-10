@@ -364,6 +364,78 @@ func TestStandaloneUnit(t *testing.T) {
 	}
 }
 
+// TestExistingUnitEnablementViaShow drives the path the standalone/adopt-unit
+// tests miss: enablement reconciliation of an EXISTING unit, which reads live
+// state through `systemctl show` (reconcileServiceState → sd.Show →
+// enablementFromShow → EnablementOp) at both plan and apply time. A *new* unit
+// takes the `enable --now` branch and never touches Show, so without this the
+// show-based UnitFileState→Enablement mapping had zero real-systemd coverage.
+//
+// Both drift directions are exercised against identical-content (adopted, not
+// created) units, so a broken enablement mapping fails to converge here.
+func TestExistingUnitEnablementViaShow(t *testing.T) {
+	c := setup(t, examplePolicy)
+
+	// Bodies match what the butane below declares, so each unit is ADOPTED
+	// (content-equal, unowned) rather than created — forcing the existing-unit
+	// enablement path instead of enable --now.
+	onBody := "[Unit]\nDescription=drift-on\n[Service]\nType=oneshot\nRemainAfterExit=yes\nExecStart=/usr/bin/true\n[Install]\nWantedBy=multi-user.target\n"
+	offBody := "[Unit]\nDescription=drift-off\n[Service]\nType=oneshot\nRemainAfterExit=yes\nExecStart=/usr/bin/true\n[Install]\nWantedBy=multi-user.target\n"
+	c.put("/etc/systemd/system/magus-drift-on.service", onBody)
+	c.put("/etc/systemd/system/magus-drift-off.service", offBody)
+	c.exec("systemctl", "daemon-reload")
+	// Establish the drift: drift-off is enabled (IR will declare it disabled);
+	// drift-on stays disabled (IR will declare it enabled).
+	if out, code := c.exec("systemctl", "enable", "magus-drift-off.service"); code != 0 {
+		t.Fatalf("precondition enable: %s", out)
+	}
+	if e := c.isEnabled("magus-drift-on.service"); e != "disabled" {
+		t.Fatalf("precondition: drift-on is-enabled=%q, want disabled", e)
+	}
+	if e := c.isEnabled("magus-drift-off.service"); e != "enabled" {
+		t.Fatalf("precondition: drift-off is-enabled=%q, want enabled", e)
+	}
+
+	bu := butaneHeader + `systemd:
+  units:
+    - name: magus-drift-on.service
+      enabled: true
+      contents: |
+        [Unit]
+        Description=drift-on
+        [Service]
+        Type=oneshot
+        RemainAfterExit=yes
+        ExecStart=/usr/bin/true
+        [Install]
+        WantedBy=multi-user.target
+    - name: magus-drift-off.service
+      enabled: false
+      contents: |
+        [Unit]
+        Description=drift-off
+        [Service]
+        Type=oneshot
+        RemainAfterExit=yes
+        ExecStart=/usr/bin/true
+        [Install]
+        WantedBy=multi-user.target
+`
+	out, code := c.apply(bu)
+	if code != 0 {
+		t.Fatalf("apply: exit %d\n%s", code, out)
+	}
+	// These converge only if magus read each unit's current enablement
+	// correctly via `systemctl show` (enablementFromShow) and EnablementOp
+	// decided the right operation.
+	if e := c.isEnabled("magus-drift-on.service"); e != "enabled" {
+		t.Errorf("enable-drift not reconciled via systemctl show: is-enabled=%q, want enabled", e)
+	}
+	if e := c.isEnabled("magus-drift-off.service"); e != "disabled" {
+		t.Errorf("disable-drift not reconciled via systemctl show: is-enabled=%q, want disabled", e)
+	}
+}
+
 // TestQuadlet proves quadlet generation: a .container source under the workload
 // root is written and the quadlet generator materializes its .service at
 // daemon-reload. The container runtime start depends on image egress, so this

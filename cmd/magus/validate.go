@@ -5,8 +5,9 @@ import (
 	"fmt"
 	"os"
 
-	"github.com/lazypower/magus-cli/internal/ir"
+	"github.com/lazypower/magus-cli/internal/manifest"
 	"github.com/lazypower/magus-cli/internal/policy"
+	"github.com/lazypower/magus-cli/internal/status"
 )
 
 const validateUsage = `magus validate — parse a Butane source and check it against the policy
@@ -17,8 +18,11 @@ Usage: magus validate [--policy <path>] <butane-source>
 URLs are fetched on every invocation; no caching.
 
 Flags:
-  --policy <path>   Override the policy file location
-                    (default: /etc/magus/policy.yaml)
+  --policy <path>     Override the policy file location (default: /etc/magus/policy.yaml)
+  --manifest <path>   Manifest path for the reserved-path check (default: /var/lib/magus/manifest.json)
+  --status <path>     Status path for the reserved-path check (default: /var/lib/magus/status.json)
+  --insecure-http     Allow fetching Butane over plain HTTP (https is required by
+                      default; http:// is an RCE vector for an on-path attacker)
 `
 
 func runValidate(args []string) int {
@@ -26,6 +30,9 @@ func runValidate(args []string) int {
 	fs.SetOutput(os.Stderr)
 	fs.Usage = func() { fmt.Fprint(os.Stderr, validateUsage) }
 	policyPath := fs.String("policy", policy.DefaultPath, "policy file path")
+	manifestPath := fs.String("manifest", manifest.DefaultPath, "manifest file path (reserved-path check)")
+	statusPath := fs.String("status", status.DefaultPath, "status file path (reserved-path check)")
+	insecureHTTP := fs.Bool("insecure-http", false, "allow fetching Butane over plain HTTP")
 	if err := fs.Parse(args); err != nil {
 		return 1
 	}
@@ -35,31 +42,31 @@ func runValidate(args []string) int {
 	}
 	butanePath := fs.Arg(0)
 
-	p, err := policy.Load(*policyPath)
+	// Same reserved-path set the reconcile commands use, so validate flags the
+	// same IR-declares-a-state-file violations apply would (D14 consistency).
+	_, parsed, violations, err := loadInputs(*policyPath, *manifestPath, *statusPath, butanePath, *insecureHTTP)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "error: %v\n", err)
 		return 1
 	}
-
-	parsed, warnings, err := ir.LoadButane(butanePath)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "error: %v\n", err)
-		return 1
-	}
-	for _, w := range warnings {
-		fmt.Fprintf(os.Stderr, "warning: %s\n", w)
-	}
-
-	violations := policy.Check(p, parsed, *policyPath)
 	for _, v := range violations {
 		fmt.Fprintf(os.Stderr, "error: %s\n", v)
 	}
 
-	resourceCount := len(parsed.Files) + len(parsed.Directories) + len(parsed.Units)
+	resourceCount := len(parsed.Files) + len(parsed.Directories) + len(parsed.Units) + len(parsed.Quadlets)
 	if len(violations) > 0 {
 		fmt.Fprintf(os.Stderr, "%d resources, %d policy violations\n", resourceCount, len(violations))
 		return 1
 	}
 	fmt.Printf("ok: %d resources, 0 policy violations\n", resourceCount)
 	return 0
+}
+
+// printButaneWarnings surfaces non-fatal Butane translation warnings to stderr.
+// The translator emits these on the very file the timer applies, so every
+// command that loads Butane shows them — not just validate (D16).
+func printButaneWarnings(warnings []string) {
+	for _, w := range warnings {
+		fmt.Fprintf(os.Stderr, "warning: %s\n", w)
+	}
 }

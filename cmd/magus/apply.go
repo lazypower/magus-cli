@@ -1,18 +1,17 @@
 package main
 
 import (
-	"bufio"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
 	"os"
-	"strings"
 	"time"
 
 	"github.com/lazypower/magus-cli/internal/apply"
 	"github.com/lazypower/magus-cli/internal/diff"
 	"github.com/lazypower/magus-cli/internal/hostfs"
-	"github.com/lazypower/magus-cli/internal/ir"
+	"github.com/lazypower/magus-cli/internal/lock"
 	"github.com/lazypower/magus-cli/internal/manifest"
 	"github.com/lazypower/magus-cli/internal/policy"
 	"github.com/lazypower/magus-cli/internal/status"
@@ -30,10 +29,13 @@ Flags:
   --yes               Skip the confirmation prompt
   --policy <path>     Override policy file (default: /etc/magus/policy.yaml)
   --manifest <path>   Override manifest file (default: /var/lib/magus/manifest.json)
+  --status <path>     Override status observation file (default: /var/lib/magus/status.json)
+  --insecure-http     Allow fetching Butane over plain HTTP (https required by default)
 
 Exit codes:
   0   all declared resources are in their desired state
-  2   one or more resources skipped (conflicts, orphaned, drift)
+  2   one or more resources skipped (conflicts, orphaned, drift), OR the
+      confirmation was declined with changes still pending
   1   one or more resources errored mid-apply, OR input-bad (parse, policy)
 `
 
@@ -45,6 +47,7 @@ func runApply(args []string) int {
 	manifestPath := fs.String("manifest", manifest.DefaultPath, "manifest file path")
 	statusPath := fs.String("status", status.DefaultPath, "status observation file path")
 	yes := fs.Bool("yes", false, "skip confirmation prompt")
+	insecureHTTP := fs.Bool("insecure-http", false, "allow fetching Butane over plain HTTP")
 	if err := fs.Parse(args); err != nil {
 		return 1
 	}
@@ -54,25 +57,23 @@ func runApply(args []string) int {
 	}
 	butanePath := fs.Arg(0)
 
-	p, err := policy.Load(*policyPath)
+	// Serialize with any other manifest-mutating operation (a concurrent timer
+	// apply, or a human adopt/reclaim) for the whole plan→apply→save window.
+	// The manifest is the consent ledger; a lost record reads later as a
+	// spurious conflict or a skipped delete.
+	release, err := lock.Acquire(*manifestPath)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "error: %v\n", err)
-		return 1
-	}
-	parsed, _, err := ir.LoadButane(butanePath)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "error: %v\n", err)
-		return 1
-	}
-	if violations := policy.Check(p, parsed, *manifestPath, *policyPath, *statusPath); len(violations) > 0 {
-		for _, v := range violations {
-			fmt.Fprintf(os.Stderr, "error: %s\n", v)
+		if errors.Is(err, lock.ErrBusy) {
+			fmt.Fprintln(os.Stderr, "error: another magus apply is in progress (manifest is locked)")
+			return 1
 		}
+		fmt.Fprintf(os.Stderr, "error: %v\n", err)
 		return 1
 	}
-	m, err := manifest.Load(*manifestPath)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "error: %v\n", err)
+	defer func() { _ = release() }()
+
+	p, parsed, m, ok := loadReconcileInputs(*policyPath, *manifestPath, *statusPath, butanePath, *insecureHTTP)
+	if !ok {
 		return 1
 	}
 
@@ -100,18 +101,22 @@ func runApply(args []string) int {
 		fmt.Fprintf(os.Stderr, "error: %v\n", err)
 		return 1
 	}
+	// Enablement is persistent state reconciled every apply — model it as plan
+	// rows so it's previewed like everything else and a drift can't hide behind
+	// a clean file diff ("Nothing to apply" stays honest).
+	diff.PlanServiceState(parsed, plan, sd)
 
 	printPlan(os.Stdout, butanePath, plan, nil)
 
-	changes, conflicts := planCounts(plan)
-	if changes == 0 && conflicts == 0 {
+	changes, conflicts, errored := planCounts(plan)
+	if changes == 0 && conflicts == 0 && errored == 0 {
 		// Already converged. Refresh the observation (keeps last_apply current
 		// on a timer that mostly runs no-op applies) and exit.
 		saveStatusObservation(*statusPath, plan, nil, apply.ObserveUnits(parsed, sd), now)
 		fmt.Println("\nNothing to apply.")
 		return 0
 	}
-	if changes == 0 {
+	if changes == 0 && errored == 0 {
 		// Conflicts only: nothing to apply, but the conflicts must still be
 		// recorded so `magus status` reflects them (and the exit code is 2,
 		// "conflicts present") — regardless of --yes. No prompt: there's nothing
@@ -121,10 +126,15 @@ func runApply(args []string) int {
 		return 2
 	}
 
-	if !*yes {
+	// There is real work (changes) and/or diff errors to surface. Confirm only
+	// when there are changes to apply; errored-only plans run straight through
+	// to record the failure (nothing is written — ActionError is fail-closed).
+	if changes > 0 && !*yes {
 		if !confirm(os.Stdin, os.Stdout, changes, conflicts) {
+			// Exit 2 (changes pending), not 0 — declining with work outstanding
+			// is not "converged", and a wrapper needs to tell them apart (UX5).
 			fmt.Println("Aborted.")
-			return 0
+			return 2
 		}
 	}
 	fmt.Println()
@@ -159,6 +169,14 @@ func saveStatusObservation(statusPath string, plan *diff.Plan, result *apply.Res
 	for _, a := range plan.Actions {
 		if a.Action == diff.ActionConflict {
 			conflicts = append(conflicts, status.Conflict{Path: a.Path, Reason: a.Reason})
+		}
+	}
+	// Enablement skips (declared enabled but masked/static/not-found) are
+	// unresolved-by-magus states too — record them so `magus status` reflects
+	// the unachievable intent instead of dropping it.
+	for _, sa := range plan.ServiceActions {
+		if sa.Op == diff.ServiceSkip {
+			conflicts = append(conflicts, status.Conflict{Path: sa.Unit, Reason: sa.Reason})
 		}
 	}
 
@@ -200,15 +218,27 @@ func statusResultString(code int) string {
 	}
 }
 
-// planCounts splits actions into "changes that will run" vs "conflicts that
-// will be skipped" — the two numbers the prompt needs.
-func planCounts(p *diff.Plan) (changes, conflicts int) {
+// planCounts splits actions into the numbers the apply flow needs: changes that
+// will run, conflicts that will be skipped, and resources that errored during
+// diff (undeterminable state, fail-closed). Enablement operations count too:
+// enable/disable are changes, a masked/static skip is a conflict.
+func planCounts(p *diff.Plan) (changes, conflicts, errored int) {
 	for _, a := range p.Actions {
 		switch a.Action {
 		case diff.ActionCreate, diff.ActionUpdate, diff.ActionAdopt,
 			diff.ActionDelete, diff.ActionCleanup:
 			changes++
 		case diff.ActionConflict, diff.ActionOrphaned:
+			conflicts++
+		case diff.ActionError:
+			errored++
+		}
+	}
+	for _, sa := range p.ServiceActions {
+		switch sa.Op {
+		case diff.ServiceEnable, diff.ServiceDisable:
+			changes++
+		case diff.ServiceSkip:
 			conflicts++
 		}
 	}
@@ -232,13 +262,7 @@ func confirm(in io.Reader, out io.Writer, changes, conflicts int) bool {
 			conflicts, plural(conflicts))
 		return false
 	}
-	r := bufio.NewReader(in)
-	line, err := r.ReadString('\n')
-	if err != nil && line == "" {
-		return false
-	}
-	answer := strings.ToLower(strings.TrimSpace(line))
-	return answer == "y" || answer == "yes"
+	return readYesNo(in)
 }
 
 func plural(n int) string {

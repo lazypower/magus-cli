@@ -1,21 +1,18 @@
 package main
 
 import (
-	"bufio"
-	"crypto/sha256"
-	"encoding/hex"
+	"errors"
 	"flag"
 	"fmt"
-	"io"
 	"os"
-	"strings"
 	"time"
 
 	"github.com/lazypower/magus-cli/internal/diff"
 	"github.com/lazypower/magus-cli/internal/hostfs"
-	"github.com/lazypower/magus-cli/internal/ir"
+	"github.com/lazypower/magus-cli/internal/lock"
 	"github.com/lazypower/magus-cli/internal/manifest"
 	"github.com/lazypower/magus-cli/internal/policy"
+	"github.com/lazypower/magus-cli/internal/status"
 )
 
 const adoptUsage = `magus adopt — take over an existing path that differs from the IR
@@ -33,6 +30,7 @@ silently during 'magus apply' and does not require this command.
 
 Flags:
   --yes               Skip the confirmation prompt
+  --insecure-http     Allow fetching Butane over plain HTTP (https required by default)
   --policy <path>     Override policy file (default: /etc/magus/policy.yaml)
   --manifest <path>   Override manifest file (default: /var/lib/magus/manifest.json)
 `
@@ -43,7 +41,9 @@ func runAdopt(args []string) int {
 	fs.Usage = func() { fmt.Fprint(os.Stderr, adoptUsage) }
 	policyPath := fs.String("policy", policy.DefaultPath, "policy file path")
 	manifestPath := fs.String("manifest", manifest.DefaultPath, "manifest file path")
+	statusPath := fs.String("status", status.DefaultPath, "status observation file path (reserved-path check)")
 	yes := fs.Bool("yes", false, "skip confirmation prompt")
+	insecureHTTP := fs.Bool("insecure-http", false, "allow fetching Butane over plain HTTP")
 	if err := fs.Parse(args); err != nil {
 		return 1
 	}
@@ -53,25 +53,20 @@ func runAdopt(args []string) int {
 	}
 	butanePath, target := fs.Arg(0), fs.Arg(1)
 
-	p, err := policy.Load(*policyPath)
+	// Serialize manifest mutation against a concurrent apply/adopt/reclaim.
+	release, err := lock.Acquire(*manifestPath)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "error: %v\n", err)
-		return 1
-	}
-	parsed, _, err := ir.LoadButane(butanePath)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "error: %v\n", err)
-		return 1
-	}
-	if violations := policy.Check(p, parsed, *manifestPath, *policyPath); len(violations) > 0 {
-		for _, v := range violations {
-			fmt.Fprintf(os.Stderr, "error: %s\n", v)
+		if errors.Is(err, lock.ErrBusy) {
+			fmt.Fprintln(os.Stderr, "error: another magus operation is in progress (manifest is locked)")
+			return 1
 		}
+		fmt.Fprintf(os.Stderr, "error: %v\n", err)
 		return 1
 	}
-	m, err := manifest.Load(*manifestPath)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "error: %v\n", err)
+	defer func() { _ = release() }()
+
+	p, parsed, m, ok := loadReconcileInputs(*policyPath, *manifestPath, *statusPath, butanePath, *insecureHTTP)
+	if !ok {
 		return 1
 	}
 
@@ -118,6 +113,17 @@ func runAdopt(args []string) int {
 		return 1
 	}
 
+	// Symlink-resolved containment BEFORE the prompt: a deliberate overwrite
+	// must not be redirected outside authority through a symlinked ancestor, and
+	// there's no point asking the operator to confirm something we'll refuse
+	// (UX4).
+	if r, ok := w.(hostfs.Resolver); ok {
+		if _, reason := diff.ContainmentEscape(p, r, target); reason != "" {
+			fmt.Fprintf(os.Stderr, "error: refusing to adopt %s: %s\n", target, reason)
+			return 1
+		}
+	}
+
 	fmt.Println("The path exists with content that differs from the IR.")
 	fmt.Println()
 	fmt.Printf("  - existing hash: %s\n", onDisk)
@@ -126,25 +132,19 @@ func runAdopt(args []string) int {
 	fmt.Println("Overwriting will replace the existing content with the IR's declared content.")
 
 	if !*yes {
-		if !confirmAdopt(os.Stdin, os.Stdout, target) {
+		if !confirmAction(os.Stdin, os.Stdout, fmt.Sprintf("\nTake over %s? [y/N] ", target)) {
 			fmt.Println("Aborted.")
 			return 0
 		}
 	}
 	fmt.Println()
 
-	// Symlink-resolved containment: a deliberate overwrite must still not be
-	// redirected outside authority through a symlinked ancestor.
-	if r, ok := w.(hostfs.Resolver); ok {
-		if _, reason := diff.ContainmentEscape(p, r, target); reason != "" {
-			fmt.Fprintf(os.Stderr, "error: refusing to adopt %s: %s\n", target, reason)
-			return 1
-		}
-	}
 	if err := w.WriteFile(target, declared.contents, declared.mode, declared.uid, declared.gid); err != nil {
 		fmt.Fprintf(os.Stderr, "error: write %s: %v\n", target, err)
 		return 1
 	}
+	// A rewritten unit/quadlet is stale to systemd until daemon-reload.
+	reloadAfterUnitWrite(declared.diffKind, target)
 	m.PutActive(target, manifestKind(declared.diffKind), declared_, manifest.OriginForceAdopt, time.Now().UTC())
 	if err := m.Save(*manifestPath); err != nil {
 		fmt.Fprintf(os.Stderr, "error: save manifest: %v\n", err)
@@ -152,20 +152,4 @@ func runAdopt(args []string) int {
 	}
 	fmt.Printf("  ✓ %s  (rewrote, recorded in manifest)\n", target)
 	return 0
-}
-
-func hashContent(b []byte) string {
-	h := sha256.Sum256(b)
-	return "sha256:" + hex.EncodeToString(h[:])
-}
-
-func confirmAdopt(in io.Reader, out io.Writer, path string) bool {
-	fmt.Fprintf(out, "\nTake over %s? [y/N] ", path)
-	r := bufio.NewReader(in)
-	line, err := r.ReadString('\n')
-	if err != nil && line == "" {
-		return false
-	}
-	answer := strings.ToLower(strings.TrimSpace(line))
-	return answer == "y" || answer == "yes"
 }

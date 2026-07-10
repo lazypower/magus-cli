@@ -1,6 +1,7 @@
 package main
 
 import (
+	"encoding/json"
 	"flag"
 	"fmt"
 	"io"
@@ -13,6 +14,8 @@ import (
 	"github.com/lazypower/magus-cli/internal/ir"
 	"github.com/lazypower/magus-cli/internal/manifest"
 	"github.com/lazypower/magus-cli/internal/policy"
+	"github.com/lazypower/magus-cli/internal/status"
+	"github.com/lazypower/magus-cli/internal/systemd"
 )
 
 const planUsage = `magus plan — show what apply would do
@@ -26,6 +29,9 @@ Flags:
   -v, --verbose       With --explain, reveal the content diff for conflicts
                       (unowned). Default: conflicts show hashes only, so an
                       unowned file's content is never written to logs.
+  --json              Emit the plan as machine-readable JSON (actions, service
+                      actions, hashes, summary) for a scriptable review→apply loop
+  --insecure-http     Allow fetching Butane over plain HTTP (https required by default)
   --policy <path>     Override policy file (default: /etc/magus/policy.yaml)
   --manifest <path>   Override manifest file (default: /var/lib/magus/manifest.json)
 
@@ -41,7 +47,10 @@ func runPlan(args []string) int {
 	fs.Usage = func() { fmt.Fprint(os.Stderr, planUsage) }
 	policyPath := fs.String("policy", policy.DefaultPath, "policy file path")
 	manifestPath := fs.String("manifest", manifest.DefaultPath, "manifest file path")
+	statusPath := fs.String("status", status.DefaultPath, "status observation file path")
 	explainFlag := fs.Bool("explain", false, "show per-resource diffs")
+	jsonOut := fs.Bool("json", false, "emit machine-readable JSON plan")
+	insecureHTTP := fs.Bool("insecure-http", false, "allow fetching Butane over plain HTTP")
 	var verbose bool
 	fs.BoolVar(&verbose, "v", false, "reveal conflict content with --explain")
 	fs.BoolVar(&verbose, "verbose", false, "reveal conflict content with --explain")
@@ -54,25 +63,8 @@ func runPlan(args []string) int {
 	}
 	butanePath := fs.Arg(0)
 
-	p, err := policy.Load(*policyPath)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "error: %v\n", err)
-		return 1
-	}
-	parsed, _, err := ir.LoadButane(butanePath)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "error: %v\n", err)
-		return 1
-	}
-	if violations := policy.Check(p, parsed, *manifestPath, *policyPath); len(violations) > 0 {
-		for _, v := range violations {
-			fmt.Fprintf(os.Stderr, "error: %s\n", v)
-		}
-		return 1
-	}
-	m, err := manifest.Load(*manifestPath)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "error: %v\n", err)
+	p, parsed, m, ok := loadReconcileInputs(*policyPath, *manifestPath, *statusPath, butanePath, *insecureHTTP)
+	if !ok {
 		return 1
 	}
 
@@ -86,15 +78,91 @@ func runPlan(args []string) int {
 		fmt.Fprintf(os.Stderr, "error: %v\n", err)
 		return 1
 	}
+	// Preview enablement operations too (read-only is-enabled queries) so plan
+	// honestly shows the enable/disable/skip work apply will do. No-op when
+	// systemd is unavailable.
+	diff.PlanServiceState(parsed, plan, systemd.OS())
 
-	var details map[string]string
-	if *explainFlag {
-		details = buildExplanations(parsed, fsys, plan, verbose)
+	if *jsonOut {
+		if code := emitPlanJSON(os.Stdout, butanePath, plan); code != 0 {
+			return code
+		}
+	} else {
+		var details map[string]string
+		if *explainFlag {
+			details = buildExplanations(parsed, fsys, plan, verbose)
+		}
+		printPlan(os.Stdout, butanePath, plan, details)
 	}
-	printPlan(os.Stdout, butanePath, plan, details)
 
+	// Error dominates: a path whose state couldn't be determined is exit 1, not
+	// the "changes pending" exit 2 — an agent gating on 2 as "review then apply"
+	// must not treat an unreadable path as safe.
+	if plan.HasErrors() {
+		return 1
+	}
 	if plan.HasChanges() {
 		return 2
+	}
+	return 0
+}
+
+// planJSON is the machine-readable shape of a plan. The spec calls Butane the
+// LLM-facing contract and status the structured surface — plan, the thing an
+// agent gates on before `apply --yes`, gets a structured surface too (UX3).
+type planJSON struct {
+	Source         string              `json:"source"`
+	HasChanges     bool                `json:"has_changes"`
+	Actions        []actionJSON        `json:"actions"`
+	ServiceActions []serviceActionJSON `json:"service_actions"`
+}
+
+type actionJSON struct {
+	Path       string `json:"path"`
+	Kind       string `json:"kind"`
+	Action     string `json:"action"`
+	Reason     string `json:"reason,omitempty"`
+	OnDiskHash string `json:"on_disk_hash,omitempty"`
+	IRHash     string `json:"ir_hash,omitempty"`
+}
+
+type serviceActionJSON struct {
+	Unit   string `json:"unit"`
+	Op     string `json:"op"`
+	Reason string `json:"reason,omitempty"`
+}
+
+// emitPlanJSON writes the plan as indented JSON. Returns 0 on success, 1 on a
+// (near-impossible) encode error.
+func emitPlanJSON(w io.Writer, source string, p *diff.Plan) int {
+	out := planJSON{
+		Source:         source,
+		HasChanges:     p.HasChanges(),
+		Actions:        make([]actionJSON, 0, len(p.Actions)),
+		ServiceActions: make([]serviceActionJSON, 0, len(p.ServiceActions)),
+	}
+	for _, a := range p.Actions {
+		out.Actions = append(out.Actions, actionJSON{
+			Path:       a.Path,
+			Kind:       string(a.Kind),
+			Action:     string(a.Action),
+			Reason:     a.Reason,
+			OnDiskHash: a.OnDiskHash,
+			IRHash:     a.IRHash,
+		})
+	}
+	for _, sa := range p.ServiceActions {
+		out.ServiceActions = append(out.ServiceActions, serviceActionJSON{
+			Unit:   sa.Unit,
+			Op:     string(sa.Op),
+			Reason: sa.Reason,
+		})
+	}
+	enc := json.NewEncoder(w)
+	enc.SetIndent("", "  ")
+	if err := enc.Encode(out); err != nil {
+		fmt.Fprintf(os.Stderr, "error: %v\n", err)
+		return 1
 	}
 	return 0
 }
@@ -151,6 +219,16 @@ func printPlan(w io.Writer, butanePath string, p *diff.Plan, details map[string]
 		}
 	}
 
+	// Enablement operations, rendered like resource rows: [enable]/[disable]/
+	// [skip] against the unit name.
+	for _, sa := range p.ServiceActions {
+		fmt.Fprintf(w, "  %-12s%s", fmt.Sprintf("[%s]", sa.Op), sa.Unit)
+		if sa.Reason != "" {
+			fmt.Fprintf(w, "  (%s)", sa.Reason)
+		}
+		fmt.Fprintln(w)
+	}
+
 	fmt.Fprintln(w)
 	fmt.Fprintln(w, summary(p))
 }
@@ -160,7 +238,7 @@ func actionTag(a diff.Action) string {
 }
 
 func summary(p *diff.Plan) string {
-	var c, u, ad, d, s, cf, or, sc int
+	var c, u, ad, d, s, cf, or, sc, er int
 	for _, a := range p.Actions {
 		switch a.Action {
 		case diff.ActionCreate:
@@ -179,6 +257,8 @@ func summary(p *diff.Plan) string {
 			or++
 		case diff.ActionCleanup:
 			sc++
+		case diff.ActionError:
+			er++
 		}
 	}
 	out := fmt.Sprintf("%d creates, %d updates, %d adopts, %d deletes, %d skipped",
@@ -192,5 +272,29 @@ func summary(p *diff.Plan) string {
 	if sc > 0 {
 		out += fmt.Sprintf(", %d manifest cleanup", sc)
 	}
+	if er > 0 {
+		out += fmt.Sprintf(", %d errored", er)
+	}
+	if en, dis, sk := serviceCounts(p); en+dis+sk > 0 {
+		out += fmt.Sprintf(", %d enable, %d disable", en, dis)
+		if sk > 0 {
+			out += fmt.Sprintf(", %d enablement skipped", sk)
+		}
+	}
 	return out
+}
+
+// serviceCounts tallies the plan's enablement operations by kind.
+func serviceCounts(p *diff.Plan) (enable, disable, skip int) {
+	for _, sa := range p.ServiceActions {
+		switch sa.Op {
+		case diff.ServiceEnable:
+			enable++
+		case diff.ServiceDisable:
+			disable++
+		case diff.ServiceSkip:
+			skip++
+		}
+	}
+	return
 }

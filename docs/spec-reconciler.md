@@ -69,8 +69,7 @@ file_roots:
   - /var/data
 
 unit_patterns:
-  - "magus-*"
-  - "*.d/10-magus.conf"
+  - "magus-*"   # matches unit NAMES; drop-ins are gated by their parent unit's pattern
 
 deny:
   paths:
@@ -86,12 +85,13 @@ deny:
 **Hard rules:**
 
 1. **Path allowlist.** No write outside `file_roots`. Paths are checked after symlink resolution: the longest existing ancestor of the target is resolved (`EvalSymlinks`) and the *resolved* path must still fall within `file_roots` and clear `deny` — a symlinked ancestor that redirects an in-bounds-looking path outside the roots is a conflict (skipped), not a write. Resolution failure fails closed. At write time the atomic `tmp`+`rename` and `O_NOFOLLOW` on the temp file ensure Magus never writes *through* a symlink at the destination.
-2. **Unit namespace.** Only manage units matching `unit_patterns`. Quadlet *generated* services (e.g. `ollama.service` from `ollama.container`) are the exception: they are gated by `deny.units` only, **not** `unit_patterns` — they're a side effect of a file under `file_roots`, and requiring a `unit_patterns` match would reject every quadlet under a drop-in-only policy.
+2. **Unit namespace.** Only manage units matching `unit_patterns`. Units are governed by **name everywhere** — creation, deny, and orphaning all key off the unit name (`unit_patterns` / `deny.units`), never `file_roots`. A unit body lives at a fixed `/etc/systemd/system` location that is an implementation detail, not something the operator lists in `file_roots`; so `file_roots` need not include the systemd dir to manage units, and a name-permitted unit is never orphaned for being "outside file_roots." Quadlet *generated* services (e.g. `ollama.service` from `ollama.container`) are gated by `deny.units` only, **not** `unit_patterns` — they're a side effect of a file under `file_roots`, and requiring a `unit_patterns` match would reject every quadlet under a drop-in-only policy. (A quadlet's *source file* is still path-governed under `file_roots`; only units-proper are purely name-governed.)
 3. **Deny list.** A path or unit matching `deny` is off-limits even if it falls inside `file_roots` / `unit_patterns`. Deny is the explicit "never touch this" override.
 4. **Drop-in precedence.** All drop-ins go to `10-magus.conf` so they sort predictably and are easy to identify.
 5. **Manifest ownership is binding.** Magus reconciles paths it owns (per the manifest), including removing them when they leave the IR. Paths it didn't claim are skipped — even if they fall inside `file_roots`. No "polite reconciliation."
-6. **No privilege escalation.** File modes cannot exceed what the policy declares. No setuid, no setgid, no world-writable.
+6. **No privilege escalation.** File modes cannot exceed what the policy declares. No setuid, no setgid, no world-writable. The sticky bit is also rejected — magus reconciles the standard `0o777` permission bits only, and a declared special bit it can't observe/apply faithfully would flap `[update]` forever, so it's refused at load rather than silently dropped.
 7. **Reserved state paths.** Magus's own state files — `manifest.json` and `status.json` under `/var/lib/magus` (or wherever `--manifest`/`--status` point) — may **not** be declared in the IR, even though they live inside a `file_root`. Letting an IR manage Magus's ownership ledger would let it clobber the consent contract from outside the contract. A reserved path in the IR is a parse-time validation error.
+8. **Remote source integrity.** A Butane source may be a local path or an `http(s)` URL. Because a root-privileged reconciler that fetches its desired state and applies it turns the transport into a code path (an on-path attacker who can rewrite the response can plant a unit Magus will run), **`https` is required for remote sources**. A plain `http://` source is refused unless the operator passes `--insecure-http` — the explicit, auditable opt-out.
 
 **Policy contention with the manifest.** When a new policy denies a path Magus currently owns, Magus transitions the manifest entry to an **orphaned** state: the entry is retained (audit trail), no further reconciliation occurs, the path is excluded from diff and apply, a warning is emitted on every plan and apply. The file is left in place — never deleted, never modified.
 
@@ -118,7 +118,7 @@ The Butane file is the input. Magus consumes a strict subset as its intermediate
 
 | Resource              | Actions                                              | Notes                                                          |
 |-----------------------|------------------------------------------------------|----------------------------------------------------------------|
-| `systemd.units`       | Create, drop-in override, delete on omission         | Drop-ins to `10-magus.conf` only. Must match `unit_patterns`. Delete = stop + disable + unlink + daemon-reload. |
+| `systemd.units`       | Create, drop-in override, delete on omission         | Drop-ins to `10-magus.conf` only. Must match `unit_patterns`. `enabled` is tri-state (`true`/`false`/omitted — see Apply mechanics). `mask` is **rejected at load**: v1 does not reconcile masked state, and silently dropping a security-relevant declaration is worse than refusing it. Delete = stop + disable + unlink + daemon-reload. |
 | `storage.files`       | Create, update, delete on omission                   | Atomic write. Must fall within `file_roots`.                   |
 | `storage.directories` | Create, reconcile mode/ownership                     | Never removed even on IR omission — directories may hold user data Magus didn't track. v1 exception; see open questions. |
 | Quadlets              | Create, update, delete on omission, adopt            | Auto-promoted from `storage.files` whose path is under `/etc/containers/systemd/` and ends in `.container`/`.volume`/`.network`. Equivalence is the unit canonical hash. Apply triggers `daemon-reload` + `start` of the *generated* service (always — quadlets express intent that the thing should be running; generated units can't be enabled, so boot persistence is the quadlet's `[Install]`). v1 supports `.container`/`.volume`/`.network`; `.pod`/`.kube`/`.image`/`.build` are deferred. |
@@ -171,11 +171,13 @@ This is the reconciler-pattern compromise. Magus runs unattended (timer-driven `
 
 These are not state contention; they're broken inputs. Halting forces a human to fix them before any apply runs.
 
-The user resolves an apply-time conflict manually (delete the path, move it out of `file_roots`, fix the IR to match, or `magus adopt --force` to take it over with the IR content). Until then the path stays in the conflict list, and every apply re-checks and re-skips.
+The user resolves an apply-time conflict manually (delete the path, move it out of `file_roots`, fix the IR to match, or `magus adopt <butane-source> <path>` to take it over with the IR content). Until then the path stays in the conflict list, and every apply re-checks and re-skips.
 
 **Stale manifest entries** — paths Magus claims to own but which are absent on disk (typically deleted out of band, or after a v1 unit-removal that didn't update the manifest cleanly) — are pruned silently during apply, with a log line for visibility. No reconciliation action is taken; the disk is already in the desired state.
 
 A path inside `file_roots` that is neither in the IR nor in the manifest is simply ignored. Not a conflict, not Magus's problem.
+
+**A diff-stage read failure on one path is isolated, not fatal.** If the `stat`/`read` of a single declared path fails during planning (EPERM, transient I/O), that resource is marked errored (`[error]` row) and Magus refuses to touch it — fail-closed — while every other resource is still planned and applied. The apply exit code reflects the error (`1`), but one unreadable path does not halt convergence of the rest. This is the same per-resource posture apply takes; only *input-bad* cases (parse, policy, manifest version) halt the whole run.
 
 ## Equivalence
 
@@ -225,9 +227,10 @@ The canonicalization is intentionally lossy in only two dimensions: whitespace n
 **systemd units / drop-ins (create / update):**
 1. Write file atomically (same as files), if content differs
 2. `systemctl daemon-reload` once, after all unit writes
-3. **Reconcile enablement** (persistent state, checked every apply):
-   - Declared enabled, `is-enabled` says no → `systemctl enable <unit>`
-   - Declared disabled, `is-enabled` says yes → `systemctl disable <unit>`
+3. **Reconcile enablement** (persistent state, checked every apply). Enablement is **tri-state**, following Ignition/Butane's `enabled` field:
+   - `enabled: true`, `is-enabled` says no → `systemctl enable <unit>`
+   - `enabled: false`, `is-enabled` says yes → `systemctl disable <unit>`
+   - `enabled` **omitted** → enablement is not declared; Magus does not touch it. A unit declared only to attach a drop-in (or one that simply omits `enabled`) keeps whatever enablement it has — extending a unit never enables or disables it as a side effect. This is the difference between "declared disabled" and "not declared", and collapsing the two would make Magus actively disable services it was only meant to extend.
 4. **First-time start, only on creation:** new unit declared enabled → `systemctl start <unit>` (combined with step 3 as `enable --now` for new units)
 5. **Restart on content change**, only if the unit is currently active: `systemctl restart <unit>`
 6. **Inactive units whose content changed** are rewritten only. The new content takes effect on next start. Logged at apply-time so the deferred behavior is visible.
@@ -263,7 +266,7 @@ Enablement is reconciled every apply because it's persistent. Activity is not �
 6. Update manifest
 
 **Quadlets (delete):**
-1. `systemctl stop <generated-service>` — running container exits before its declaration disappears
+1. `systemctl stop <generated-service>` **only if it is currently active** — running container exits before its declaration disappears. A quadlet whose generated service never materialized (the generator rejected an invalid source) isn't loaded; skipping the stop lets the reconciler still remove the bad source rather than erroring on it forever.
 2. `unlink(2)` the quadlet source file
 3. `systemctl daemon-reload` (batched — generator drops the now-orphaned service)
 4. Remove the manifest entry
@@ -341,6 +344,13 @@ config/butane/magus.bu → 5 resources
 
 Exit codes (plan): `0` = no changes needed, `2` = changes pending or conflicts present, `1` = input-bad (parse error, policy/IR contradiction, manifest version mismatch).
 
+**Enablement is previewed too.** Because enablement is persistent state reconciled every apply, `plan` shows the enable/disable operations it will perform as their own rows (`[enable]`/`[disable]` against the unit name), and surfaces an unachievable declaration (`enabled: true` on a masked/static/not-found unit) as `[skip]`. This is what makes `plan` an honest preview of `apply` and keeps "Nothing to apply" true by construction — an enablement drift is a plan row, so it can't hide behind a clean file diff. `plan` queries `systemctl is-enabled` (read-only) to compute these; where systemd is unavailable, enablement simply isn't previewed.
+
+```
+  [enable]   magus-healthcheck.timer  (declared enabled, currently disabled)
+  [skip]     legacy.service           (declared enabled but unit is masked; magus will not unmask)
+```
+
 `--explain` augments the plan with per-resource diffs. For **`[update]`** rows (resources Magus owns) it shows a unified text diff — over the canonicalized form for units/quadlets (same bytes used for hashing), raw for files; if either side is non-text the diff is replaced with the sha256 of each side. Mode and ownership deltas are shown as single lines.
 
 For **`[conflict]`** rows the resource is *unowned*, so dumping its content into CLI/log/LLM output is an information leak. By default a conflict shows **hashes only** (`sha256` of each side). The full conflict diff is revealed only when the operator explicitly passes **`-v` / `--verbose`** — secure-by-default for unattended/logged runs, with human-in-the-loop ergonomics when someone is actually looking.
@@ -398,7 +408,7 @@ Apply 4 changes? (1 conflict will be skipped) [y/N] y
   ✓ daemon-reload
   ✓ enable --now magus-healthcheck.timer
 
-Applied 4 changes, 1 conflict (skipped), 0 errors.  exit 2
+Applied 4 changes, 1 skipped, 0 errors.  exit 2
 ```
 
 ### `magus status`
@@ -449,12 +459,16 @@ $ magus status --json
 
 `result` is one of `ok` (everything converged), `ok-with-skips` (conflicts present, or orphans warned), or `error` (mid-apply failures). `conflicts` lists every IR-declared path Magus refuses to overwrite. `orphaned` lists every path Magus once managed but no longer reconciles due to policy — kept persistently until the file is removed from disk or the operator runs `magus reclaim`.
 
+For unattended monitoring, `magus status --check` turns `result` into an exit code (`0` converged, `2` conflicts/orphans, `1` error) so a timer or health probe can gate on the exit status instead of parsing JSON; `--max-age <dur>` additionally fails (exit `1`) when the last apply is older than the given duration, catching a stopped timer.
+
 ### `magus reclaim`
 
 Restore an orphaned path to active reconciliation. Run after the policy that caused the orphan has been removed (or amended to permit the path again). The IR must declare the path; the path must exist on disk.
 
+Reclaim takes the Butane source (so it can read the declared desired state) and the path: `magus reclaim [--yes] [--force] <butane-source> <path>`.
+
 ```
-$ magus reclaim /etc/shadow
+$ magus reclaim config/butane/magus.bu /etc/shadow
 This path is orphaned (orphaned 2026-04-26 by policy deny).
 
   - manifest hash:  sha256:9f1234...
@@ -468,14 +482,16 @@ Reclaim /etc/shadow? [y/N] y
   ✓ /etc/shadow  (state: orphaned → active)
 ```
 
-If the on-disk content has drifted during orphan, reclaim refuses unless `--force` is passed (which writes the IR content over the existing file). Reclaim never auto-runs — the operator decides when to take a path back under management.
+If the on-disk content has drifted during orphan, reclaim refuses unless `--force` is passed (which writes the IR content over the existing file). Reclaim never auto-runs — the operator decides when to take a path back under management. Directories are reclaimable too; having no content, they skip the drift check and re-activate directly (mode/ownership is reconciled by the next apply). When `--force` rewrites a unit or quadlet, reclaim runs `daemon-reload` (and restarts it if active) so systemd picks up the new definition immediately rather than on next boot.
 
 ### `magus adopt`
 
 Take over a path that exists, differs from the IR, and isn't in the manifest. **This overwrites the existing content with the IR's content**, then records the entry in the manifest. Use it when you want Magus to own a path you're willing to replace — `terraform import` with a write step. (Adoption of *matching* content needs no command — `magus apply` does it automatically.)
 
+Adopt takes the Butane source and the path: `magus adopt [--yes] <butane-source> <path>`. It always overwrites (there is no `--force` — the overwrite *is* the operation); adoption of *matching* content is the silent no-op `magus apply` already does.
+
 ```
-$ magus adopt /etc/systemd/system/legacy-thing.service
+$ magus adopt config/butane/magus.bu /etc/systemd/system/legacy-thing.service
 The path exists with content that differs from the IR.
 
   - existing hash: sha256:9f12...
@@ -488,7 +504,7 @@ Take over /etc/systemd/system/legacy-thing.service? [y/N] y
   ✓ /etc/systemd/system/legacy-thing.service  (rewrote, recorded in manifest)
 ```
 
-Adoption of *matching* content happens automatically during `magus apply` and does not require this command. `magus adopt` exists for the deliberate-overwrite case.
+Adoption of *matching* content happens automatically during `magus apply` and does not require this command. `magus adopt` exists for the deliberate-overwrite case. When the adopted path is a unit or quadlet, adopt runs `daemon-reload` (and restarts it if active) after the rewrite so systemd doesn't keep running the stale definition.
 
 ### `magus validate`
 
@@ -505,6 +521,14 @@ error: /tmp/foo is outside allowed file_roots
 ```
 
 By default `magus validate` reads `/etc/magus/policy.yaml`. Override with `--policy <path>` for testing.
+
+### `magus version`
+
+Prints the build's version and commit (`magus <version> (<commit>)`), stamped at build time via `-ldflags`. A host-deployed static binary needs a version identifier for support and upgrade tracking.
+
+### JSON surfaces for automation
+
+`magus plan --json` emits the plan (actions, service actions, per-resource hashes, and a `has_changes` flag) as structured JSON — Butane is the LLM-facing input contract and `status --json` the structured output, and `plan --json` makes the review-then-`apply --yes` loop scriptable without scraping text. Exit codes are unchanged (`0` no changes, `2` pending, `1` input-bad).
 
 ## Relationship to existing artifacts
 

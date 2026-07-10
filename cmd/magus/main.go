@@ -10,6 +10,15 @@ import (
 	"os"
 )
 
+// version and commit are stamped at build time via
+// -ldflags "-X main.version=... -X main.commit=...". A host-deployed static
+// binary with no version identifier is a support headache (UX6); `make build`
+// injects them from git, and they default to dev/none for a plain `go build`.
+var (
+	version = "dev"
+	commit  = "none"
+)
+
 const usage = `magus — Butane reconciler for Magus
 
 Usage: magus <command> [flags]
@@ -21,6 +30,7 @@ Commands:
   status      Print reconciler state from the manifest
   adopt       Take over an existing path that differs from the IR
   reclaim     Restore an orphaned path to active reconciliation
+  version     Print the magus version and commit
 
 Run 'magus <command> -h' for command-specific flags.
 `
@@ -46,6 +56,9 @@ func main() {
 		os.Exit(runAdopt(args))
 	case "reclaim":
 		os.Exit(runReclaim(args))
+	case "version", "--version":
+		fmt.Printf("magus %s (%s)\n", version, commit)
+		os.Exit(0)
 	case "-h", "--help", "help":
 		fmt.Print(usage)
 		os.Exit(0)

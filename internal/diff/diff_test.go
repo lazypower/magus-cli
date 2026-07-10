@@ -3,6 +3,7 @@ package diff
 import (
 	"errors"
 	"io/fs"
+	"sort"
 	"testing"
 	"time"
 
@@ -28,7 +29,7 @@ func (m memFS) Stat(path string) (hostfs.FileInfo, error) {
 	if !ok {
 		return hostfs.FileInfo{Exists: false}, nil
 	}
-	return hostfs.FileInfo{Exists: true, Mode: f.mode, UID: f.uid, GID: f.gid}, nil
+	return hostfs.FileInfo{Exists: true, IsDir: f.isDir, Mode: f.mode, UID: f.uid, GID: f.gid}, nil
 }
 
 func (m memFS) ReadFile(path string) ([]byte, error) {
@@ -37,6 +38,104 @@ func (m memFS) ReadFile(path string) ([]byte, error) {
 		return nil, &fs.PathError{Op: "open", Path: path, Err: errors.New("not found")}
 	}
 	return f.contents, nil
+}
+
+// D9: manifest-sweep rows must be emitted in a stable (sorted) order, not the
+// randomized map-iteration order.
+func TestSweepRowsAreSorted(t *testing.T) {
+	m := manifest.New()
+	now := time.Unix(1, 0)
+	// Insert in non-sorted order; none are declared in the IR, so all are swept.
+	for _, p := range []string{"/etc/core/z", "/etc/core/a", "/etc/core/m", "/etc/core/b"} {
+		m.PutActive(p, manifest.KindFile, "sha256:x", manifest.OriginCreate, now)
+	}
+	plan, err := Compute(&ir.IR{}, m, memFS{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	paths := make([]string, 0, len(plan.Actions))
+	for _, a := range plan.Actions {
+		paths = append(paths, a.Path)
+	}
+	if !sort.StringsAreSorted(paths) {
+		t.Errorf("sweep rows not in sorted order: %v", paths)
+	}
+}
+
+// Finding 4: a regular file where a directory is declared must be a conflict,
+// not a silent adopt/update that leaves apply reporting success.
+func TestDirectoryDeclaredButFileOnDisk(t *testing.T) {
+	in := &ir.IR{Directories: []ir.Directory{{Path: "/etc/core/data", Mode: 0o755}}}
+	// A regular file (isDir:false) sits at the directory path, mode matching.
+	fs := memFS{"/etc/core/data": {mode: 0o755, isDir: false}}
+
+	plan, err := Compute(in, manifest.New(), fs)
+	if err != nil {
+		t.Fatal(err)
+	}
+	a := findAction(t, plan, "/etc/core/data")
+	if a.Action != ActionConflict {
+		t.Errorf("file-at-dir-path action = %s, want conflict", a.Action)
+	}
+}
+
+// Finding 6: HasErrors is distinct from HasChanges — an ActionError is an error
+// (exit 1), not a pending change (exit 2).
+func TestPlanHasErrorsSeparateFromHasChanges(t *testing.T) {
+	p := &Plan{Actions: []ResourceAction{{Action: ActionError}}}
+	if !p.HasErrors() {
+		t.Error("plan with an ActionError should report HasErrors")
+	}
+	if p.HasChanges() {
+		t.Error("an ActionError is not a pending change")
+	}
+}
+
+// erroringFS wraps a memFS and returns an I/O error for one designated path,
+// modeling an EPERM/transient failure on a single declared resource.
+type erroringFS struct {
+	memFS
+	failPath string
+}
+
+func (e erroringFS) Stat(path string) (hostfs.FileInfo, error) {
+	if path == e.failPath {
+		return hostfs.FileInfo{}, errors.New("permission denied")
+	}
+	return e.memFS.Stat(path)
+}
+
+func (e erroringFS) ReadFile(path string) ([]byte, error) {
+	if path == e.failPath {
+		return nil, errors.New("permission denied")
+	}
+	return e.memFS.ReadFile(path)
+}
+
+// D5: a stat/read failure on one declared path must degrade to a fail-closed
+// ActionError row without aborting the diff of every other resource.
+func TestDiffPerPathErrorIsolation(t *testing.T) {
+	in := &ir.IR{Files: []ir.File{
+		{Path: "/etc/magus.d/good", Mode: 0o644, Contents: []byte("hi")},
+		{Path: "/etc/magus.d/bad", Mode: 0o644, Contents: []byte("nope")},
+	}}
+	fsys := erroringFS{memFS: memFS{}, failPath: "/etc/magus.d/bad"}
+
+	plan, err := Compute(in, manifest.New(), fsys)
+	if err != nil {
+		t.Fatalf("Compute must not abort on a per-path error: %v", err)
+	}
+	good := findAction(t, plan, "/etc/magus.d/good")
+	if good.Action != ActionCreate {
+		t.Errorf("healthy resource action = %s, want create", good.Action)
+	}
+	bad := findAction(t, plan, "/etc/magus.d/bad")
+	if bad.Action != ActionError {
+		t.Errorf("failed resource action = %s, want error", bad.Action)
+	}
+	if bad.Reason == "" {
+		t.Error("error row should carry a reason")
+	}
 }
 
 // findAction returns the first action targeting path, or fails the test.
@@ -147,9 +246,6 @@ func TestConflictWhenNotOwnedAndContentDiffers(t *testing.T) {
 	a := findAction(t, plan, "/etc/magus.d/foo")
 	if a.Action != ActionConflict {
 		t.Errorf("Action = %s (%s), want conflict", a.Action, a.Reason)
-	}
-	if !plan.HasConflicts() {
-		t.Error("plan.HasConflicts() = false, want true")
 	}
 }
 

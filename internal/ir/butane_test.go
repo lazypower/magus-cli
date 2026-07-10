@@ -3,6 +3,7 @@ package ir
 import (
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
@@ -41,7 +42,7 @@ func TestLoadButaneMinimal(t *testing.T) {
 		t.Fatalf("write: %v", err)
 	}
 
-	got, _, err := LoadButane(path)
+	got, _, err := LoadButane(path, false)
 	if err != nil {
 		t.Fatalf("LoadButane: %v", err)
 	}
@@ -74,8 +75,90 @@ func TestLoadButaneMinimal(t *testing.T) {
 	if u.Name != "magus-healthcheck.timer" {
 		t.Errorf("Units[0].Name = %q", u.Name)
 	}
-	if !u.Enabled {
-		t.Errorf("Units[0].Enabled = false, want true")
+	if u.Enabled == nil || !*u.Enabled {
+		t.Errorf("Units[0].Enabled = %v, want &true", u.Enabled)
+	}
+}
+
+// A unit that omits `enabled` must load with Enabled == nil, not &false. This
+// is the tri-state contract: nil means "magus does not touch enablement", so a
+// unit declared only to attach a drop-in isn't disabled as a side effect.
+func TestLoadButaneEnabledOmittedIsNil(t *testing.T) {
+	doc := `variant: fcos
+version: "1.6.0"
+systemd:
+  units:
+    - name: magus-foo.service
+      dropins:
+        - name: 10-magus.conf
+          contents: |
+            [Service]
+            Environment=FOO=bar
+`
+	dir := t.TempDir()
+	path := filepath.Join(dir, "dropin.bu")
+	if err := os.WriteFile(path, []byte(doc), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	got, _, err := LoadButane(path, false)
+	if err != nil {
+		t.Fatalf("LoadButane: %v", err)
+	}
+	if len(got.Units) != 1 {
+		t.Fatalf("Units: want 1, got %d", len(got.Units))
+	}
+	if got.Units[0].Enabled != nil {
+		t.Errorf("Units[0].Enabled = %v, want nil (enablement not declared)", *got.Units[0].Enabled)
+	}
+}
+
+// enabled: false must load with Enabled == &false so magus actively disables.
+func TestLoadButaneEnabledFalse(t *testing.T) {
+	doc := `variant: fcos
+version: "1.6.0"
+systemd:
+  units:
+    - name: magus-foo.service
+      enabled: false
+      contents: |
+        [Service]
+        ExecStart=/bin/true
+`
+	dir := t.TempDir()
+	path := filepath.Join(dir, "disabled.bu")
+	if err := os.WriteFile(path, []byte(doc), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	got, _, err := LoadButane(path, false)
+	if err != nil {
+		t.Fatalf("LoadButane: %v", err)
+	}
+	if got.Units[0].Enabled == nil || *got.Units[0].Enabled {
+		t.Errorf("Units[0].Enabled = %v, want &false", got.Units[0].Enabled)
+	}
+}
+
+// mask: true is a security-relevant declaration magus does not reconcile in
+// v1; loading must reject it rather than silently drop it.
+func TestLoadButaneRejectsMask(t *testing.T) {
+	doc := `variant: fcos
+version: "1.6.0"
+systemd:
+  units:
+    - name: magus-foo.service
+      mask: true
+`
+	dir := t.TempDir()
+	path := filepath.Join(dir, "masked.bu")
+	if err := os.WriteFile(path, []byte(doc), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	_, _, err := LoadButane(path, false)
+	if err == nil {
+		t.Fatal("LoadButane accepted mask: true")
+	}
+	if !strings.Contains(err.Error(), "mask is not supported") {
+		t.Errorf("error did not explain mask rejection: %v", err)
 	}
 }
 
@@ -87,6 +170,8 @@ func TestDecodeSourceVariants(t *testing.T) {
 		want        string
 	}{
 		{"plain", "data:,hello%20world", "", "hello world"},
+		// A literal '+' must survive (PathUnescape, not QueryUnescape — D18).
+		{"plus-literal", "data:,a+b=c", "", "a+b=c"},
 		{"base64", "data:;base64,aGVsbG8=", "", "hello"},
 		{"with-mediatype", "data:text/plain;charset=utf-8;base64,aGVsbG8=", "", "hello"},
 		{"empty", "", "", ""},
@@ -128,7 +213,7 @@ func TestLoadButaneHTTP(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	got, _, err := LoadButane(srv.URL + "/magus.bu")
+	got, _, err := LoadButane(srv.URL+"/magus.bu", true)
 	if err != nil {
 		t.Fatalf("LoadButane: %v", err)
 	}
@@ -137,13 +222,56 @@ func TestLoadButaneHTTP(t *testing.T) {
 	}
 }
 
+func TestLoadButaneRejectsPlainHTTP(t *testing.T) {
+	// D19: an http:// source is refused by default (no network hit — the reject
+	// happens before the fetch). --insecure-http (the bool) is the opt-out.
+	_, _, err := LoadButane("http://example.com/magus.bu", false)
+	if err == nil {
+		t.Fatal("LoadButane accepted a plain-HTTP source without --insecure-http")
+	}
+	if !strings.Contains(err.Error(), "plain HTTP") {
+		t.Errorf("error did not explain the https requirement: %v", err)
+	}
+}
+
+func TestRejectInsecureRedirect(t *testing.T) {
+	// Finding 1: an https source that redirects to http must be refused unless
+	// --insecure-http, or the gate is bypassed.
+	httpReq := &http.Request{URL: mustURL(t, "http://evil.example/x")}
+	httpsReq := &http.Request{URL: mustURL(t, "https://ok.example/x")}
+
+	if err := rejectInsecureRedirect(false)(httpReq, nil); err == nil {
+		t.Error("redirect to http must be refused when insecure is off")
+	}
+	if err := rejectInsecureRedirect(true)(httpReq, nil); err != nil {
+		t.Errorf("redirect to http should be allowed with --insecure-http: %v", err)
+	}
+	if err := rejectInsecureRedirect(false)(httpsReq, nil); err != nil {
+		t.Errorf("redirect to https must be allowed: %v", err)
+	}
+	// Redirect-loop cap.
+	via := make([]*http.Request, 10)
+	if err := rejectInsecureRedirect(false)(httpsReq, via); err == nil {
+		t.Error("should stop after 10 redirects")
+	}
+}
+
+func mustURL(t *testing.T, raw string) *url.URL {
+	t.Helper()
+	u, err := url.Parse(raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return u
+}
+
 func TestLoadButaneHTTPNon200(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "not here", http.StatusNotFound)
 	}))
 	defer srv.Close()
 
-	if _, _, err := LoadButane(srv.URL + "/missing.bu"); err == nil {
+	if _, _, err := LoadButane(srv.URL+"/missing.bu", true); err == nil {
 		t.Error("LoadButane: want error on HTTP 404, got nil")
 	}
 }
@@ -157,12 +285,28 @@ func TestLoadButaneHTTPSizeCap(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	_, _, err := LoadButane(srv.URL)
+	_, _, err := LoadButane(srv.URL, true)
 	if err == nil {
 		t.Fatal("LoadButane: want size-cap error, got nil")
 	}
 	if !strings.Contains(err.Error(), "exceeds") {
 		t.Errorf("error message should mention size cap, got: %v", err)
+	}
+}
+
+func TestLoadButaneLocalSizeCap(t *testing.T) {
+	// A local file over the cap is refused, matching the HTTP path (D20).
+	dir := t.TempDir()
+	path := filepath.Join(dir, "big.bu")
+	if err := os.WriteFile(path, []byte(strings.Repeat("x", maxButaneSize+1024)), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	_, _, err := LoadButane(path, false)
+	if err == nil {
+		t.Fatal("LoadButane: want size-cap error on a large local file, got nil")
+	}
+	if !strings.Contains(err.Error(), "exceeds") {
+		t.Errorf("error should mention the size cap, got: %v", err)
 	}
 }
 
@@ -198,7 +342,7 @@ storage:
 	if err := os.WriteFile(path, []byte(doc), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	_, _, err := LoadButane(path)
+	_, _, err := LoadButane(path, false)
 	if err == nil {
 		t.Fatal("LoadButane accepted a deferred quadlet type (.kube)")
 	}

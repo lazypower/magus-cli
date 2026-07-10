@@ -6,6 +6,7 @@
 package apply
 
 import (
+	"errors"
 	"fmt"
 	"path/filepath"
 	"time"
@@ -276,11 +277,11 @@ func ObserveUnits(in *ir.IR, sd systemd.Manager) map[string]string {
 // failed/activating/…) or "unknown" if it can't be determined. Observation
 // only — never fatal.
 func activeState(sd systemd.Manager, name string) string {
-	state, err := sd.ActiveState(name)
+	status, err := sd.Show(name)
 	if err != nil {
 		return "unknown"
 	}
-	return state
+	return status.Active
 }
 
 func indexResources(in *ir.IR) map[string]pendingResource {
@@ -391,12 +392,18 @@ func applyQuadletDelete(p *policy.Policy, a diff.ResourceAction, w hostfs.Writer
 		oc.Err = err
 		return oc
 	}
-	// Stop (NOT disable --now): the generated service can't be disabled. Stop
-	// the container, then unlink the source so daemon-reload drops the unit.
-	if err := sd.Stop(svc); err != nil {
-		oc.Status = StatusErrored
-		oc.Err = fmt.Errorf("stop %s: %w", svc, err)
-		return oc
+	// Stop (NOT disable --now): the generated service can't be disabled. Only
+	// stop it if it's actually running — a quadlet whose generated service never
+	// materialized (e.g. the generator rejected an invalid .container source)
+	// isn't loaded, and `systemctl stop` on it would fail and wedge the delete
+	// forever. Tolerating "not active" lets the reconciler remove the bad source
+	// (D11). A real stop failure on a running service is still surfaced.
+	if status, _ := sd.Show(svc); status.IsActive() {
+		if err := sd.Stop(svc); err != nil {
+			oc.Status = StatusErrored
+			oc.Err = fmt.Errorf("stop %s: %w", svc, err)
+			return oc
+		}
 	}
 	if err := w.Remove(a.Path); err != nil {
 		oc.Status = StatusErrored
@@ -428,6 +435,14 @@ func applyOne(p *policy.Policy, a diff.ResourceAction, resources map[string]pend
 	case diff.ActionSkip:
 		oc.Status = StatusUnchanged
 		oc.Reason = "unchanged"
+		return oc
+
+	case diff.ActionError:
+		// Diff couldn't determine this path's state (stat/read failure). Refuse
+		// to touch it — fail-closed — and surface the error. Other resources
+		// were still planned and apply normally.
+		oc.Status = StatusErrored
+		oc.Err = errors.New(a.Reason)
 		return oc
 
 	case diff.ActionConflict, diff.ActionOrphaned:
@@ -531,6 +546,18 @@ func applyDirectoryCreateOrUpdate(a diff.ResourceAction, r pendingResource, w ho
 			return oc
 		}
 	} else { // Update
+		// Re-verify the path is still a directory at apply time. If it was
+		// replaced by a regular file since planning, chmod/chown-ing it and
+		// recording a directory entry would be wrong — skip, fail-closed.
+		if st, err := w.Stat(a.Path); err != nil {
+			oc.Status = StatusErrored
+			oc.Err = err
+			return oc
+		} else if !st.Exists || !st.IsDir {
+			oc.Status = StatusSkipped
+			oc.Reason = "drifted between plan and apply (no longer a directory)"
+			return oc
+		}
 		if err := w.Chmod(a.Path, r.Mode); err != nil {
 			oc.Status = StatusErrored
 			oc.Err = err
@@ -565,7 +592,7 @@ func applyDirectoryAdopt(a diff.ResourceAction, r pendingResource, w hostfs.Writ
 		oc.Err = err
 		return oc
 	}
-	if !st.Exists ||
+	if !st.Exists || !st.IsDir ||
 		st.Mode != r.Mode ||
 		(r.UID != nil && st.UID != *r.UID) ||
 		(r.GID != nil && st.GID != *r.GID) {
@@ -624,14 +651,15 @@ func diffKind(k manifest.Kind) diff.Kind {
 }
 
 // unitEvents tracks what happened to a unit's files during phase 1, so phase 3
-// can decide whether to enable, disable, restart, or skip.
+// can decide whether to enable, start, restart, or skip. Only the three signals
+// phase 2/3 actually consume are tracked: whether the body was created (→ enable
+// --now on a new enabled unit), whether the body was deleted (→ already
+// disabled+stopped), and whether any content mutation happened (→ daemon-reload
+// and restart-if-active).
 type unitEvents struct {
 	bodyCreated   bool
-	bodyUpdated   bool
-	bodyAdopted   bool
 	bodyDeleted   bool
-	dropInChange  bool // any drop-in create/update/delete (not adopt)
-	hasContentMut bool // any mutation that requires daemon-reload (excludes adopts)
+	hasContentMut bool // any create/update/delete requiring daemon-reload (excludes adopts)
 }
 
 func recordUnitEvent(ev *unitEvents, action diff.Action, isBody bool) {
@@ -639,25 +667,14 @@ func recordUnitEvent(ev *unitEvents, action diff.Action, isBody bool) {
 	case diff.ActionCreate:
 		if isBody {
 			ev.bodyCreated = true
-		} else {
-			ev.dropInChange = true
 		}
 		ev.hasContentMut = true
 	case diff.ActionUpdate:
-		if isBody {
-			ev.bodyUpdated = true
-		} else {
-			ev.dropInChange = true
-		}
 		ev.hasContentMut = true
 	case diff.ActionAdopt:
-		if isBody {
-			ev.bodyAdopted = true
-		}
 		// adopts don't trigger daemon-reload or restart
 	case diff.ActionDelete:
-		// Drop-in deletes get here (body deletes are routed elsewhere)
-		ev.dropInChange = true
+		// Drop-in deletes get here (body deletes are routed elsewhere).
 		ev.hasContentMut = true
 	}
 }
@@ -675,38 +692,63 @@ func anyUnitMutation(events map[string]*unitEvents) bool {
 // or a quadlet's *generated* .service name) after files + daemon-reload have
 // settled. Returns one outcome per systemctl operation performed.
 //
-// The same logic governs both units and quadlets — the only difference is
-// the service name a caller passes in, and the desiredEnabled flag (units
-// honor the IR's Enabled field; quadlets always pass true since the .container
-// format expresses always-on intent).
-func reconcileServiceState(serviceName string, desiredEnabled bool, ev *unitEvents, sd systemd.Manager) []Outcome {
+// desiredEnabled carries the IR's tri-state enablement (see ir.Unit.Enabled):
+//
+//	nil   → enablement is not declared; magus does not touch it. A unit
+//	        declared only to attach a drop-in must not be enabled or disabled
+//	        as a side effect of extending it.
+//	true  → ensure enabled
+//	false → ensure disabled
+func reconcileServiceState(serviceName string, desiredEnabled *bool, ev *unitEvents, sd systemd.Manager) []Outcome {
 	if ev.bodyDeleted {
 		// Stop+disable already happened in phase 1; nothing more to do.
 		return nil
 	}
 	var outcomes []Outcome
 
-	// Newly-created service: combine enable + start if desired enabled.
+	// Newly-created service: enable+start only when explicitly declared enabled.
+	// A freshly-written unit file is not enabled by default, so nil/false need
+	// no action at creation.
 	if ev.bodyCreated {
-		if desiredEnabled {
+		if desiredEnabled != nil && *desiredEnabled {
 			err := sd.EnableNow(serviceName)
 			outcomes = append(outcomes, unitOutcome(serviceName, "enable --now", err))
 		}
 		return outcomes
 	}
 
-	// Existing service: reconcile enablement every apply.
-	current, err := sd.IsEnabled(serviceName)
-	if err != nil {
-		outcomes = append(outcomes, unitOutcome(serviceName, "is-enabled", err))
-	} else {
-		switch {
-		case desiredEnabled && (current == systemd.EnablementDisabled || current == systemd.EnablementUnknown):
-			err := sd.Enable(serviceName)
-			outcomes = append(outcomes, unitOutcome(serviceName, "enable", err))
-		case !desiredEnabled && current == systemd.EnablementEnabled:
-			err := sd.Disable(serviceName)
-			outcomes = append(outcomes, unitOutcome(serviceName, "disable", err))
+	// Existing service. Both the enablement decision and the restart decision
+	// need live state, so fetch it once (Show = enablement + active in one
+	// systemctl call) — but only when there's actually a decision to make: a
+	// unit whose enablement is undeclared (nil) and whose content didn't change
+	// needs no query at all.
+	if desiredEnabled == nil && !ev.hasContentMut {
+		return outcomes
+	}
+	status, err := sd.Show(serviceName)
+
+	// Reconcile enablement every apply — but only when the IR declares it. The
+	// enable/disable/skip decision comes from diff.EnablementOp, the single
+	// authority the planner also uses, so plan and apply never diverge.
+	if desiredEnabled != nil {
+		if err != nil {
+			outcomes = append(outcomes, unitOutcome(serviceName, "show", err))
+		} else {
+			switch op, reason := diff.EnablementOp(desiredEnabled, status.Enablement); op {
+			case diff.ServiceEnable:
+				outcomes = append(outcomes, unitOutcome(serviceName, "enable", sd.Enable(serviceName)))
+			case diff.ServiceDisable:
+				outcomes = append(outcomes, unitOutcome(serviceName, "disable", sd.Disable(serviceName)))
+			case diff.ServiceSkip:
+				// Declared intent is unachievable (masked/static/not-found).
+				// Surface it as a skip instead of a silent no-op (D10).
+				outcomes = append(outcomes, Outcome{
+					Path:   serviceName,
+					Action: diff.ActionSkip,
+					Status: StatusSkipped,
+					Reason: reason,
+				})
+			}
 		}
 	}
 
@@ -714,8 +756,7 @@ func reconcileServiceState(serviceName string, desiredEnabled bool, ev *unitEven
 	// Inactive services whose content changed are rewritten only — the new
 	// content takes effect on next start. Logged for visibility.
 	if ev.hasContentMut {
-		active, _ := sd.IsActive(serviceName)
-		if active {
+		if err == nil && status.IsActive() {
 			err := sd.Restart(serviceName)
 			outcomes = append(outcomes, unitOutcome(serviceName, "restart", err))
 		} else {
@@ -750,8 +791,8 @@ func reconcileQuadletState(serviceName string, ev *unitEvents, sd systemd.Manage
 	}
 
 	if ev.hasContentMut {
-		active, _ := sd.IsActive(serviceName)
-		if active {
+		status, _ := sd.Show(serviceName)
+		if status.IsActive() {
 			err := sd.Restart(serviceName)
 			outcomes = append(outcomes, unitOutcome(serviceName, "restart", err))
 		} else {

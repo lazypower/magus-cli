@@ -60,6 +60,20 @@ func TestLoadWrongVersionIgnored(t *testing.T) {
 	}
 }
 
+func TestLoadUnreadableIsSurfaced(t *testing.T) {
+	// D21: a genuine read failure (here, the path is a directory) is distinct
+	// from "never applied" — it must return an error so the caller can warn
+	// instead of reporting last-apply (never).
+	dir := t.TempDir() // a directory is not a regular file → ReadFile errors
+	got, err := Load(dir)
+	if err == nil {
+		t.Error("unreadable status should surface an error, got nil")
+	}
+	if got != nil {
+		t.Errorf("unreadable status should return nil report, got %+v", got)
+	}
+}
+
 func TestBuildCarriesFirstSeenForward(t *testing.T) {
 	prior := &Report{Conflicts: []Conflict{
 		{Path: "/etc/core/old", Reason: "differs", FirstSeen: time.Unix(100, 0).UTC()},

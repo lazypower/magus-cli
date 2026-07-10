@@ -38,21 +38,27 @@ const (
 // error rather than halting the whole apply.
 var ErrUnavailable = errors.New("systemctl is unavailable on this host")
 
+// UnitStatus is a unit's persistent + runtime state, fetched in a single
+// `systemctl show` call: Enablement (from UnitFileState) and Active (the raw
+// is-active vocabulary). Combining the two into one query replaces the separate
+// is-enabled + is-active forks the reconcile/observe paths used to make.
+type UnitStatus struct {
+	Enablement Enablement
+	Active     string // "active"/"inactive"/"failed"/… or "unknown"
+}
+
+// IsActive reports whether the unit is currently running.
+func (s UnitStatus) IsActive() bool { return s.Active == "active" }
+
 // Manager is the operation surface apply needs. Keep it narrow — every method
 // here corresponds to a step in the spec's apply mechanics for units.
 type Manager interface {
 	// DaemonReload re-reads unit files. Run exactly once per apply, after
 	// all unit filesystem mutations and before enablement reconciliation.
 	DaemonReload() error
-	// IsEnabled returns the current enablement state.
-	IsEnabled(unit string) (Enablement, error)
-	// IsActive reports whether the unit is currently running.
-	IsActive(unit string) (bool, error)
-	// ActiveState returns the raw is-active state ("active", "inactive",
-	// "failed", "activating", …) or "unknown" when it can't be determined.
-	// Used for the status observation, which wants the real state, not a
-	// boolean.
-	ActiveState(unit string) (string, error)
+	// Show returns the unit's enablement and runtime state in one query
+	// (`systemctl show`), replacing the separate is-enabled/is-active forks.
+	Show(unit string) (UnitStatus, error)
 	// Enable persists the enablement symlinks but does not start the unit.
 	Enable(unit string) error
 	// EnableNow enables and starts the unit in one operation.
@@ -114,23 +120,13 @@ func (m *osManager) Restart(unit string) error    { return m.run("restart", unit
 func (m *osManager) Start(unit string) error      { return m.run("start", unit) }
 func (m *osManager) Stop(unit string) error       { return m.run("stop", unit) }
 
-func (m *osManager) IsEnabled(unit string) (Enablement, error) {
-	out, _ := m.runOutput("is-enabled", unit)
-	// systemctl is-enabled exits non-zero for "disabled" but still prints
-	// the state on stdout — so we ignore the error and parse the text.
-	return parseEnablement(out), nil
-}
-
-func (m *osManager) IsActive(unit string) (bool, error) {
-	out, _ := m.runOutput("is-active", unit)
-	return parseActiveState(out) == "active", nil
-}
-
-func (m *osManager) ActiveState(unit string) (string, error) {
-	// is-active exits non-zero for non-active states but still prints the
-	// state on stdout — parse the text, ignore the exit code.
-	out, _ := m.runOutput("is-active", unit)
-	return parseActiveState(out), nil
+func (m *osManager) Show(unit string) (UnitStatus, error) {
+	// `systemctl show` prints KEY=value lines and exits 0 even for a not-found
+	// unit (LoadState=not-found), so — like the old is-enabled/is-active — we
+	// parse the text and ignore the exit code.
+	out, _ := m.runOutput("show", unit,
+		"--property=LoadState", "--property=UnitFileState", "--property=ActiveState")
+	return parseShow(out), nil
 }
 
 // parseEnablement maps `systemctl is-enabled` output to the Enablement subset
@@ -152,6 +148,50 @@ func parseEnablement(out string) Enablement {
 	return EnablementUnknown
 }
 
+// parseShow parses `systemctl show -p LoadState -p UnitFileState -p ActiveState`
+// output (KEY=value lines) into a UnitStatus. Pure so it's unit-testable without
+// systemctl.
+func parseShow(out string) UnitStatus {
+	var loadState, unitFileState, activeState string
+	for _, line := range strings.Split(out, "\n") {
+		key, val, ok := strings.Cut(line, "=")
+		if !ok {
+			continue
+		}
+		switch key {
+		case "LoadState":
+			loadState = val
+		case "UnitFileState":
+			unitFileState = val
+		case "ActiveState":
+			activeState = val
+		}
+	}
+	return UnitStatus{
+		Enablement: enablementFromShow(loadState, unitFileState),
+		Active:     parseActiveState(activeState),
+	}
+}
+
+// enablementFromShow maps a unit's LoadState + UnitFileState to the Enablement
+// subset, matching `is-enabled` semantics. not-found and masked are recognized
+// by LoadState; otherwise UnitFileState carries the same vocabulary is-enabled
+// prints (enabled/disabled/static/…). An empty UnitFileState — a loaded unit
+// with no [Install] — is treated as static (is-enabled reports "static" for
+// these), so magus never tries to enable an un-enableable unit.
+func enablementFromShow(loadState, unitFileState string) Enablement {
+	switch loadState {
+	case "not-found":
+		return EnablementNotFound
+	case "masked", "masked-runtime":
+		return EnablementMasked
+	}
+	if unitFileState == "" {
+		return EnablementStatic
+	}
+	return parseEnablement(unitFileState)
+}
+
 // parseActiveState maps `systemctl is-active` output to the known state
 // vocabulary, or "unknown" for anything unexpected (e.g. systemd unreachable
 // noise on stderr). Pure so it's unit-testable without systemctl.
@@ -167,15 +207,13 @@ func parseActiveState(out string) string {
 type unavailableManager struct{}
 
 func (unavailableManager) DaemonReload() error { return ErrUnavailable }
-func (unavailableManager) IsEnabled(string) (Enablement, error) {
-	return EnablementUnknown, ErrUnavailable
+func (unavailableManager) Show(string) (UnitStatus, error) {
+	return UnitStatus{Enablement: EnablementUnknown, Active: "unknown"}, ErrUnavailable
 }
-func (unavailableManager) IsActive(string) (bool, error)      { return false, ErrUnavailable }
-func (unavailableManager) ActiveState(string) (string, error) { return "unknown", ErrUnavailable }
-func (unavailableManager) Enable(string) error                { return ErrUnavailable }
-func (unavailableManager) EnableNow(string) error             { return ErrUnavailable }
-func (unavailableManager) Disable(string) error               { return ErrUnavailable }
-func (unavailableManager) DisableNow(string) error            { return ErrUnavailable }
-func (unavailableManager) Restart(string) error               { return ErrUnavailable }
-func (unavailableManager) Start(string) error                 { return ErrUnavailable }
-func (unavailableManager) Stop(string) error                  { return ErrUnavailable }
+func (unavailableManager) Enable(string) error     { return ErrUnavailable }
+func (unavailableManager) EnableNow(string) error  { return ErrUnavailable }
+func (unavailableManager) Disable(string) error    { return ErrUnavailable }
+func (unavailableManager) DisableNow(string) error { return ErrUnavailable }
+func (unavailableManager) Restart(string) error    { return ErrUnavailable }
+func (unavailableManager) Start(string) error      { return ErrUnavailable }
+func (unavailableManager) Stop(string) error       { return ErrUnavailable }

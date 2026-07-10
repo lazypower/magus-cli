@@ -103,14 +103,25 @@ func Check(p *Policy, in *ir.IR, extraReserved ...string) []Violation {
 	return v
 }
 
-// modeEscalation enforces "no privilege escalation" — setuid, setgid, and
-// world-writable bits are off-limits regardless of where the path falls.
+// modeEscalation enforces "no privilege escalation" — setuid and setgid are
+// off-limits — and rejects any mode magus can't faithfully reconcile.
+//
+// The sticky bit is rejected too: magus manages the standard 0o777 permission
+// bits only (hostfs.Stat reports Mode().Perm(), and os.Chmod ignores the raw
+// 0o1000 bit — it's ModeSticky it honors, a different flag). A declared 0o1755
+// would therefore never converge: declared 0o1755 vs observed 0o755 flaps to
+// ActionUpdate on every apply forever. Rejecting it at load turns a silent
+// infinite flap into a clear "not supported" (D12). The classic sticky /tmp
+// mode 0o1777 is already rejected below for being world-writable.
 func modeEscalation(mode uint32) string {
 	if mode&0o4000 != 0 {
 		return fmt.Sprintf("mode %#o: setuid bit not permitted", mode)
 	}
 	if mode&0o2000 != 0 {
 		return fmt.Sprintf("mode %#o: setgid bit not permitted", mode)
+	}
+	if mode&0o1000 != 0 {
+		return fmt.Sprintf("mode %#o: sticky bit not supported (magus manages 0o777 permission bits only)", mode)
 	}
 	if mode&0o0002 != 0 {
 		return fmt.Sprintf("mode %#o: world-writable not permitted", mode)
