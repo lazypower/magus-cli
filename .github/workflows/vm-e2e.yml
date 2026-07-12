@@ -29,7 +29,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Make /dev/kvm usable by the job user
         run: |
@@ -50,7 +50,7 @@ jobs:
         run: GOOS=linux GOARCH=amd64 CGO_ENABLED=0 go build -o magus.linux ./cmd/magus
 
       - name: Cache the FCOS qcow2
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: ~/.cache/magus-vm
           key: fcos-stable-x86_64-${{ hashFiles('hack/vm/fixtures/**') }}
@@ -72,7 +72,7 @@ jobs:
 
       - name: Upload VM console log on failure
         if: failure()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: vm-console-log
           path: out/magus-e2e.*/console.log
