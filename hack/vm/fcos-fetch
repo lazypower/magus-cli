@@ -37,7 +37,9 @@ if [ -e "$link" ] && [ "$refresh" = no ]; then
 fi
 
 log "fetching FCOS $stream/$arch (signature-verified)…"
-out=$(coreos-installer download -s "$stream" -p qemu -f qcow2 \
+# Stream metadata publishes the qemu disk only as qcow2.xz; --decompress unpacks
+# it to a .qcow2 (validated by hand on FCOS 2026-07-12). -f qcow2 matches no key.
+out=$(coreos-installer download -s "$stream" -p qemu -f qcow2.xz \
         --architecture "$arch" --decompress -C "$dir")
 # coreos-installer prints the final path; e.g.
 #   <cache>/fedora-coreos-44.20260607.3.1-qemu.x86_64.qcow2
