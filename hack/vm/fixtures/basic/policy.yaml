@@ -1,0 +1,18 @@
+# Policy for the basic e2e fixture. Realistic shape: scoped roots, magus-*
+# unit namespace, a couple of illustrative denies.
+version: 1
+
+file_roots:
+  - /etc/magus.d
+  - /var/data
+  - /var/lib/magus
+
+unit_patterns:
+  - "magus-*"
+
+deny:
+  paths:
+    - /etc/shadow
+  units:
+    - "sshd.*"
+    - "systemd-*"
