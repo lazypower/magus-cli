@@ -1,0 +1,42 @@
+# magus VM-harness container — pins the whole VM toolchain (qemu, butane,
+# coreos-installer, edk2) into one image so the harness runs identically on
+# any Linux host with /dev/kvm: dev desktop, act_runner, GitHub Actions.
+#
+#   build:  podman build -t magus-vm-harness -f hack/vm/Containerfile hack/vm/
+#   run:    podman run --rm -it --device /dev/kvm \
+#             -v magus-vm-cache:/cache \
+#             -v "$PWD:/work:z" -p 2222:2222 \
+#             magus-vm-harness e2e --fixture /work/hack/vm/fixtures/basic \
+#                                  --magus /work/magus --reboot
+#
+# macOS note: this container is NOT the Mac path — a container on macOS lives
+# inside a Linux VM and only has TCG. On the Mac, run the same scripts
+# natively (brew install qemu butane coreos-installer) and HVF is picked up
+# automatically. One codebase, two packagings.
+
+ARG BASE=registry.fedoraproject.org/fedora:42
+FROM ${BASE}
+
+RUN dnf install -y --setopt=install_weak_deps=False \
+      qemu-system-x86-core \
+      qemu-system-aarch64-core \
+      edk2-aarch64 \
+      butane \
+      coreos-installer \
+      openssh-clients \
+      jq \
+    && dnf clean all
+
+COPY common.sh fcos-fetch fcos-run fcos-e2e /usr/local/bin/
+COPY fixtures/ /usr/local/share/magus-vm/fixtures/
+RUN chmod +x /usr/local/bin/fcos-fetch /usr/local/bin/fcos-run /usr/local/bin/fcos-e2e
+
+# Image cache lives on a named volume so CI can persist it across runs and
+# the qcow2 is fetched (and signature-verified) once, not per job.
+ENV MAGUS_VM_CACHE=/cache
+VOLUME /cache
+
+COPY entrypoint.sh /usr/local/bin/entrypoint.sh
+RUN chmod +x /usr/local/bin/entrypoint.sh
+ENTRYPOINT ["/usr/local/bin/entrypoint.sh"]
+CMD ["help"]

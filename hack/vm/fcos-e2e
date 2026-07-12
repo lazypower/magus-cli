@@ -1,0 +1,154 @@
+#!/usr/bin/env bash
+# fcos-e2e — the full two-consumer lifecycle against a real FCOS VM:
+#
+#   Ignition paves (day 1)  →  magus adopts  →  idempotence  →  day-2 mutation
+#   →  (optional) reboot  →  declared state survived
+#
+# This is the test the podman tier structurally cannot run: a genuine
+# Ignition first boot, and persistence across a real reboot (the spec's unit
+# of correctness).
+#
+# usage: fcos-e2e --fixture DIR --magus BIN [--arch A] [--reboot] [--keep] [--port N]
+#
+# Fixture directory contract:
+#   day1.bu      Butane consumed by BOTH Ignition (rendered, merged at boot)
+#                and magus (day-1 source). This duality is the point.
+#   day2.bu      Mutated declaration (content changes, additions, omissions).
+#   policy.yaml  The policy magus runs under (installed to /etc/magus/).
+#
+# The magus binary must be built for the guest: GOOS=linux GOARCH=<arch>.
+
+set -euo pipefail
+. "$(dirname "$0")/common.sh"
+
+fixture="" magus="" arch="$(host_arch)" reboot=no keep=no port=2222
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --fixture) fixture="$2"; shift 2 ;;
+    --magus)   magus="$2"; shift 2 ;;
+    --arch)    arch="$2"; shift 2 ;;
+    --port)    port="$2"; shift 2 ;;
+    --reboot)  reboot=yes; shift ;;
+    --keep)    keep=yes; shift ;;
+    *) die "unknown arg: $1" ;;
+  esac
+done
+[ -d "$fixture" ] || die "--fixture DIR is required"
+[ -f "$magus" ]   || die "--magus BIN is required (GOOS=linux GOARCH=$arch build)"
+for f in day1.bu day2.bu policy.yaml; do
+  [ -f "$fixture/$f" ] || die "fixture is missing $f"
+done
+have butane || die "butane not found"
+
+work="$(mktemp -d "${TMPDIR:-/tmp}/magus-e2e.XXXXXX")"
+pidfile="$work/qemu.pid" console="$work/console.log" key="$work/id"
+cleanup() {
+  local rc=$?
+  if [ "$keep" = yes ]; then
+    log "--keep: VM left running (pid $(cat "$pidfile" 2>/dev/null || echo '?'), ssh -i $key -p $port core@127.0.0.1)"
+    return
+  fi
+  [ -f "$pidfile" ] && kill "$(cat "$pidfile")" 2>/dev/null || true
+  if [ $rc -ne 0 ]; then
+    log "FAILED (rc=$rc) — console log preserved at: $console"
+    log "workdir preserved at: $work"
+  else
+    rm -rf "$work"
+  fi
+}
+trap cleanup EXIT
+
+# ---- 1. render: fixture butane → ignition; wrap with harness access -------
+ssh-keygen -q -t ed25519 -N '' -f "$key"
+butane --strict "$fixture/day1.bu" -o "$work/day1.ign"
+
+# harness.bu: ssh access for the harness + merge the fixture's own ignition.
+# The fixture is merged, not inlined — Ignition paves exactly what the fixture
+# declares, and the day-1 magus apply must then adopt it.
+cat > "$work/harness.bu" <<EOF
+variant: fcos
+version: 1.6.0
+ignition:
+  config:
+    merge:
+      - local: day1.ign
+passwd:
+  users:
+    - name: core
+      ssh_authorized_keys:
+        - $(cat "$key.pub")
+EOF
+butane --strict --files-dir "$work" "$work/harness.bu" -o "$work/boot.ign"
+
+# ---- 2. boot ---------------------------------------------------------------
+"$(dirname "$0")/fcos-run" --ignition "$work/boot.ign" --arch "$arch" \
+  --port "$port" --console "$console" --detach "$pidfile"
+wait_ssh "$key" "$port" || die "guest never became ssh-reachable (see $console)"
+
+run()  { vm_ssh "$key" "$port" "$@"; }
+put()  { vm_scp "$key" "$port" "$1" "$2"; }
+
+# expect <want-rc> <label> <cmd...> — run, compare exit code, log verdict.
+expect() {
+  local want="$1" label="$2"; shift 2
+  local rc=0; run "$@" || rc=$?
+  if [ "$rc" -ne "$want" ]; then
+    die "$label: expected exit $want, got $rc"
+  fi
+  log "ok: $label (exit $rc)"
+}
+
+# ---- 3. install magus + fixture inputs ------------------------------------
+put "$magus" magus
+put "$fixture/policy.yaml" policy.yaml
+put "$fixture/day1.bu" day1.bu
+put "$fixture/day2.bu" day2.bu
+run sudo install -m0755 magus /usr/local/bin/magus       # /usr/local → /var (writable on ostree)
+run sudo install -D -m0644 policy.yaml /etc/magus/policy.yaml
+run sudo mkdir -p /var/lib/magus
+run magus version
+
+# ---- 4. the handoff: Ignition paved it, magus must adopt it ----------------
+expect 0 "validate day1"            sudo magus validate day1.bu
+expect 2 "plan day1 has pending"    sudo magus plan day1.bu
+plan="$(run sudo magus plan day1.bu || true)"
+echo "$plan" | grep -q '\[adopt\]' || die "handoff: expected [adopt] rows, got: $plan"
+if echo "$plan" | grep -q '\[conflict\]'; then
+  die "handoff: unexpected [conflict]: $plan"
+fi
+if echo "$plan" | grep -q '\[create\]'; then
+  die "handoff: Ignition should have paved everything, found [create]: $plan"
+fi
+log "ok: day1 plan is adopt-only"
+
+expect 0 "apply day1 (adopt)"       sudo magus apply --yes day1.bu
+expect 0 "plan day1 idempotent"     sudo magus plan day1.bu
+expect 0 "apply day1 idempotent"    sudo magus apply --yes day1.bu
+expect 0 "status --check converged" sudo magus status --check
+
+# ---- 5. day 2: mutate, converge -------------------------------------------
+expect 2 "plan day2 has pending"    sudo magus plan day2.bu
+expect 0 "apply day2"               sudo magus apply --yes day2.bu
+expect 0 "plan day2 idempotent"     sudo magus plan day2.bu
+
+# fixture-specific post-conditions (optional hook)
+if [ -x "$fixture/assert.sh" ]; then
+  log "running fixture assertions…"
+  MAGUS_SSH_KEY="$key" MAGUS_SSH_PORT="$port" "$fixture/assert.sh" || die "fixture assert.sh failed"
+fi
+
+# ---- 6. optional: the spec's unit of correctness ---------------------------
+if [ "$reboot" = yes ]; then
+  log "rebooting guest…"
+  run sudo systemctl reboot || true      # connection drops; that's the point
+  sleep 5
+  wait_ssh "$key" "$port" 300 || die "guest did not come back from reboot (see $console)"
+  expect 0 "post-reboot plan day2 converged" sudo magus plan day2.bu
+  expect 0 "post-reboot status --check"      sudo magus status --check
+  if [ -x "$fixture/assert.sh" ]; then
+    MAGUS_SSH_KEY="$key" MAGUS_SSH_PORT="$port" "$fixture/assert.sh" || die "post-reboot assert.sh failed"
+  fi
+fi
+
+suffix=converged; [ "$reboot" = yes ] && suffix="reboot-converged"
+log "PASS: full lifecycle (pave → adopt → idempotent → day-2 → $suffix)"
