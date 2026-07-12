@@ -1,0 +1,29 @@
+# Dependabot — magus-cli is github-authority; dependency autopatching lives here.
+# github → gitea is a read-only pull-mirror, so this is the one place deps move.
+version: 2
+updates:
+  - package-ecosystem: gomod
+    directory: /
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 10
+    groups:
+      # Bundle non-major bumps so patch/minor autopatch as one reviewable PR.
+      go-minor-patch:
+        update-types:
+          - minor
+          - patch
+    commit-message:
+      prefix: "deps(go)"
+
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 10
+    groups:
+      actions-all:
+        patterns:
+          - "*"
+    commit-message:
+      prefix: "ci(actions)"
