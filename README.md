@@ -53,6 +53,12 @@ the system hostage. Exit codes: `0` clean, `2` skipped (conflict/orphan/drift),
 The authority model, manifest semantics, and equivalence rules live in
 [`docs/spec-reconciler.md`](docs/spec-reconciler.md).
 
+magus is **system-scope**: it reconciles system units and root-podman quadlets,
+and its `status` is honest about what it checked and silent about what it didn't.
+Before using it to deploy a **rootless / user-scope** workload, read
+[`docs/scope-and-status-honesty.md`](docs/scope-and-status-honesty.md) — magus can
+report a clean, converged status while a user-scope workload does nothing.
+
 ## Build
 
 ```sh
