@@ -1,0 +1,29 @@
+# basic fixture, day 1 — consumed by BOTH Ignition (first boot pave) and
+# magus (day-1 apply, which must adopt everything below without a write).
+variant: fcos
+version: 1.6.0
+storage:
+  files:
+    - path: /etc/magus.d/hello.env
+      mode: 0644
+      contents:
+        inline: |
+          GREETING=hello
+  directories:
+    - path: /var/data/hello
+      mode: 0755
+systemd:
+  units:
+    - name: magus-hello.service
+      enabled: true
+      contents: |
+        [Unit]
+        Description=magus e2e canary
+
+        [Service]
+        Type=simple
+        EnvironmentFile=/etc/magus.d/hello.env
+        ExecStart=/usr/bin/bash -c 'echo "magus-hello: ${GREETING}"; exec sleep infinity'
+
+        [Install]
+        WantedBy=multi-user.target

@@ -1,0 +1,52 @@
+#!/usr/bin/env bash
+# fcos-fetch — download and verify the official FCOS qemu image into the cache.
+#
+# Uses coreos-installer, which fetches from the stream metadata and verifies
+# the GPG signature — we never boot an unverified image (same posture as the
+# spec's remote-source integrity rule).
+#
+# usage: fcos-fetch [--arch x86_64|aarch64] [--stream stable] [--refresh]
+#
+# Maintains a stable symlink  <cache>/fcos-<arch>-<stream>.qcow2  and a pin
+# file <cache>/fcos-<arch>-<stream>.version recording what was fetched. With a
+# pin present and no --refresh, an existing image is reused as-is (CI caches
+# key on the pin file).
+
+set -euo pipefail
+. "$(dirname "$0")/common.sh"
+
+arch="$(host_arch)"; stream=stable; refresh=no
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --arch)    arch="$2"; shift 2 ;;
+    --stream)  stream="$2"; shift 2 ;;
+    --refresh) refresh=yes; shift ;;
+    *) die "unknown arg: $1" ;;
+  esac
+done
+
+have coreos-installer || die "coreos-installer not found (dnf install coreos-installer / brew install coreos-installer)"
+
+dir="$(cache_dir)"; mkdir -p "$dir"
+link="$(image_link "$arch" "$stream")"
+pin="${link%.qcow2}.version"
+
+if [ -e "$link" ] && [ "$refresh" = no ]; then
+  log "cached: $(readlink "$link" 2>/dev/null || echo "$link") ($(cat "$pin" 2>/dev/null || echo unpinned))"
+  exit 0
+fi
+
+log "fetching FCOS $stream/$arch (signature-verified)…"
+# Stream metadata publishes the qemu disk only as qcow2.xz; --decompress unpacks
+# it to a .qcow2 (validated by hand on FCOS 2026-07-12). -f qcow2 matches no key.
+out=$(coreos-installer download -s "$stream" -p qemu -f qcow2.xz \
+        --architecture "$arch" --decompress -C "$dir")
+# coreos-installer prints the final path; e.g.
+#   <cache>/fedora-coreos-44.20260607.3.1-qemu.x86_64.qcow2
+img="$(echo "$out" | tail -n1)"
+[ -f "$img" ] || die "download did not produce an image (got: $out)"
+
+version="$(basename "$img" | sed -E 's/^fedora-coreos-(.+)-qemu\..*/\1/')"
+ln -sf "$(basename "$img")" "$link"
+echo "$version" > "$pin"
+log "pinned $arch/$stream → $version"

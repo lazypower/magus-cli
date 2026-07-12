@@ -1,0 +1,40 @@
+# basic fixture, day 2 — the mutation magus must converge on a running system:
+# changed env content, changed unit content (→ restart-if-active), one new file.
+#
+# NOTE: the unit content change is deliberate. Until the apply-graph notify
+# edges land (ADR-0002 / WP B3), an EnvironmentFile-only change does NOT
+# restart the consumer — that gap is the ADR's motivating case. When B3 lands,
+# add a day3.bu that changes ONLY hello.env and assert the restart.
+variant: fcos
+version: 1.6.0
+storage:
+  files:
+    - path: /etc/magus.d/hello.env
+      mode: 0644
+      contents:
+        inline: |
+          GREETING=day2
+    - path: /etc/magus.d/extra.env
+      mode: 0644
+      contents:
+        inline: |
+          EXTRA=1
+  directories:
+    - path: /var/data/hello
+      mode: 0755
+systemd:
+  units:
+    - name: magus-hello.service
+      enabled: true
+      contents: |
+        [Unit]
+        Description=magus e2e canary
+
+        [Service]
+        Type=simple
+        Environment=DAY=2
+        EnvironmentFile=/etc/magus.d/hello.env
+        ExecStart=/usr/bin/bash -c 'echo "magus-hello: ${GREETING}"; exec sleep infinity'
+
+        [Install]
+        WantedBy=multi-user.target

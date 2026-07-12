@@ -1,0 +1,79 @@
+name: vm-e2e
+
+# Real-FCOS end-to-end: Ignition paves the declared state at first boot, then
+# magus must adopt it, converge day-2 changes, and hold across a reboot. Runs
+# the hack/vm/ harness container against a KVM-accelerated FCOS VM on GitHub's
+# ubuntu-latest (which has had working /dev/kvm since 2024).
+#
+# The container path is deliberate: the Fedora-based harness image bakes in
+# qemu + butane + coreos-installer, so the runner needs nothing but podman and
+# a usable /dev/kvm. See docs/adr-0001-test-substrate.md (tier 2a).
+#
+# Schedule fires only from the default branch, per GitHub. To trial a change on
+# a branch, use "Run workflow" (workflow_dispatch) or label a PR `vm-e2e`.
+
+on:
+  schedule:
+    - cron: '17 7 * * *'        # nightly, ~07:17 UTC
+  workflow_dispatch: {}
+  pull_request:
+    types: [labeled]
+
+concurrency:
+  group: vm-e2e-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  e2e:
+    if: github.event_name != 'pull_request' || github.event.label.name == 'vm-e2e'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Make /dev/kvm usable by the job user
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' \
+            | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+          ls -l /dev/kvm
+
+      - name: Install podman
+        run: sudo apt-get update && sudo apt-get install -y podman
+
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+
+      - name: Build guest magus (linux/amd64)
+        run: GOOS=linux GOARCH=amd64 CGO_ENABLED=0 go build -o magus.linux ./cmd/magus
+
+      - name: Cache the FCOS qcow2
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/magus-vm
+          key: fcos-stable-x86_64-${{ hashFiles('hack/vm/fixtures/**') }}
+          restore-keys: fcos-stable-x86_64-
+
+      - name: Build the harness image
+        run: podman build -t magus-vm-harness -f hack/vm/Containerfile hack/vm/
+
+      - name: e2e — pave → adopt → idempotent → day-2 → reboot
+        run: |
+          mkdir -p ~/.cache/magus-vm out
+          podman run --rm --device /dev/kvm \
+            -e TMPDIR=/work/out \
+            -v "$HOME/.cache/magus-vm:/cache" \
+            -v "$PWD:/work" \
+            magus-vm-harness e2e \
+              --fixture /work/hack/vm/fixtures/basic \
+              --magus /work/magus.linux --reboot
+
+      - name: Upload VM console log on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: vm-console-log
+          path: out/magus-e2e.*/console.log
+          if-no-files-found: warn

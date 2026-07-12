@@ -1,0 +1,81 @@
+#!/usr/bin/env bash
+# fcos-run — boot a throwaway FCOS VM with an Ignition config.
+#
+# The disk is always opened with -snapshot: the cached image is never written,
+# every boot is pristine, teardown is `kill`.
+#
+# usage: fcos-run --ignition cfg.ign [options]
+#   --ignition FILE   Ignition config (required; rendered, not butane)
+#   --arch A          guest arch (default: host arch)
+#   --stream S        FCOS stream (default: stable)
+#   --image PATH      explicit qcow2 (default: cache via fcos-fetch)
+#   --port N          host port forwarded to guest :22 (default: 2222)
+#   --memory MB       (default: 2048)   --cpus N  (default: 2)
+#   --console FILE    serial console log (default: ./console.log when detached)
+#   --detach PIDFILE  daemonize; write qemu pid to PIDFILE
+#
+# Acceleration is auto-detected (kvm on Linux, hvf on macOS, tcg fallback with
+# a loud warning). Ignition is injected via fw_cfg opt/com.coreos/config — the
+# canonical qemu-platform mechanism, identical across all hosts and CI.
+
+set -euo pipefail
+. "$(dirname "$0")/common.sh"
+
+ign="" arch="$(host_arch)" stream=stable image="" port=2222
+memory=2048 cpus=2 console="" pidfile=""
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --ignition) ign="$2"; shift 2 ;;
+    --arch)     arch="$2"; shift 2 ;;
+    --stream)   stream="$2"; shift 2 ;;
+    --image)    image="$2"; shift 2 ;;
+    --port)     port="$2"; shift 2 ;;
+    --memory)   memory="$2"; shift 2 ;;
+    --cpus)     cpus="$2"; shift 2 ;;
+    --console)  console="$2"; shift 2 ;;
+    --detach)   pidfile="$2"; shift 2 ;;
+    *) die "unknown arg: $1" ;;
+  esac
+done
+[ -n "$ign" ] && [ -f "$ign" ] || die "--ignition FILE is required"
+
+if [ -z "$image" ]; then
+  "$(dirname "$0")/fcos-fetch" --arch "$arch" --stream "$stream"
+  image="$(image_link "$arch" "$stream")"
+fi
+[ -e "$image" ] || die "image not found: $image"
+
+acc="$(accel "$arch")"
+[ "$acc" = tcg ] && log "WARNING: no same-arch accelerator for $arch — TCG emulation (slow)"
+
+qemu="qemu-system-$arch"
+have "$qemu" || die "$qemu not found"
+
+args=(
+  -name "magus-fcos-$port"
+  -m "$memory" -smp "$cpus"
+  -snapshot -drive "if=virtio,file=$image"
+  -fw_cfg "name=opt/com.coreos/config,file=$ign"
+  -nic "user,model=virtio-net-pci,hostfwd=tcp::${port}-:22"
+  -display none
+)
+case "$acc" in
+  kvm) args+=(-accel kvm -cpu host) ;;
+  hvf) args+=(-accel hvf -cpu host) ;;
+  tcg) args+=(-accel tcg -cpu max) ;;
+esac
+case "$arch" in
+  x86_64)  args+=(-machine q35) ;;
+  aarch64) args+=(-machine virt -bios "$(find_aarch64_fw)") ;;
+esac
+
+if [ -n "$pidfile" ]; then
+  console="${console:-console.log}"
+  args+=(-serial "file:$console" -pidfile "$pidfile" -daemonize)
+  log "booting FCOS $arch ($acc), ssh -p $port, console → $console"
+  exec "$qemu" "${args[@]}"
+else
+  [ -n "$console" ] && args+=(-serial "file:$console") || args+=(-serial mon:stdio)
+  log "booting FCOS $arch ($acc), ssh -p $port (Ctrl-A X to quit)"
+  exec "$qemu" "${args[@]}"
+fi
