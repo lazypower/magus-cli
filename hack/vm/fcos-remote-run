@@ -1,0 +1,62 @@
+#!/usr/bin/env bash
+# fcos-remote-run — the single narrow remote entry point (invoked by
+# fcos-remote; the command a forced-command ssh key / magus-ci identity pins to).
+#
+# Runs the FCOS e2e in a disposable container against local /dev/kvm, serialized
+# by a flock so a dev gate and the nightly can't collide. On failure it prints
+# the VM serial console to stdout before exiting with the e2e's code — so red
+# comes back through this one channel with no extra path to widen.
+#
+# Layout (created by fcos-remote): <base>/vm/ (this script + harness), plus the
+# siblings <base>/magus.linux, <base>/out, <base>/.lock.
+set -uo pipefail
+
+base="$(cd "$(dirname "$0")/.." && pwd)"
+vm="$base/vm" magus="$base/magus.linux" out="$base/out" lock="$base/.lock"
+
+arch=x86_64 reboot="" fixture=basic
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --arch)    arch="$2"; shift 2 ;;
+    --reboot)  reboot=--reboot; shift ;;
+    --fixture) fixture="$2"; shift 2 ;;
+    *) echo "fcos-remote-run: unknown arg: $1" >&2; exit 2 ;;
+  esac
+done
+
+fx="$vm/fixtures/$fixture"
+[ -x "$magus" ] || { echo "guest binary missing: $magus" >&2; exit 2; }
+[ -d "$fx" ]    || { echo "fixture missing: $fx" >&2; exit 2; }
+
+rm -rf "$out"; mkdir -p "$out"
+
+# serialize runs on this host (dev gate vs. nightly)
+exec 9>"$lock"; flock 9
+
+# build the harness image (cached layers) then run the e2e inside it. :Z is
+# required — FCOS is SELinux-enforcing, so bind mounts must be relabeled.
+podman build -q -t magus-vm-harness -f "$vm/Containerfile" "$vm" >/dev/null
+
+reboot_arg=(); [ "$reboot" = --reboot ] && reboot_arg=(--reboot)
+
+set +e
+podman run --rm --device /dev/kvm \
+  -e TMPDIR=/out \
+  -v magus-vm-cache:/cache \
+  -v "$vm:/work:Z" \
+  -v "$magus:/magus.linux:ro,Z" \
+  -v "$out:/out:Z" \
+  magus-vm-harness e2e \
+    --arch "$arch" \
+    --fixture "/work/fixtures/$fixture" \
+    --magus /magus.linux \
+    "${reboot_arg[@]}"
+rc=$?
+set -e
+
+if [ "$rc" -ne 0 ]; then
+  echo "===== fcos-remote-run: e2e FAILED (rc=$rc) — VM serial console follows ====="
+  cat "$out"/magus-e2e.*/console.log 2>/dev/null || echo "(no console log captured)"
+  echo "===== end console (rc=$rc) ====="
+fi
+exit "$rc"
