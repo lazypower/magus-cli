@@ -1,0 +1,56 @@
+#!/usr/bin/env bash
+# fcos-remote — run the FCOS e2e on a remote KVM host, driven from here.
+#
+# The remote ($MAGUS_VM_HOST) does all VM work in a disposable container; this
+# side ships the harness + a freshly-built guest magus, invokes ONE narrow
+# entry point (fcos-remote-run), streams its output live, and propagates its
+# exit code as the gate's verdict. Red is self-reported: on failure the remote
+# prints the VM serial console to its own stdout before exiting non-zero, so the
+# whole story returns through this single ssh channel.
+#
+# Hardened for a future locked-down endpoint: the remote side is one pinnable
+# command (fcos-remote-run), so a forced-command ssh key or a dedicated
+# `magus-ci` identity drops in with no change here.
+#
+# usage: MAGUS_VM_HOST=<ssh-host> hack/vm/fcos-remote
+#          [--arch x86_64|aarch64] [--fixture NAME] [--no-reboot]
+set -euo pipefail
+. "$(dirname "$0")/common.sh"
+
+host="${MAGUS_VM_HOST:-}"
+[ -n "$host" ] || die "set MAGUS_VM_HOST=<ssh-host> — the remote KVM box"
+
+arch=x86_64 fixture=basic reboot=--reboot
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --arch)      arch="$2"; shift 2 ;;
+    --fixture)   fixture="$2"; shift 2 ;;
+    --no-reboot) reboot=""; shift ;;
+    *) die "unknown arg: $1" ;;
+  esac
+done
+
+root="$(cd "$(dirname "$0")/../.." && pwd)"
+[ -d "$root/hack/vm/fixtures/$fixture" ] || die "no such fixture: $fixture"
+goarch=amd64; [ "$arch" = aarch64 ] && goarch=arm64
+
+tmp="$(mktemp -d)"; trap 'rm -rf "$tmp"' EXIT
+
+log "building guest magus (linux/$goarch)…"
+( cd "$root" && GOOS=linux GOARCH="$goarch" CGO_ENABLED=0 \
+    go build -o "$tmp/magus.linux" ./cmd/magus )
+
+# One scratch dir holds all remote state: harness is a pure mirror of hack/vm/
+# (safe for rsync --delete); the binary and run artifacts are its siblings, so
+# the mirror sync never touches them.
+rdir=".cache/magus-remote-e2e"
+log "syncing harness + magus → $host:$rdir (one open window covers the run)…"
+ssh "$host" "mkdir -p '$rdir'"
+rsync -az --delete "$root/hack/vm/" "$host:$rdir/vm/"
+rsync -az "$tmp/magus.linux" "$host:$rdir/magus.linux"
+
+log "e2e on $host (arch=$arch, fixture=$fixture) — streaming; red carries the console…"
+# Single narrow invocation. $reboot is intentionally word-split into the remote
+# command string (empty or --reboot).
+# shellcheck disable=SC2029,SC2086
+ssh "$host" "'$rdir/vm/fcos-remote-run' --arch '$arch' --fixture '$fixture' $reboot"
