@@ -1,6 +1,62 @@
 package diff
 
-import "testing"
+import (
+	"reflect"
+	"testing"
+)
+
+func TestUnitValues(t *testing.T) {
+	cases := []struct {
+		name     string
+		contents string
+		key      string
+		want     []string
+	}{
+		{
+			name:     "single value, spacing normalized",
+			contents: "[Service]\nEnvironmentFile = /etc/app.env\n",
+			key:      "EnvironmentFile",
+			want:     []string{"/etc/app.env"},
+		},
+		{
+			name:     "repeated key returns all, in order",
+			contents: "[Container]\nNetwork=a.network\nNetwork=b.network\n",
+			key:      "Network",
+			want:     []string{"a.network", "b.network"},
+		},
+		{
+			name:     "comments and blanks ignored",
+			contents: "# c\n[Service]\n\nEnvironmentFile=/x\n; c2\n",
+			key:      "EnvironmentFile",
+			want:     []string{"/x"},
+		},
+		{
+			name:     "section headers never match",
+			contents: "[Service]\nType=simple\n",
+			key:      "Service",
+			want:     nil,
+		},
+		{
+			name:     "absent key yields nil",
+			contents: "[Service]\nType=simple\n",
+			key:      "Network",
+			want:     nil,
+		},
+		{
+			name:     "value may contain equals",
+			contents: "[Container]\nVolume=data.volume:/data=x\n",
+			key:      "Volume",
+			want:     []string{"data.volume:/data=x"},
+		},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			if got := UnitValues(c.contents, c.key); !reflect.DeepEqual(got, c.want) {
+				t.Errorf("UnitValues(%q, %q) = %v, want %v", c.contents, c.key, got, c.want)
+			}
+		})
+	}
+}
 
 func TestCanonicalizeUnit(t *testing.T) {
 	cases := []struct {

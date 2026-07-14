@@ -2,6 +2,26 @@ package diff
 
 import "strings"
 
+// UnitValues returns every value assigned to key in a unit/quadlet/drop-in body,
+// in file order. It reuses CanonicalizeUnit so there is exactly one opinion about
+// unit-file shape: the body is canonicalized (blank/comment lines dropped,
+// "k = v" spacing normalized) and then each "key=value" line whose key matches is
+// collected. A key may legitimately repeat (EnvironmentFile=, Network=,
+// Volume=), so all values are returned.
+//
+// Matching is case-sensitive and section-agnostic — magus's edge derivation only
+// consults keys whose value is a plain path or quadlet name (EnvironmentFile=,
+// Network=, Volume=), and those key names are unambiguous across sections.
+func UnitValues(contents, key string) []string {
+	var out []string
+	for line := range strings.SplitSeq(CanonicalizeUnit(contents), "\n") {
+		if k, v, ok := strings.Cut(line, "="); ok && k == key {
+			out = append(out, v)
+		}
+	}
+	return out
+}
+
 // CanonicalizeUnit normalizes a systemd unit file or drop-in to its
 // behavior-significant form. The output is what diff hashes for equivalence:
 // two unit files that canonicalize to the same bytes have the same effect on
