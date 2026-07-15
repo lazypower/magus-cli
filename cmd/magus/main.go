@@ -26,6 +26,7 @@ Usage: magus <command> [flags]
 Commands:
   validate    Parse a Butane source and check it against the policy
   plan        Show what apply would do
+  graph       Show the apply-ordering graph derived from a plan
   apply       Reconcile the system toward the declared state
   status      Print reconciler state from the manifest
   adopt       Take over an existing path that differs from the IR
@@ -48,6 +49,8 @@ func main() {
 		os.Exit(runValidate(args))
 	case "plan":
 		os.Exit(runPlan(args))
+	case "graph":
+		os.Exit(runGraph(args))
 	case "apply":
 		os.Exit(runApply(args))
 	case "status":
