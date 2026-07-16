@@ -232,7 +232,7 @@ The canonicalization is intentionally lossy in only two dimensions: whitespace n
    - `enabled: false`, `is-enabled` says yes → `systemctl disable <unit>`
    - `enabled` **omitted** → enablement is not declared; Magus does not touch it. A unit declared only to attach a drop-in (or one that simply omits `enabled`) keeps whatever enablement it has — extending a unit never enables or disables it as a side effect. This is the difference between "declared disabled" and "not declared", and collapsing the two would make Magus actively disable services it was only meant to extend.
 4. **First-time start, only on creation:** new unit declared enabled → `systemctl start <unit>` (combined with step 3 as `enable --now` for new units)
-5. **Restart on content change**, only if the unit is currently active: `systemctl restart <unit>`
+5. **Restart on content change**, only if the unit is currently active: `systemctl restart <unit>`. A unit is also restarted when an `EnvironmentFile=` it consumes was changed this apply, even if the unit's own body did not change (see *Apply order* below) — so a config-file edit propagates to the running service.
 6. **Inactive units whose content changed** are rewritten only. The new content takes effect on next start. Logged at apply-time so the deferred behavior is visible.
 7. Update manifest
 
@@ -251,6 +251,11 @@ The canonicalization is intentionally lossy in only two dimensions: whitespace n
 
 Enablement is reconciled every apply because it's persistent. Activity is not — Magus starts a unit once on creation and otherwise leaves runtime to systemd.
 
+**Apply order.** The steps above are not a hardcoded phase pipeline; Magus derives an explicit dependency graph from the plan (see `docs/adr-0002-apply-graph.md`) and walks it in topological order. The ordering the phases used to guarantee — one `daemon-reload` after all writes and before any service op, drop-ins after their body, deletes reversed, service-aware teardown — is preserved as graph structure. The graph's typed edges add two cross-resource behaviors the fixed phases could not express:
+
+- **require (fail-closed cascade):** if a resource a node depends on fails or is skipped (e.g. a directory whose creation errored, or the `daemon-reload` a service needs), the dependent node is skipped with `dependency <path> failed` rather than run against a broken prerequisite. It never reports success for work it couldn't do.
+- **notify (config propagation):** a managed file consumed by a unit/quadlet via `EnvironmentFile=` *notifies* that service. When the file changes, the active consumer is restarted so it re-reads the new environment — closing the gap where an env-only edit left a service running stale config.
+
 **Directories:**
 1. `mkdir -p` with declared mode (no-op if already exists)
 2. `chown` as declared (mode and ownership are reconciled on existing directories; content is not touched)
@@ -261,7 +266,7 @@ Enablement is reconciled every apply because it's persistent. Activity is not �
 1. Write file atomically (same as files)
 2. `systemctl daemon-reload` once, after all unit/quadlet writes (the quadlet generator runs at daemon-reload and materializes the `.service`)
 3. **First-time start, only on creation:** `systemctl start <generated-service>` — NOT `enable`: a quadlet-generated unit lives in `/run/systemd/generator/` and systemd refuses to enable a generated/transient unit. Boot persistence comes from the quadlet's own `[Install]` section, which the generator translates into the wants-symlink at `daemon-reload`. Magus only needs to start it now.
-4. **Restart on content change**, only if generated service is currently active: `systemctl restart <generated-service>`
+4. **Restart on content change**, only if generated service is currently active: `systemctl restart <generated-service>`. Also restarted when an `EnvironmentFile=` the quadlet consumes changed this apply (see *Apply order* below).
 5. **Inactive generated services whose source changed** are rewritten only; takes effect on next start. Logged.
 6. Update manifest
 

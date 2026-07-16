@@ -1,0 +1,30 @@
+# Archetype 4 — a service that consumes an EnvironmentFile= magus also manages.
+# This is the capability B3 adds: the graph's `notify` edge from the env file to
+# the consuming service. When ONLY the env file changes (the unit body is
+# untouched), the active consumer is restarted so it re-reads the new
+# environment. The pre-graph phase pipeline restarted only on a unit's own body
+# change and left the consumer running with stale config.
+#
+# The service appends its $WITNESS value to a log on every (re)start, so a test
+# can prove a restart happened by observing a second line after an env-only change.
+variant: fcos
+version: 1.5.0
+storage:
+  files:
+    - path: /etc/core/witness.env
+      mode: 0644
+      contents:
+        inline: |
+          WITNESS=one
+systemd:
+  units:
+    - name: magus-witness.service
+      enabled: true
+      contents: |
+        [Unit]
+        Description=magus env-notify witness
+        [Service]
+        EnvironmentFile=/etc/core/witness.env
+        ExecStart=/bin/sh -c 'echo "$WITNESS" >> /var/tmp/witness.log; exec sleep infinity'
+        [Install]
+        WantedBy=multi-user.target

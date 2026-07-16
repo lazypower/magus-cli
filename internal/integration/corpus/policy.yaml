@@ -1,0 +1,24 @@
+# Corpus policy — permissive enough to exercise every archetype's surface
+# (files under /etc/core, standalone magus-* units, quadlets under
+# /etc/containers/systemd), while keeping the real safety denies. Not a
+# deployment policy; it exists so the graph corpus can drive plan/apply/status
+# across all edge kinds in one boundary.
+version: 1
+file_roots:
+  - /etc/core
+  - /etc/containers/systemd
+  - /etc/systemd/system
+  - /var/lib/magus
+unit_patterns:
+  - "magus-*"
+  - "*.d/10-magus.conf"
+deny:
+  paths:
+    - /etc/shadow
+    - /etc/passwd
+    - /etc/sudoers
+    - /etc/sudoers.d/*
+  units:
+    - "sshd.*"
+    - "systemd-*"
+    - "bootc-*"
