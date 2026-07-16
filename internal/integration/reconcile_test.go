@@ -17,16 +17,18 @@ import (
 // — the REAL boundary magus runs under on a core-base host. Kept in sync
 // deliberately (not simplified) so the harness proves the actual deployment
 // boundary, including the secret/substrate denies. Quadlets + /etc/core files
-// are the workload surface; standalone units and /etc/systemd/system are NOT in
-// file_roots here (deliberate on core-base — see the policy-inconsistency note
-// on TestDropIn). Tests that need standalone units use examplePolicy.
+// are the workload surface; unit *names* are unrestricted (unit_patterns: "*"),
+// but standalone units and /etc/systemd/system are NOT in file_roots here, so
+// the path gate — not the name pattern — is what keeps unit bodies out (see the
+// note on TestDropIn). Tests that need standalone units use examplePolicy;
+// unit_patterns gating itself is proven directly in internal/policy.
 const workloadPolicy = `version: 1
 file_roots:
   - /etc/containers/systemd
   - /etc/core
   - /var/lib/magus
 unit_patterns:
-  - "*.d/10-magus.conf"
+  - "*"
 deny:
   paths:
     - /etc/shadow
@@ -549,11 +551,9 @@ func TestPlanAndStatus(t *testing.T) {
 // drop-in is written to the unit's .d/ directory and survives daemon-reload.
 //
 // NOTE: this runs under examplePolicy, not the real workload policy. The
-// core-image workload policy is internally inconsistent for drop-ins — its
-// unit_patterns allows "*.d/10-magus.conf" but its file_roots omit
-// /etc/systemd/system, so a drop-in there is path-denied. Flagged for the
-// core-image policy owner; on core-base the unit surface is quadlets, not
-// drop-ins.
+// workload policy's file_roots omit /etc/systemd/system, so a drop-in there is
+// path-denied regardless of the (permissive) unit_patterns — on core-base the
+// unit surface is quadlets, not drop-ins under /etc/systemd/system.
 func TestDropIn(t *testing.T) {
 	c := setup(t, examplePolicy)
 
