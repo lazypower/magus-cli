@@ -100,6 +100,10 @@ func Check(p *Policy, in *ir.IR, extraReserved ...string) []Violation {
 		}
 	}
 
+	// Principals (passwd.users/groups): the manage_users boundary, deterministic
+	// uids, the privileged-group gate, and v1-deferred secret fields.
+	v = append(v, p.checkPrincipals(in)...)
+
 	return v
 }
 

@@ -14,6 +14,7 @@ import (
 	"github.com/lazypower/magus-cli/internal/lock"
 	"github.com/lazypower/magus-cli/internal/manifest"
 	"github.com/lazypower/magus-cli/internal/policy"
+	"github.com/lazypower/magus-cli/internal/principal"
 	"github.com/lazypower/magus-cli/internal/status"
 	"github.com/lazypower/magus-cli/internal/systemd"
 )
@@ -106,9 +107,22 @@ func runApply(args []string) int {
 	// a clean file diff ("Nothing to apply" stays honest).
 	diff.PlanServiceState(parsed, plan, sd)
 
+	// Principals (passwd.users/groups): diffed against getent and reconciled
+	// before files, so a file owned by a freshly-created uid has its owner in
+	// place. Only managed (manage_users) principals are considered.
+	pplan, err := principal.Diff(parsed, principal.OSReader(), p)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "error: %v\n", err)
+		return 1
+	}
+
 	printPlan(os.Stdout, butanePath, plan, nil)
+	printPrincipalPlan(os.Stdout, pplan)
 
 	changes, conflicts, errored := planCounts(plan)
+	pChanges, pConflicts := principalPlanCounts(pplan)
+	changes += pChanges
+	conflicts += pConflicts
 	if changes == 0 && conflicts == 0 && errored == 0 {
 		// Already converged. Refresh the observation (keeps last_apply current
 		// on a timer that mostly runs no-op applies) and exit.
@@ -139,6 +153,17 @@ func runApply(args []string) int {
 	}
 	fmt.Println()
 
+	// Principals reconcile first: an owner must exist before a file it owns is
+	// written. A per-principal conflict (e.g. uid collision) is skipped like any
+	// other resource and does not halt the file pass.
+	var presult *principal.Result
+	if len(pplan.Actions) > 0 {
+		presult = principal.Apply(pplan, parsed, principal.OSExecutor())
+		for _, oc := range presult.Outcomes {
+			printPrincipalOutcome(os.Stdout, oc)
+		}
+	}
+
 	result := apply.ApplyWithPolicy(p, plan, parsed, w, m, sd, now)
 	for _, oc := range result.Outcomes {
 		printOutcome(os.Stdout, oc)
@@ -152,10 +177,76 @@ func runApply(args []string) int {
 	saveStatusObservation(*statusPath, plan, result, nil, now)
 
 	a, _, s, e := result.Counts()
+	exit := result.ExitCode()
+	pa, ps, pe := 0, 0, 0
+	if presult != nil {
+		pApplied, _, pSkipped, pErrored := presult.Counts()
+		pa, ps, pe = pApplied, pSkipped, pErrored
+		exit = worstExit(exit, presult.ExitCode())
+	}
 	fmt.Println()
 	fmt.Printf("Applied %d changes, %d skipped, %d errors.  exit %d\n",
-		a, s, e, result.ExitCode())
-	return result.ExitCode()
+		a+pa, s+ps, e+pe, exit)
+	return exit
+}
+
+// worstExit combines two apply exit codes by the spec priority: errors (1) beat
+// skips (2) beat clean (0).
+func worstExit(a, b int) int {
+	if a == 1 || b == 1 {
+		return 1
+	}
+	if a == 2 || b == 2 {
+		return 2
+	}
+	return 0
+}
+
+// printPrincipalPlan previews the principal actions alongside the file plan.
+func printPrincipalPlan(w io.Writer, pplan *principal.Plan) {
+	if pplan == nil || len(pplan.Actions) == 0 {
+		return
+	}
+	for _, a := range pplan.Actions {
+		fmt.Fprintf(w, "  [%s]  %s %s  (%s)\n", a.Action, a.Kind, a.Name, a.Reason)
+	}
+}
+
+// principalPlanCounts splits principal actions into changes (create/converge)
+// and conflicts, mirroring planCounts for files so the "nothing to apply" and
+// confirmation gates account for identity work too.
+func principalPlanCounts(pplan *principal.Plan) (changes, conflicts int) {
+	if pplan == nil {
+		return 0, 0
+	}
+	for _, a := range pplan.Actions {
+		switch a.Action {
+		case principal.ActionCreate, principal.ActionConverge:
+			changes++
+		case principal.ActionConflict:
+			conflicts++
+		}
+	}
+	return changes, conflicts
+}
+
+// printPrincipalOutcome renders one principal apply outcome, matching the file
+// outcome style (✓ applied/unchanged, ✗ skipped/errored).
+func printPrincipalOutcome(w io.Writer, oc principal.Outcome) {
+	mark := "✓"
+	if oc.Status == principal.StatusSkipped || oc.Status == principal.StatusErrored {
+		mark = "✗"
+	}
+	suffix := ""
+	switch {
+	case oc.Err != nil:
+		suffix = fmt.Sprintf("  (errored: %v)", oc.Err)
+	case oc.Status == principal.StatusSkipped:
+		suffix = fmt.Sprintf("  (skipped: %s)", oc.Reason)
+	case oc.Reason != "":
+		suffix = fmt.Sprintf("  (%s)", oc.Reason)
+	}
+	fmt.Fprintf(w, "  %s %s %s%s\n", mark, oc.Kind, oc.Name, suffix)
 }
 
 // saveStatusObservation writes the post-apply observation file. Conflicts are

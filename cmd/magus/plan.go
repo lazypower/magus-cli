@@ -14,6 +14,7 @@ import (
 	"github.com/lazypower/magus-cli/internal/ir"
 	"github.com/lazypower/magus-cli/internal/manifest"
 	"github.com/lazypower/magus-cli/internal/policy"
+	"github.com/lazypower/magus-cli/internal/principal"
 	"github.com/lazypower/magus-cli/internal/status"
 	"github.com/lazypower/magus-cli/internal/systemd"
 )
@@ -83,6 +84,14 @@ func runPlan(args []string) int {
 	// systemd is unavailable.
 	diff.PlanServiceState(parsed, plan, systemd.OS())
 
+	// Principal actions (read-only getent diff), previewed like everything else so
+	// the exit code and preview reflect identity work apply would do.
+	pplan, err := principal.Diff(parsed, principal.OSReader(), p)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "error: %v\n", err)
+		return 1
+	}
+
 	if *jsonOut {
 		if code := emitPlanJSON(os.Stdout, butanePath, plan); code != 0 {
 			return code
@@ -93,6 +102,7 @@ func runPlan(args []string) int {
 			details = buildExplanations(parsed, fsys, plan, verbose)
 		}
 		printPlan(os.Stdout, butanePath, plan, details)
+		printPrincipalPlan(os.Stdout, pplan)
 	}
 
 	// Error dominates: a path whose state couldn't be determined is exit 1, not
@@ -101,7 +111,8 @@ func runPlan(args []string) int {
 	if plan.HasErrors() {
 		return 1
 	}
-	if plan.HasChanges() {
+	pChanges, pConflicts := principalPlanCounts(pplan)
+	if plan.HasChanges() || pChanges > 0 || pConflicts > 0 {
 		return 2
 	}
 	return 0
