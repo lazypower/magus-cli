@@ -1,0 +1,24 @@
+# Archetype 2 — standalone unit with a drop-in and declared enablement.
+# Exercises: unit body -> drop-in `order` edge, both -> the single
+# `daemon-reload` barrier (`require`), the barrier -> the service reconcile
+# (`require`), and enable --now on a freshly-created enabled unit.
+variant: fcos
+version: 1.5.0
+systemd:
+  units:
+    - name: magus-corpus.service
+      enabled: true
+      contents: |
+        [Unit]
+        Description=magus corpus unit
+        [Service]
+        Type=oneshot
+        RemainAfterExit=yes
+        ExecStart=/usr/bin/true
+        [Install]
+        WantedBy=multi-user.target
+      dropins:
+        - name: 10-magus.conf
+          contents: |
+            [Service]
+            Environment=CORPUS=present

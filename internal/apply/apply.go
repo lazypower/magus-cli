@@ -11,7 +11,9 @@ import (
 	"path/filepath"
 	"time"
 
+	"github.com/lazypower/magus-cli/internal/applygraph"
 	"github.com/lazypower/magus-cli/internal/diff"
+	"github.com/lazypower/magus-cli/internal/graph"
 	"github.com/lazypower/magus-cli/internal/hostfs"
 	"github.com/lazypower/magus-cli/internal/ir"
 	"github.com/lazypower/magus-cli/internal/manifest"
@@ -110,14 +112,24 @@ type pendingResource struct {
 // caller is responsible for persisting it after Apply returns. `now` is
 // injected so applied_at timestamps are deterministic in tests.
 //
-// Apply runs in three phases per the spec:
-//  1. Filesystem mutations. Unit body deletes are special-cased to
-//     'systemctl disable --now' before unlink so enablement symlinks are
-//     cleaned before the file disappears.
-//  2. systemctl daemon-reload, exactly once, if any unit file was mutated.
-//  3. Per-IR-unit state reconciliation: enablement, first-time start for
-//     newly-created enabled units, and restart-if-active for content
-//     changes.
+// Apply walks the apply-ordering graph (applygraph.Derive) in topological order
+// rather than a fixed phase pipeline. Each node carries its own behavior —
+// filesystem mutation, the single daemon-reload barrier, or a service reconcile
+// — and the graph's typed edges drive two cross-node behaviors the old phases
+// couldn't express:
+//
+//   - require: if a required predecessor fails (errors or skips), the dependent
+//     node is skipped with "dependency <path> failed" rather than run against a
+//     broken prerequisite (the honest fail-closed cascade).
+//   - notify: if a node the graph marks as notifying a service actually changed
+//     (an EnvironmentFile= the service consumes), the service is restarted even
+//     when its own body did not change — closing the config-propagation gap.
+//
+// The invariants the phases used to enforce by ordering are preserved as node
+// behavior: daemon-reload runs exactly once (an OR-join barrier), unit-body
+// deletes disable-now before unlink, quadlet deletes stop the generated service
+// before the source vanishes, and every path-governed mutation re-checks
+// containment at apply time.
 //
 // Per-resource errors do not halt — the reconciler-pattern posture from the
 // spec. One bad resource does not take the system hostage.
@@ -137,123 +149,294 @@ func ApplyWithPolicy(p *policy.Policy, plan *diff.Plan, in *ir.IR, w hostfs.Writ
 	resources := indexResources(in)
 	r := &Result{Outcomes: make([]Outcome, 0, len(plan.Actions))}
 
-	// Track which IR units had file mutations and what kind, so phase 3
-	// can reconcile state intelligently.
-	events := map[string]*unitEvents{}
-	getEvents := func(name string) *unitEvents {
-		if e, ok := events[name]; ok {
-			return e
-		}
-		e := &unitEvents{}
-		events[name] = e
-		return e
+	g := applygraph.Derive(plan, in)
+	order, err := g.TopoSort()
+	if err != nil {
+		// A cyclic apply graph is a derivation contradiction — mutually
+		// dependent resources with no safe order. Fail closed: apply nothing
+		// and surface the cycle, rather than pick an arbitrary order and half
+		// converge. Still observe so status reflects live state.
+		r.Outcomes = append(r.Outcomes, Outcome{
+			Path: "apply-graph", Action: diff.ActionError,
+			Status: StatusErrored, Err: err,
+		})
+		r.UnitStates = ObserveUnits(in, sd)
+		return r
 	}
 
-	quadletEvents := map[string]*unitEvents{}
-	getQuadletEvents := func(name string) *unitEvents {
-		if e, ok := quadletEvents[name]; ok {
-			return e
-		}
-		e := &unitEvents{}
-		quadletEvents[name] = e
-		return e
+	ex := &executor{
+		p: p, plan: plan, in: in, w: w, m: m, sd: sd, now: now,
+		resources:     resources,
+		actionByPath:  make(map[string]diff.ResourceAction, len(plan.Actions)),
+		unitByService: make(map[string]ir.Unit, len(in.Units)),
+		quadletByNode: map[string]quadletNode{},
+		reqInto:       map[string][]string{},
+		notifyInto:    map[string][]string{},
+		changed:       map[string]bool{},
+		failed:        map[string]bool{},
+		events:        map[string]*unitEvents{},
+		quadletEvents: map[string]*unitEvents{},
 	}
-
-	// Phase 1a: service-aware deletes. Unit body deletes need disable-now
-	// before unlink (so enablement symlinks are removed before the file
-	// vanishes). Quadlet deletes need the *generated* service stopped before
-	// the quadlet source disappears (otherwise systemd keeps the container
-	// running on the old spec).
 	for _, a := range plan.Actions {
-		switch {
-		case isUnitBodyDelete(a):
-			oc := applyUnitBodyDelete(a, w, m, sd)
-			r.Outcomes = append(r.Outcomes, oc)
-			if oc.Status == StatusApplied {
-				getEvents(a.UnitName).bodyDeleted = true
-			}
-		case isQuadletDelete(a):
-			oc := applyQuadletDelete(p, a, w, m, sd)
-			r.Outcomes = append(r.Outcomes, oc)
-			if oc.Status == StatusApplied {
-				getQuadletEvents(a.UnitName).bodyDeleted = true
-			}
-		}
+		ex.actionByPath[a.Path] = a
 	}
-
-	// Phase 1b: everything else (files + drop-ins + unit/quadlet
-	// create/update/adopt + skip/conflict/orphan/cleanup).
-	for _, a := range plan.Actions {
-		if isUnitBodyDelete(a) || isQuadletDelete(a) {
-			continue // handled above
-		}
-		oc := applyOne(p, a, resources, w, m, now)
-		r.Outcomes = append(r.Outcomes, oc)
-		if oc.Status != StatusApplied {
-			continue
-		}
-		switch a.Kind {
-		case diff.KindUnit:
-			ev := getEvents(a.UnitName)
-			isBody := filepath.Base(a.Path) == a.UnitName
-			recordUnitEvent(ev, a.Action, isBody)
-		case diff.KindQuadlet:
-			recordUnitEvent(getQuadletEvents(a.UnitName), a.Action, true)
-		}
-	}
-
-	// Phase 2: daemon-reload if any unit OR quadlet file was mutated. The
-	// quadlet generator runs at daemon-reload time, so quadlet writes have
-	// the same trigger.
-	if anyUnitMutation(events) || anyUnitMutation(quadletEvents) {
-		err := sd.DaemonReload()
-		oc := Outcome{Path: "daemon-reload", Action: diff.ActionUpdate}
-		if err != nil {
-			oc.Status = StatusErrored
-			oc.Err = err
-		} else {
-			oc.Status = StatusApplied
-		}
-		r.Outcomes = append(r.Outcomes, oc)
-	}
-
-	// Phase 3a: per-IR-unit state reconciliation. Walks IR.Units (deleted
-	// units are not in the IR, so they're not visited here).
 	for _, u := range in.Units {
-		ev := events[u.Name]
-		if ev == nil {
-			ev = &unitEvents{}
-		}
-		outcomes := reconcileServiceState(u.Name, u.Enabled, ev, sd)
-		r.Outcomes = append(r.Outcomes, outcomes...)
+		ex.unitByService[u.Name] = u
 	}
-
-	// Phase 3b: per-IR-quadlet state reconciliation. The .container file is the
-	// quadlet source; magus drives the *generated* .service. Generated units
-	// CANNOT be enabled (systemd refuses), so magus only starts them — boot
-	// persistence comes from the [Install] section the generator processes.
 	for _, q := range in.Quadlets {
-		svc, err := diff.QuadletGeneratedService(q.Name)
-		if err != nil {
-			r.Outcomes = append(r.Outcomes, Outcome{
-				Path: q.Path, Action: diff.ActionUpdate,
-				Status: StatusErrored, Err: err,
-			})
-			continue
+		if svc, err := diff.QuadletGeneratedService(q.Name); err == nil {
+			ex.quadletByNode[svc] = quadletNode{quadlet: q, service: svc}
 		}
-		ev := quadletEvents[q.Name]
-		if ev == nil {
-			ev = &unitEvents{}
+	}
+	// Incoming require/notify predecessors per node, derived once. g.Edges() is
+	// globally sorted by (From,To,Kind), so each predecessor list is built in a
+	// deterministic order — the failure cascade names a stable dependency.
+	for _, e := range g.Edges() {
+		switch e.Kind {
+		case graph.Require:
+			ex.reqInto[e.To] = append(ex.reqInto[e.To], e.From)
+		case graph.Notify:
+			ex.notifyInto[e.To] = append(ex.notifyInto[e.To], e.From)
 		}
-		outcomes := reconcileQuadletState(svc, ev, sd)
-		r.Outcomes = append(r.Outcomes, outcomes...)
 	}
 
-	// Phase 4: observe the runtime state of every managed unit/quadlet service
-	// for the status file.
-	r.UnitStates = ObserveUnits(in, sd)
+	for _, n := range order {
+		r.Outcomes = append(r.Outcomes, ex.visit(n)...)
+	}
 
+	// Observe the runtime state of every managed unit/quadlet service for the
+	// status file.
+	r.UnitStates = ObserveUnits(in, sd)
 	return r
+}
+
+// quadletNode pairs a quadlet's generated-service node id with its IR source, so
+// the executor can reconcile the service while reading the events recorded under
+// the quadlet's own name.
+type quadletNode struct {
+	quadlet ir.Quadlet
+	service string
+}
+
+// executor holds the mutable walk state for one ApplyWithPolicy call: the
+// derived edge indexes, per-node results (changed drives notify, failed drives
+// the require cascade), and the unit/quadlet event accumulators the service
+// nodes read once their resource nodes have run.
+type executor struct {
+	p    *policy.Policy
+	plan *diff.Plan
+	in   *ir.IR
+	w    hostfs.Writer
+	m    *manifest.Manifest
+	sd   systemd.Manager
+	now  time.Time
+
+	resources     map[string]pendingResource
+	actionByPath  map[string]diff.ResourceAction
+	unitByService map[string]ir.Unit
+	quadletByNode map[string]quadletNode
+
+	reqInto    map[string][]string
+	notifyInto map[string][]string
+
+	changed map[string]bool
+	failed  map[string]bool
+
+	events        map[string]*unitEvents
+	quadletEvents map[string]*unitEvents
+}
+
+// visit executes one graph node and returns its outcome(s). Topological order
+// guarantees every predecessor has already run, so the require/notify lookups
+// read settled state.
+func (ex *executor) visit(n string) []Outcome {
+	// Dependency gate: a failed require-predecessor skips this node — the honest
+	// fail-closed cascade. The daemon-reload barrier is exempt: it is an OR-join
+	// over its triggers (it must still run for the writes that DID succeed), so
+	// a single failed write must not suppress it.
+	if n != applygraph.ReloadNode {
+		if dep, ok := firstFailed(ex.reqInto[n], ex.failed); ok {
+			ex.failed[n] = true
+			return []Outcome{{
+				Path: n, Action: diff.ActionSkip,
+				Status: StatusSkipped, Reason: "dependency " + dep + " failed",
+			}}
+		}
+	}
+
+	switch {
+	case n == applygraph.ReloadNode:
+		return ex.visitReload(n)
+	case ex.isUnitService(n):
+		return ex.visitUnitService(n)
+	case ex.isQuadletService(n):
+		return ex.visitQuadletService(n)
+	default:
+		return ex.visitResource(n)
+	}
+}
+
+func (ex *executor) isUnitService(n string) bool {
+	_, ok := ex.unitByService[n]
+	return ok
+}
+
+func (ex *executor) isQuadletService(n string) bool {
+	_, ok := ex.quadletByNode[n]
+	return ok
+}
+
+// visitReload runs the single daemon-reload, but only when at least one of its
+// trigger predecessors actually changed on disk (reproducing the old
+// anyUnitMutation gate). A reload failure propagates to the services that
+// require it, which then skip honestly.
+func (ex *executor) visitReload(n string) []Outcome {
+	if !anyTrue(ex.reqInto[n], ex.changed) {
+		return nil // every triggering write failed or was a no-op — nothing to reload
+	}
+	oc := Outcome{Path: applygraph.ReloadNode, Action: diff.ActionUpdate}
+	if err := ex.sd.DaemonReload(); err != nil {
+		oc.Status = StatusErrored
+		oc.Err = err
+		ex.failed[n] = true
+	} else {
+		oc.Status = StatusApplied
+	}
+	return []Outcome{oc}
+}
+
+// visitUnitService reconciles one IR unit's systemd state, restarting it if the
+// unit changed OR a notify source it consumes changed.
+func (ex *executor) visitUnitService(n string) []Outcome {
+	u := ex.unitByService[n]
+	ev := ex.events[u.Name]
+	if ev == nil {
+		ev = &unitEvents{}
+	}
+	notified := anyTrue(ex.notifyInto[n], ex.changed)
+	outcomes := reconcileServiceState(u.Name, u.Enabled, ev, notified, ex.sd)
+	ex.failed[n] = anyFailed(outcomes)
+	return outcomes
+}
+
+// visitQuadletService reconciles one IR quadlet's generated service.
+func (ex *executor) visitQuadletService(n string) []Outcome {
+	qn := ex.quadletByNode[n]
+	ev := ex.quadletEvents[qn.quadlet.Name]
+	if ev == nil {
+		ev = &unitEvents{}
+	}
+	notified := anyTrue(ex.notifyInto[n], ex.changed)
+	outcomes := reconcileQuadletState(qn.service, ev, notified, ex.sd)
+	ex.failed[n] = anyFailed(outcomes)
+	return outcomes
+}
+
+// visitResource applies one filesystem node (file, dir, unit body, drop-in, or
+// quadlet source) and records the unit/quadlet event its service node reads. The
+// special service-aware deletes — disable-now before a unit-body unlink, stop
+// the generated service before a quadlet source unlink — live here as node
+// behavior; the graph's edges order them ahead of the reload barrier.
+func (ex *executor) visitResource(n string) []Outcome {
+	a, ok := ex.actionByPath[n]
+	if !ok {
+		return nil // node with no plan action (defensive; every node is classified)
+	}
+
+	var oc Outcome
+	switch {
+	case isUnitBodyDelete(a):
+		oc = applyUnitBodyDelete(a, ex.w, ex.m, ex.sd)
+		if oc.Status == StatusApplied {
+			ex.getEvents(a.UnitName).bodyDeleted = true
+		}
+	case isQuadletDelete(a):
+		oc = applyQuadletDelete(ex.p, a, ex.w, ex.m, ex.sd)
+		if oc.Status == StatusApplied {
+			ex.getQuadletEvents(a.UnitName).bodyDeleted = true
+		}
+	default:
+		oc = applyOne(ex.p, a, ex.resources, ex.w, ex.m, ex.now)
+		if oc.Status == StatusApplied {
+			switch a.Kind {
+			case diff.KindUnit:
+				isBody := filepath.Base(a.Path) == a.UnitName
+				recordUnitEvent(ex.getEvents(a.UnitName), a.Action, isBody)
+			case diff.KindQuadlet:
+				recordUnitEvent(ex.getQuadletEvents(a.UnitName), a.Action, true)
+			}
+		}
+	}
+
+	ex.changed[n] = oc.Status == StatusApplied && isMutationAction(a.Action)
+	ex.failed[n] = oc.Status == StatusErrored || oc.Status == StatusSkipped
+	return []Outcome{oc}
+}
+
+func (ex *executor) getEvents(name string) *unitEvents {
+	if e, ok := ex.events[name]; ok {
+		return e
+	}
+	e := &unitEvents{}
+	ex.events[name] = e
+	return e
+}
+
+func (ex *executor) getQuadletEvents(name string) *unitEvents {
+	if e, ok := ex.quadletEvents[name]; ok {
+		return e
+	}
+	e := &unitEvents{}
+	ex.quadletEvents[name] = e
+	return e
+}
+
+// firstFailed returns the first predecessor in preds whose node has failed, and
+// whether one exists. Preds are in deterministic order, so the named dependency
+// is stable run-to-run.
+func firstFailed(preds []string, failed map[string]bool) (string, bool) {
+	for _, p := range preds {
+		if failed[p] {
+			return p, true
+		}
+	}
+	return "", false
+}
+
+// anyTrue reports whether any node in preds is marked true in m (used for both
+// the reload OR-join over changed triggers and the notify test over changed
+// sources).
+func anyTrue(preds []string, m map[string]bool) bool {
+	for _, p := range preds {
+		if m[p] {
+			return true
+		}
+	}
+	return false
+}
+
+// anyFailed reports whether any outcome errored or skipped — a service node's
+// contribution to the require cascade (a reference dependent skips if the
+// network/volume service it requires didn't come up).
+func anyFailed(ocs []Outcome) bool {
+	for _, oc := range ocs {
+		if oc.Status == StatusErrored || oc.Status == StatusSkipped {
+			return true
+		}
+	}
+	return false
+}
+
+// isMutationAction reports whether an action changes bytes on disk — the signal
+// a notify edge propagates. Adopt (no write), cleanup (manifest-only), and the
+// no-op/refused actions do not notify their consumers.
+func isMutationAction(a diff.Action) bool {
+	switch a {
+	case diff.ActionCreate, diff.ActionUpdate, diff.ActionDelete:
+		return true
+	default:
+		return false
+	}
 }
 
 // ObserveUnits queries the is-active state of every IR-declared unit and quadlet
@@ -679,15 +862,6 @@ func recordUnitEvent(ev *unitEvents, action diff.Action, isBody bool) {
 	}
 }
 
-func anyUnitMutation(events map[string]*unitEvents) bool {
-	for _, ev := range events {
-		if ev.hasContentMut || ev.bodyDeleted {
-			return true
-		}
-	}
-	return false
-}
-
 // reconcileServiceState drives systemd state for one service (a unit's name
 // or a quadlet's *generated* .service name) after files + daemon-reload have
 // settled. Returns one outcome per systemctl operation performed.
@@ -699,16 +873,22 @@ func anyUnitMutation(events map[string]*unitEvents) bool {
 //	        as a side effect of extending it.
 //	true  → ensure enabled
 //	false → ensure disabled
-func reconcileServiceState(serviceName string, desiredEnabled *bool, ev *unitEvents, sd systemd.Manager) []Outcome {
+//
+// notified is true when a graph notify source the service consumes (an
+// EnvironmentFile=) changed this apply. It forces a restart-if-active even when
+// the unit's own body did not change — the config-propagation the phase pipeline
+// could not express.
+func reconcileServiceState(serviceName string, desiredEnabled *bool, ev *unitEvents, notified bool, sd systemd.Manager) []Outcome {
 	if ev.bodyDeleted {
-		// Stop+disable already happened in phase 1; nothing more to do.
+		// Stop+disable already happened when the body-delete node ran.
 		return nil
 	}
 	var outcomes []Outcome
 
 	// Newly-created service: enable+start only when explicitly declared enabled.
 	// A freshly-written unit file is not enabled by default, so nil/false need
-	// no action at creation.
+	// no action at creation. A fresh start already reads the current
+	// EnvironmentFile=, so notify is subsumed here.
 	if ev.bodyCreated {
 		if desiredEnabled != nil && *desiredEnabled {
 			err := sd.EnableNow(serviceName)
@@ -720,9 +900,9 @@ func reconcileServiceState(serviceName string, desiredEnabled *bool, ev *unitEve
 	// Existing service. Both the enablement decision and the restart decision
 	// need live state, so fetch it once (Show = enablement + active in one
 	// systemctl call) — but only when there's actually a decision to make: a
-	// unit whose enablement is undeclared (nil) and whose content didn't change
-	// needs no query at all.
-	if desiredEnabled == nil && !ev.hasContentMut {
+	// unit whose enablement is undeclared (nil), whose content didn't change,
+	// and which no notify source touched needs no query at all.
+	if desiredEnabled == nil && !ev.hasContentMut && !notified {
 		return outcomes
 	}
 	status, err := sd.Show(serviceName)
@@ -752,19 +932,18 @@ func reconcileServiceState(serviceName string, desiredEnabled *bool, ev *unitEve
 		}
 	}
 
-	// Restart-if-active for content changes (excludes adopts and skips).
-	// Inactive services whose content changed are rewritten only — the new
-	// content takes effect on next start. Logged for visibility.
-	if ev.hasContentMut {
+	// Restart-if-active for content changes or a notified config change
+	// (excludes adopts and skips). Inactive services are rewritten only — the
+	// new content/config takes effect on next start. Logged for visibility.
+	if ev.hasContentMut || notified {
 		if err == nil && status.IsActive() {
-			err := sd.Restart(serviceName)
-			outcomes = append(outcomes, unitOutcome(serviceName, "restart", err))
+			outcomes = append(outcomes, unitOutcome(serviceName, restartReason(ev.hasContentMut), sd.Restart(serviceName)))
 		} else {
 			outcomes = append(outcomes, Outcome{
 				Path:   serviceName,
 				Action: diff.ActionUpdate,
 				Status: StatusApplied,
-				Reason: "content updated, inactive — change takes effect on next start",
+				Reason: deferReason(ev.hasContentMut),
 			})
 		}
 	}
@@ -772,35 +951,54 @@ func reconcileServiceState(serviceName string, desiredEnabled *bool, ev *unitEve
 	return outcomes
 }
 
+// restartReason names why a live service was restarted: its own content, or a
+// notified EnvironmentFile= it consumes. The content wording is unchanged from
+// the pre-graph pipeline.
+func restartReason(contentMut bool) string {
+	if contentMut {
+		return "restart"
+	}
+	return "restart (EnvironmentFile= changed)"
+}
+
+// deferReason names why an inactive service was left for next start.
+func deferReason(contentMut bool) string {
+	if contentMut {
+		return "content updated, inactive — change takes effect on next start"
+	}
+	return "environment changed, inactive — change takes effect on next start"
+}
+
 // reconcileQuadletState drives a quadlet's *generated* .service. Unlike units,
 // generated services cannot be enabled/disabled (systemd rejects it), so there
 // is no enablement reconciliation: magus starts the service on first creation
 // (boot persistence is the generator's job, from the quadlet's [Install]) and
 // restarts it if active when the source content changes.
-func reconcileQuadletState(serviceName string, ev *unitEvents, sd systemd.Manager) []Outcome {
+func reconcileQuadletState(serviceName string, ev *unitEvents, notified bool, sd systemd.Manager) []Outcome {
 	if ev.bodyDeleted {
-		return nil // stop happened in the delete phase
+		return nil // stop happened when the delete node ran
 	}
 	var outcomes []Outcome
 
 	if ev.bodyCreated {
-		// First materialization: start (NOT enable — it's a generated unit).
+		// First materialization: start (NOT enable — it's a generated unit). A
+		// fresh start already reads the current EnvironmentFile=, so notify is
+		// subsumed here.
 		err := sd.Start(serviceName)
 		outcomes = append(outcomes, unitOutcome(serviceName, "start", err))
 		return outcomes
 	}
 
-	if ev.hasContentMut {
+	if ev.hasContentMut || notified {
 		status, _ := sd.Show(serviceName)
 		if status.IsActive() {
-			err := sd.Restart(serviceName)
-			outcomes = append(outcomes, unitOutcome(serviceName, "restart", err))
+			outcomes = append(outcomes, unitOutcome(serviceName, restartReason(ev.hasContentMut), sd.Restart(serviceName)))
 		} else {
 			outcomes = append(outcomes, Outcome{
 				Path:   serviceName,
 				Action: diff.ActionUpdate,
 				Status: StatusApplied,
-				Reason: "content updated, inactive — change takes effect on next start",
+				Reason: deferReason(ev.hasContentMut),
 			})
 		}
 	}

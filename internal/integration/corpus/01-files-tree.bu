@@ -1,0 +1,23 @@
+# Archetype 1 — filesystem containment tree.
+# Exercises the graph's `require` containment edges: each declared directory
+# must settle its mode/ownership before anything nested under it lands, and a
+# nested directory chains parent -> child rather than every ancestor -> leaf.
+variant: fcos
+version: 1.5.0
+storage:
+  directories:
+    - path: /etc/core/app
+      mode: 0750
+    - path: /etc/core/app/sub
+      mode: 0755
+  files:
+    - path: /etc/core/app/config.conf
+      mode: 0644
+      contents:
+        inline: |
+          key=value
+    - path: /etc/core/app/sub/nested.conf
+      mode: 0640
+      contents:
+        inline: |
+          nested=true

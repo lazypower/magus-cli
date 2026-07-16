@@ -12,9 +12,10 @@
 // under Puppet's soft-edge rule: an edge exists only when both endpoints are
 // declared/owned. See docs/adr-0002-apply-graph.md for the autorequire table.
 //
-// This is the derivation half (plan → graph). Executing the graph in place of
-// the phase loops is a separate step (B3, internal/apply); nothing here mutates
-// a host.
+// This is the derivation half (plan → graph); nothing here mutates a host.
+// internal/apply consumes the derived graph and walks it in topological order in
+// place of the old phase loops (B3), reading the typed edges for the require
+// (fail-closed) cascade and the notify (EnvironmentFile= restart) propagation.
 package applygraph
 
 import (
@@ -26,12 +27,14 @@ import (
 	"github.com/lazypower/magus-cli/internal/ir"
 )
 
-// reloadNode is the synthetic barrier node standing for the single
+// ReloadNode is the synthetic barrier node standing for the single
 // `systemctl daemon-reload`. Every unit/quadlet content mutation edges into it;
 // it edges into every service reconcile — preserving the spec's "reload exactly
 // once, after all unit/quadlet writes, before service ops" invariant as explicit
 // structure. It exists only when at least one unit/quadlet mutation is planned.
-const reloadNode = "daemon-reload"
+// Exported so the apply executor (B3) can recognize the barrier node during its
+// graph walk.
+const ReloadNode = "daemon-reload"
 
 // Derive builds the apply-ordering graph for plan. in supplies the declared
 // contents (EnvironmentFile=/Network=/Volume= directives) the plan rows don't
@@ -103,7 +106,7 @@ func (b *builder) addNodes(plan *diff.Plan, in *ir.IR) {
 
 	b.hasReload = len(b.reloadTriggers) > 0
 	if b.hasReload {
-		b.g.AddNode(reloadNode)
+		b.g.AddNode(ReloadNode)
 	}
 
 	for _, u := range in.Units {
@@ -163,10 +166,10 @@ func (b *builder) reloadEdges() {
 		return
 	}
 	for _, p := range b.reloadTriggers {
-		b.g.AddEdge(p, reloadNode, graph.Require, "unit/quadlet write needs daemon-reload")
+		b.g.AddEdge(p, ReloadNode, graph.Require, "unit/quadlet write needs daemon-reload")
 	}
 	for _, s := range b.serviceNodes {
-		b.g.AddEdge(reloadNode, s, graph.Require, "daemon-reload precedes service reconcile")
+		b.g.AddEdge(ReloadNode, s, graph.Require, "daemon-reload precedes service reconcile")
 	}
 }
 

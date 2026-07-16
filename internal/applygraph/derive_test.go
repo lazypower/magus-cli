@@ -137,7 +137,7 @@ func TestDropInOnlyUnitNoOrderEdge(t *testing.T) {
 		t.Error("no body node should exist for a drop-in-only unit")
 	}
 	dp := diff.DropInPath("sshd.service", "10-magus.conf")
-	if !hasEdge(g, dp, reloadNode, graph.Require) {
+	if !hasEdge(g, dp, ReloadNode, graph.Require) {
 		t.Error("drop-in write should still trigger daemon-reload")
 	}
 }
@@ -149,10 +149,10 @@ func TestReloadBarrierEdges(t *testing.T) {
 	g := Derive(plan, in)
 
 	body := diff.UnitPath("web.service")
-	if !hasEdge(g, body, reloadNode, graph.Require) {
+	if !hasEdge(g, body, ReloadNode, graph.Require) {
 		t.Error("unit write should edge into daemon-reload")
 	}
-	if !hasEdge(g, reloadNode, "web.service", graph.Require) {
+	if !hasEdge(g, ReloadNode, "web.service", graph.Require) {
 		t.Error("daemon-reload should edge into the service reconcile")
 	}
 }
@@ -162,7 +162,7 @@ func TestAdoptAndSkipDoNotTriggerReload(t *testing.T) {
 	for _, act := range []diff.Action{diff.ActionAdopt, diff.ActionSkip} {
 		plan := &diff.Plan{Actions: []diff.ResourceAction{unitAct("web.service", act)}}
 		g := Derive(plan, in)
-		if g.HasNode(reloadNode) {
+		if g.HasNode(ReloadNode) {
 			t.Errorf("action %q must not create a daemon-reload node (no bytes changed)", act)
 		}
 		// The service node still exists (phase 3 reconciles it) but with no
@@ -177,7 +177,7 @@ func TestNoReloadNodeWithoutUnitMutation(t *testing.T) {
 	in := &ir.IR{Files: []ir.File{{Path: "/etc/x"}}}
 	plan := &diff.Plan{Actions: []diff.ResourceAction{fileAct("/etc/x", diff.ActionCreate)}}
 	g := Derive(plan, in)
-	if g.HasNode(reloadNode) {
+	if g.HasNode(ReloadNode) {
 		t.Error("a file-only plan must not create a daemon-reload node")
 	}
 }
@@ -375,11 +375,11 @@ func TestPhaseEquivalence(t *testing.T) {
 		"/etc/containers/systemd/db.network",
 		"/etc/containers/systemd/app.container",
 	} {
-		must(w, reloadNode, "write→reload")
+		must(w, ReloadNode, "write→reload")
 	}
 	// ...and daemon-reload before every service reconcile.
 	for _, s := range []string{"web.service", "db-network.service", "app.service"} {
-		must(reloadNode, s, "reload→service")
+		must(ReloadNode, s, "reload→service")
 	}
 	// Network reference: the network service precedes the container service.
 	must("db-network.service", "app.service", "Network= reference")
