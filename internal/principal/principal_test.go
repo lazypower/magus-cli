@@ -243,6 +243,81 @@ func TestApplyConflictSkipsExit2(t *testing.T) {
 	}
 }
 
+func onlyGroup(g ir.Group) *ir.IR { return &ir.IR{Groups: []ir.Group{g}} }
+
+func TestDiffGroupCreate(t *testing.T) {
+	plan, _ := Diff(onlyGroup(ir.Group{Name: "argus", GID: intp(1600)}), fakeReader{}, manages("argus"))
+	if len(plan.Actions) != 1 || plan.Actions[0].Kind != KindGroup || plan.Actions[0].Action != ActionCreate {
+		t.Fatalf("want one group create, got %+v", plan.Actions)
+	}
+}
+
+func TestDiffGroupAdopt(t *testing.T) {
+	r := fakeReader{groups: map[string]int{"argus": 1600}}
+	plan, _ := Diff(onlyGroup(ir.Group{Name: "argus", GID: intp(1600)}), r, manages("argus"))
+	if plan.Actions[0].Action != ActionAdopt {
+		t.Fatalf("matching group must adopt, got %s", plan.Actions[0].Action)
+	}
+}
+
+func TestDiffGroupConflicts(t *testing.T) {
+	// gid immutable: exists with a different gid.
+	r := fakeReader{groups: map[string]int{"argus": 1601}}
+	plan, _ := Diff(onlyGroup(ir.Group{Name: "argus", GID: intp(1600)}), r, manages("argus"))
+	if plan.Actions[0].Action != ActionConflict {
+		t.Errorf("changed gid must conflict, got %s", plan.Actions[0].Action)
+	}
+	// gid collision: absent, but the gid belongs to another group.
+	r2 := fakeReader{gidOwner: map[int]string{1600: "other"}}
+	plan2, _ := Diff(onlyGroup(ir.Group{Name: "argus", GID: intp(1600)}), r2, manages("argus"))
+	if plan2.Actions[0].Action != ActionConflict {
+		t.Errorf("gid collision must conflict, got %s", plan2.Actions[0].Action)
+	}
+}
+
+func TestApplyGroupCreateRunsGroupAdd(t *testing.T) {
+	in := onlyGroup(ir.Group{Name: "argus", GID: intp(1600)})
+	plan, _ := Diff(in, fakeReader{}, manages("argus"))
+	ex := &fakeExecutor{failOn: map[string]error{}}
+	if r := Apply(plan, in, ex); r.ExitCode() != 0 {
+		t.Fatalf("group create exit %d", r.ExitCode())
+	}
+	if !has(ex.calls, "GroupAdd(argus)") {
+		t.Errorf("group create must call GroupAdd, got %v", ex.calls)
+	}
+}
+
+func TestApplyConvergeSetsShellAndGroups(t *testing.T) {
+	r := fakeReader{users: map[string]ActualUser{
+		"argus": {Exists: true, Name: "argus", UID: 1500, PrimaryGroup: "argus", Shell: "/bin/bash"},
+	}}
+	in := onlyUser(ir.User{Name: "argus", UID: intp(1500), Shell: "/usr/sbin/nologin", Groups: []string{"kvm"}})
+	plan, _ := Diff(in, r, manages("argus"))
+	if plan.Actions[0].Action != ActionConverge {
+		t.Fatalf("want converge, got %s", plan.Actions[0].Action)
+	}
+	ex := &fakeExecutor{failOn: map[string]error{}}
+	res := Apply(plan, in, ex)
+	if !has(ex.calls, "UserSetShell(argus)") || !has(ex.calls, "UserAddGroups(argus)") {
+		t.Errorf("converge must set shell and add groups, got %v", ex.calls)
+	}
+	if a, _, _, _ := res.Counts(); a != 1 {
+		t.Errorf("converge should count as applied, got %+v", res.Outcomes)
+	}
+}
+
+func TestPlanHasWork(t *testing.T) {
+	create, _ := Diff(onlyUser(ir.User{Name: "argus", UID: intp(1500)}), fakeReader{}, manages("argus"))
+	if !create.HasWork() {
+		t.Error("a create plan has work")
+	}
+	adopt, _ := Diff(onlyUser(ir.User{Name: "argus", UID: intp(1500)}),
+		fakeReader{users: map[string]ActualUser{"argus": {Exists: true, Name: "argus", UID: 1500}}}, manages("argus"))
+	if adopt.HasWork() {
+		t.Error("an adopt-only plan has no work")
+	}
+}
+
 func TestApplyErrorIsolation(t *testing.T) {
 	in := &ir.IR{Users: []ir.User{
 		{Name: "a", UID: intp(1000)},
