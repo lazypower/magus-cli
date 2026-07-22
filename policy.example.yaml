@@ -22,3 +22,25 @@ deny:
   units:
     - "sshd.*"
     - "systemd-*"
+
+# manage_users is the allowlist of principals (Butane passwd.users/groups) magus
+# may create or modify day-2 — the identity analogue of file_roots/unit_patterns.
+# A declared principal NOT listed here is ignored (Ignition's concern), exactly
+# as storage.disks is. A managed principal must declare a uid; created accounts
+# get safe defaults (password locked, nologin) and their identity attributes
+# (uid, primary gid, home path) are immutable after creation.
+manage_users:
+  - argus
+
+# privileged_groups extends the built-in root-equivalent set (root, wheel, sudo,
+# docker). Adding a managed principal to any privileged group — by name; numeric
+# gids are refused — requires an explicit grant below.
+# privileged_groups:
+#   - kvm
+
+# group_grants maps a principal to the privileged groups it is explicitly allowed
+# to join. Without a grant, a privileged membership (declared, or found on an
+# existing principal at adopt time) is refused.
+# group_grants:
+#   argus:
+#     - docker

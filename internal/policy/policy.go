@@ -24,6 +24,18 @@ type Policy struct {
 	FileRoots    []string `yaml:"file_roots"`
 	UnitPatterns []string `yaml:"unit_patterns"`
 	Deny         Deny     `yaml:"deny"`
+
+	// ManageUsers is the allowlist of principals (users and groups) magus may
+	// create or modify. Anything not listed is ignored — Ignition's concern.
+	// This is the identity analogue of file_roots/unit_patterns.
+	ManageUsers []string `yaml:"manage_users"`
+	// PrivilegedGroups extends the built-in root-equivalent set (root, wheel,
+	// sudo, docker). Adding a managed principal to any privileged group requires
+	// an explicit GroupGrants entry.
+	PrivilegedGroups []string `yaml:"privileged_groups"`
+	// GroupGrants maps a principal to the privileged groups it is explicitly
+	// permitted to join. Without a grant, a privileged membership is refused.
+	GroupGrants map[string][]string `yaml:"group_grants"`
 }
 
 // Deny lists paths and unit patterns that are off-limits even when they fall

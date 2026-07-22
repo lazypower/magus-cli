@@ -19,6 +19,42 @@ type IR struct {
 	Directories []Directory
 	Units       []Unit
 	Quadlets    []Quadlet
+	Users       []User
+	Groups      []Group
+}
+
+// User is a declared principal from Butane's passwd.users — a day-2 identity
+// magus reconciles (see docs/adr-0003-principal-reconciliation.md). Only the v1
+// consumed subset is carried; magus reconciles a principal only when policy's
+// manage_users allowlist permits it.
+//
+// UID is *int so "not declared" (nil) is distinct from "declared uid 0" — the
+// ADR requires a uid for every managed principal, enforced at validate. UID and
+// PrimaryGroup and HomeDir are the principal's *identity* (immutable after
+// create); Shell and supplementary Groups are mutable and reconciled each apply.
+//
+// HasPassword / HasSSHKeys record that the Butane declared password_hash or
+// ssh_authorized_keys — both deferred in v1. They are refused at validate for a
+// *managed* principal (a workload account is not a login account); on an
+// unmanaged principal they are Ignition's concern and ignored.
+type User struct {
+	Name         string
+	UID          *int
+	PrimaryGroup string
+	Groups       []string
+	Shell        string
+	HomeDir      string
+	System       bool
+	HasPassword  bool
+	HasSSHKeys   bool
+}
+
+// Group is a declared principal from Butane's passwd.groups. GID is *int for the
+// same not-declared-vs-declared-zero reason as User.UID.
+type Group struct {
+	Name   string
+	GID    *int
+	System bool
 }
 
 // File is a declared regular file under storage.files.

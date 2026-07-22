@@ -261,6 +261,32 @@ func LoadButane(source string, allowInsecureHTTP bool) (*IR, []string, error) {
 		out.Units = append(out.Units, unit)
 	}
 
+	// Principals (passwd.users / passwd.groups). Unlike the storage/systemd
+	// sections these are carried into the IR verbatim; whether magus reconciles a
+	// given principal is a policy decision (manage_users) resolved downstream, not
+	// a parse-time one. An unmanaged principal (e.g. Ignition's `core`) stays
+	// Ignition's concern and is simply never acted on.
+	for _, u := range ign.Passwd.Users {
+		out.Users = append(out.Users, User{
+			Name:         u.Name,
+			UID:          u.UID.v,
+			PrimaryGroup: derefString(u.PrimaryGroup),
+			Groups:       u.Groups,
+			Shell:        derefString(u.Shell),
+			HomeDir:      derefString(u.HomeDir),
+			System:       u.System != nil && *u.System,
+			HasPassword:  u.PasswordHash != nil && *u.PasswordHash != "",
+			HasSSHKeys:   len(u.SSHAuthorizedKeys) > 0,
+		})
+	}
+	for _, g := range ign.Passwd.Groups {
+		out.Groups = append(out.Groups, Group{
+			Name:   g.Name,
+			GID:    g.GID.v,
+			System: g.System != nil && *g.System,
+		})
+	}
+
 	return out, warnings, nil
 }
 
@@ -286,6 +312,31 @@ type ignitionSubset struct {
 	Systemd struct {
 		Units []ignUnit `json:"units"`
 	} `json:"systemd"`
+	Passwd struct {
+		Users  []ignUser  `json:"users"`
+		Groups []ignGroup `json:"groups"`
+	} `json:"passwd"`
+}
+
+// ignUser mirrors the Ignition passwd.users schema. Only the v1 consumed subset
+// is unmarshalled; passwordHash and sshAuthorizedKeys are parsed solely so a
+// managed principal declaring them can be refused at validate (deferred in v1).
+type ignUser struct {
+	Name              string   `json:"name"`
+	UID               intPtr   `json:"uid"`
+	PrimaryGroup      *string  `json:"primaryGroup"`
+	Groups            []string `json:"groups"`
+	Shell             *string  `json:"shell"`
+	HomeDir           *string  `json:"homeDir"`
+	System            *bool    `json:"system"`
+	PasswordHash      *string  `json:"passwordHash"`
+	SSHAuthorizedKeys []string `json:"sshAuthorizedKeys"`
+}
+
+type ignGroup struct {
+	Name   string `json:"name"`
+	GID    intPtr `json:"gid"`
+	System *bool  `json:"system"`
 }
 
 type ignFile struct {
