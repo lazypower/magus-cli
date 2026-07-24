@@ -177,3 +177,102 @@ func (f *Fake) Stop(unit string) error {
 	f.activity[unit] = false
 	return nil
 }
+
+// FakeUser is an in-memory UserManager for tests. Like Fake it records calls in
+// order and supports fail injection; additionally it models the readiness gate
+// (Ready) that the rootless spine's honest-skip turns on.
+type FakeUser struct {
+	mu       sync.Mutex
+	calls    []string
+	states   map[string]string // unit → raw active state
+	ready    bool
+	notReady string           // reason returned when !ready
+	failOn   map[string]error // method-name → error on next call
+}
+
+// NewFakeUser returns a FakeUser that is operational (Ready → true) by default,
+// so the common path activates; call SetReady(false, reason) to exercise the
+// staged-not-activated skip.
+func NewFakeUser() *FakeUser {
+	return &FakeUser{
+		states: map[string]string{},
+		ready:  true,
+		failOn: map[string]error{},
+	}
+}
+
+// SetReady controls what Ready reports (reason is used only when ready is false).
+func (f *FakeUser) SetReady(ready bool, reason string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.ready, f.notReady = ready, reason
+}
+
+// SetActiveState preloads the raw active state Show returns for unit.
+func (f *FakeUser) SetActiveState(unit, state string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.states[unit] = state
+}
+
+// FailNext makes the next call to method return err.
+func (f *FakeUser) FailNext(method string, err error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.failOn[method] = err
+}
+
+// Calls returns the call log in invocation order.
+func (f *FakeUser) Calls() []string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	out := make([]string, len(f.calls))
+	copy(out, f.calls)
+	return out
+}
+
+func (f *FakeUser) record(method string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.calls = append(f.calls, method)
+	if err, ok := f.failOn[method]; ok {
+		delete(f.failOn, method)
+		return err
+	}
+	return nil
+}
+
+func (f *FakeUser) DaemonReload() error     { return f.record("DaemonReload") }
+func (f *FakeUser) Start(unit string) error { return f.record(fmt.Sprintf("Start(%s)", unit)) }
+func (f *FakeUser) Restart(unit string) error {
+	if err := f.record(fmt.Sprintf("Restart(%s)", unit)); err != nil {
+		return err
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.states[unit] = "active"
+	return nil
+}
+
+func (f *FakeUser) Show(unit string) (UnitStatus, error) {
+	if err := f.record(fmt.Sprintf("Show(%s)", unit)); err != nil {
+		return UnitStatus{Enablement: EnablementUnknown, Active: "unknown"}, err
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	active := "inactive"
+	if s, ok := f.states[unit]; ok {
+		active = s
+	}
+	return UnitStatus{Enablement: EnablementStatic, Active: active}, nil
+}
+
+func (f *FakeUser) Ready() (bool, string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.calls = append(f.calls, "Ready")
+	if f.ready {
+		return true, ""
+	}
+	return false, f.notReady
+}
