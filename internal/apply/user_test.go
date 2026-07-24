@@ -252,6 +252,20 @@ func TestStageRefusedOwnerQuadlets(t *testing.T) {
 	}
 }
 
+// A diff ActionError on a refused owner's quadlet is NOT downgraded to a conflict
+// — the host failure must dominate as exit 1, not be hidden behind the refusal.
+func TestStageRefusedOwnerQuadletsPreservesError(t *testing.T) {
+	path := "/var/home/argus/.config/containers/systemd/argusd.container"
+	in := &ir.IR{Quadlets: []ir.Quadlet{{Name: "argusd.container", Path: path, Scope: ir.ScopeUser, Owner: "argus"}}}
+	plan := &diff.Plan{Actions: []diff.ResourceAction{
+		{Path: path, Kind: diff.KindQuadlet, Action: diff.ActionError, Reason: "stat: permission denied"},
+	}}
+	StageRefusedOwnerQuadlets(plan, in, map[string]string{"argus": "uid collision"})
+	if plan.Actions[0].Action != diff.ActionError {
+		t.Errorf("ActionError must be preserved, got %s", plan.Actions[0].Action)
+	}
+}
+
 // The bounded config-tree chown: only ancestors STRICTLY below a real user home
 // are returned; a system-path home (the escalation Codex flagged) yields nothing.
 func TestConfigTreeDirsBounded(t *testing.T) {

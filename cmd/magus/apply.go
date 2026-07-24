@@ -12,6 +12,7 @@ import (
 	"github.com/lazypower/magus-cli/internal/apply"
 	"github.com/lazypower/magus-cli/internal/diff"
 	"github.com/lazypower/magus-cli/internal/hostfs"
+	"github.com/lazypower/magus-cli/internal/ir"
 	"github.com/lazypower/magus-cli/internal/lock"
 	"github.com/lazypower/magus-cli/internal/manifest"
 	"github.com/lazypower/magus-cli/internal/policy"
@@ -126,7 +127,7 @@ func runApply(args []string) int {
 	// (dropping the quadlet from the IR would make the sweep delete a running
 	// workload's source). So mark those quadlets' file actions as conflicts:
 	// magus withholds the write, preserves the manifest, and surfaces the refusal.
-	apply.StageRefusedOwnerQuadlets(plan, parsed, blockedOwners(pplan, nil))
+	apply.StageRefusedOwnerQuadlets(plan, parsed, blockedOwners(pplan, nil, parsed.Users))
 	// Enablement is persistent state reconciled every apply — model it as plan
 	// rows so it's previewed like everything else and a drift can't hide behind
 	// a clean file diff ("Nothing to apply" stays honest).
@@ -199,7 +200,7 @@ func runApply(args []string) int {
 			IR:      parsed,
 			Changed: appliedPaths(result),
 			Refused: refusedPaths(result),
-			Blocked: blockedOwners(pplan, presult),
+			Blocked: blockedOwners(pplan, presult, parsed.Users),
 			Chown:   w,
 			NewUser: func(name string, uid int) systemd.UserManager { return systemd.OSUser(name, uid) },
 		})
@@ -235,16 +236,29 @@ func runApply(args []string) int {
 // create/subuid/linger — to the reason. Its rootless workloads are then staged,
 // never activated: magus must not run a workload as an identity the gate refused
 // or whose prerequisites failed (Codex P1 #2).
-func blockedOwners(pplan *principal.Plan, presult *principal.Result) map[string]string {
+func blockedOwners(pplan *principal.Plan, presult *principal.Result, users []ir.User) map[string]string {
 	blocked := map[string]string{}
-	// Plan-level conflicts. A workload owner is a USER, so only a user conflict
-	// (or a subuid/linger prerequisite) blocks it — NOT a same-named group. The
-	// manifest namespaces user:argus and group:argus separately; collapsing them
-	// here would let a group-gid collision block an otherwise-valid user's
-	// workload (Codex round-3).
+	// Plan-level conflicts. A workload owner is a USER, so a user conflict (or a
+	// subuid/linger prerequisite) blocks it — NOT a same-named group by mere name
+	// (the manifest namespaces user:argus and group:argus separately; collapsing
+	// them would let an unrelated group-gid collision block a valid user — Codex
+	// round-3). But a group that a user actually DEPENDS on (its primary or
+	// supplementary group) failing to reconcile DOES block that user: its declared
+	// group identity didn't converge (Codex round-4).
+	conflictedGroup := map[string]string{}
 	for _, a := range pplan.Actions {
 		if a.Action == principal.ActionConflict && ownerKind(a.Kind) {
 			blocked[a.Name] = a.Reason
+		}
+		if a.Action == principal.ActionConflict && a.Kind == principal.KindGroup {
+			conflictedGroup[a.Name] = a.Reason
+		}
+	}
+	for _, u := range users {
+		for _, g := range append(append([]string(nil), u.Groups...), u.PrimaryGroup) {
+			if reason, ok := conflictedGroup[g]; ok {
+				blocked[u.Name] = fmt.Sprintf("declared group %q did not reconcile (%s)", g, reason)
+			}
 		}
 	}
 	// Apply-level skips/errors (the conflict's skip, or a failed provision step

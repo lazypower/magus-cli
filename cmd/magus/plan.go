@@ -95,6 +95,10 @@ func runPlan(args []string) int {
 		fmt.Fprintf(os.Stderr, "error: %v\n", err)
 		return 1
 	}
+	// Preview the same refusal rewrite apply performs, so plan→apply is an honest
+	// contract: a refused owner's quadlet shows as [conflict] here too, not a
+	// create/update apply would silently withhold (Codex round-4).
+	apply.StageRefusedOwnerQuadlets(plan, parsed, blockedOwners(pplan, nil, parsed.Users))
 
 	if *jsonOut {
 		if code := emitPlanJSON(os.Stdout, butanePath, plan, pplan); code != 0 {

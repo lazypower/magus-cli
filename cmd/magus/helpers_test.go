@@ -259,6 +259,27 @@ func TestSaveStatusObservationRecordsPrincipalConflict(t *testing.T) {
 // A staged user workload (skipped by the activation reconciler) must reach the
 // status observation with its reason — not vanish behind a bare ok-with-skips
 // (Codex P2 #5).
+// blockedOwners blocks a user whose declared group has a conflict (its identity
+// didn't reconcile), but NOT a user merely sharing a name with an unrelated
+// conflicted group (Codex round-3/4).
+func TestBlockedOwnersGroupDependency(t *testing.T) {
+	pplan := &principal.Plan{Actions: []principal.PrincipalAction{
+		{Kind: principal.KindGroup, Name: "appgrp", Action: principal.ActionConflict, Reason: "gid 2000 but host has 3000"},
+		{Kind: principal.KindGroup, Name: "argus", Action: principal.ActionConflict, Reason: "unrelated group named argus"},
+	}}
+	users := []ir.User{
+		{Name: "argus", PrimaryGroup: "appgrp"},  // depends on appgrp → blocked
+		{Name: "bob", Groups: []string{"other"}}, // depends on nothing conflicted → not blocked
+	}
+	got := blockedOwners(pplan, nil, users)
+	if _, ok := got["argus"]; !ok {
+		t.Errorf("argus depends on the conflicted appgrp → must be blocked; got %v", got)
+	}
+	if _, ok := got["bob"]; ok {
+		t.Errorf("bob must NOT be blocked by a same-named group conflict; got %v", got)
+	}
+}
+
 func TestSaveStatusObservationRecordsStagedWorkload(t *testing.T) {
 	statusPath := filepath.Join(t.TempDir(), "status.json")
 	now := time.Unix(1000, 0).UTC()

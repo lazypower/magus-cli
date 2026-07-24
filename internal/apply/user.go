@@ -305,6 +305,12 @@ func StageRefusedOwnerQuadlets(plan *diff.Plan, in *ir.IR, refused map[string]st
 		if !isUserQuad {
 			continue
 		}
+		// Never downgrade a diff ActionError (a stat/read failure that must dominate
+		// as exit 1) into a conflict — the host failure would be hidden. It is
+		// already fail-closed (no write), so leave it as the error it is.
+		if a.Action == diff.ActionError {
+			continue
+		}
 		if reason, isRefused := refused[owner]; isRefused {
 			a.Action = diff.ActionConflict
 			a.Reason = "owner principal " + owner + " refused (" + reason + ")"
