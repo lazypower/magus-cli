@@ -78,6 +78,29 @@ func TestEmitPlanJSON(t *testing.T) {
 	}
 }
 
+// A principal conflict with no filesystem work must still report has_changes:true
+// (it exits 2), so an automation gating on the JSON never treats a refused
+// escalation as clean (Codex P2 #6).
+func TestEmitPlanJSONConflictIsAChange(t *testing.T) {
+	var b bytes.Buffer
+	pp := &principal.Plan{Actions: []principal.PrincipalAction{
+		{Kind: principal.KindUser, Name: "argus", Action: principal.ActionConflict, Reason: "uid 1000 already belongs to \"other\""},
+	}}
+	if code := emitPlanJSON(&b, "src.bu", &diff.Plan{}, pp); code != 0 {
+		t.Fatalf("emitPlanJSON code = %d", code)
+	}
+	var got planJSON
+	if err := json.Unmarshal(b.Bytes(), &got); err != nil {
+		t.Fatal(err)
+	}
+	if !got.HasChanges {
+		t.Errorf("a principal conflict must set has_changes:true, got %+v", got)
+	}
+	if len(got.Principals) != 1 || got.Principals[0].Action != "conflict" {
+		t.Errorf("conflict should appear in principals: %+v", got.Principals)
+	}
+}
+
 // TestEmitPlanJSONPrincipalOnlyChanges proves has_changes reflects principal work
 // even when the file plan is empty — a scriptable consumer gating on the JSON must
 // see that apply would create a principal.
@@ -230,6 +253,38 @@ func TestSaveStatusObservationRecordsPrincipalConflict(t *testing.T) {
 	}
 	if len(rep.Conflicts) != 1 || rep.Conflicts[0].Path != "user:argus" {
 		t.Errorf("principal conflict not recorded: %+v", rep.Conflicts)
+	}
+}
+
+// A staged user workload (skipped by the activation reconciler) must reach the
+// status observation with its reason — not vanish behind a bare ok-with-skips
+// (Codex P2 #5).
+func TestSaveStatusObservationRecordsStagedWorkload(t *testing.T) {
+	statusPath := filepath.Join(t.TempDir(), "status.json")
+	now := time.Unix(1000, 0).UTC()
+	result := &apply.Result{Outcomes: []apply.Outcome{
+		{Path: "/var/home/argus/.config/containers/systemd/argusd.container",
+			Action: diff.ActionSkip, Status: apply.StatusSkipped,
+			Reason: "staged, not activated: /run/user/1000 not present"},
+	}}
+
+	saveStatusObservation(statusPath, &diff.Plan{}, result, &principal.Plan{}, nil, nil, now)
+
+	rep, err := status.Load(statusPath)
+	if err != nil {
+		t.Fatalf("load status: %v", err)
+	}
+	if rep.Result != status.ResultWithSkips {
+		t.Errorf("result = %q, want with-skips", rep.Result)
+	}
+	var found bool
+	for _, c := range rep.Conflicts {
+		if strings.Contains(c.Path, "argusd.container") && strings.Contains(c.Reason, "staged") {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("staged workload not recorded in status: %+v", rep.Conflicts)
 	}
 }
 

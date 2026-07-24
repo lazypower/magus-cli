@@ -1,6 +1,7 @@
 package apply
 
 import (
+	"reflect"
 	"slices"
 	"strings"
 	"testing"
@@ -41,7 +42,7 @@ func TestReconcileUserWorkloadsActivatesInOrder(t *testing.T) {
 		return fu
 	}
 
-	outs := ReconcileUserWorkloads(in, allChanged(in), factory)
+	outs := ReconcileUserWorkloads(UserWorkloads{IR: in, Changed: allChanged(in), NewUser: factory})
 
 	if gotName != "argus" || gotUID != 1000 {
 		t.Errorf("factory called with (%q,%d), want (argus,1000)", gotName, gotUID)
@@ -71,7 +72,7 @@ func TestReconcileUserWorkloadsStagedWhenNotReady(t *testing.T) {
 	fu := systemd.NewFakeUser()
 	fu.SetReady(false, "/run/user/1000 not present — user@1000.service not started (linger enabled?)")
 
-	outs := ReconcileUserWorkloads(in, allChanged(in), func(string, int) systemd.UserManager { return fu })
+	outs := ReconcileUserWorkloads(UserWorkloads{IR: in, Changed: allChanged(in), NewUser: func(string, int) systemd.UserManager { return fu }})
 
 	if len(outs) != 2 {
 		t.Fatalf("want 2 staged outcomes, got %d", len(outs))
@@ -99,7 +100,7 @@ func TestReconcileUserWorkloadsIdempotentWhenActive(t *testing.T) {
 	fu.SetActiveState("argusd.service", "active")
 	fu.SetActiveState("argus-egress-network.service", "active")
 
-	outs := ReconcileUserWorkloads(in, map[string]bool{}, func(string, int) systemd.UserManager { return fu })
+	outs := ReconcileUserWorkloads(UserWorkloads{IR: in, Changed: map[string]bool{}, NewUser: func(string, int) systemd.UserManager { return fu }})
 
 	for _, o := range outs {
 		if o.Status != StatusUnchanged {
@@ -121,7 +122,7 @@ func TestReconcileUserWorkloadsRestartsOnChange(t *testing.T) {
 	fu.SetActiveState("argus-egress-network.service", "active")
 	changed := map[string]bool{"/var/home/argus/.config/containers/systemd/argusd.container": true}
 
-	outs := ReconcileUserWorkloads(in, changed, func(string, int) systemd.UserManager { return fu })
+	outs := ReconcileUserWorkloads(UserWorkloads{IR: in, Changed: changed, NewUser: func(string, int) systemd.UserManager { return fu }})
 
 	var restarted bool
 	for _, o := range outs {
@@ -136,11 +137,11 @@ func TestReconcileUserWorkloadsRestartsOnChange(t *testing.T) {
 
 // No factory or no user workloads → nothing to do (the common all-system case).
 func TestReconcileUserWorkloadsNoop(t *testing.T) {
-	if outs := ReconcileUserWorkloads(argusIR(), nil, nil); outs != nil {
+	if outs := ReconcileUserWorkloads(UserWorkloads{IR: argusIR()}); outs != nil {
 		t.Errorf("nil factory disables activation; got %+v", outs)
 	}
 	sysOnly := &ir.IR{Quadlets: []ir.Quadlet{{Name: "x.container", Scope: ir.ScopeSystem}}}
-	if outs := ReconcileUserWorkloads(sysOnly, nil, func(string, int) systemd.UserManager { return systemd.NewFakeUser() }); outs != nil {
+	if outs := ReconcileUserWorkloads(UserWorkloads{IR: sysOnly, NewUser: func(string, int) systemd.UserManager { return systemd.NewFakeUser() }}); outs != nil {
 		t.Errorf("no user workloads → no outcomes; got %+v", outs)
 	}
 }
@@ -152,12 +153,126 @@ func TestReconcileUserWorkloadsReloadFailureStages(t *testing.T) {
 	fu := systemd.NewFakeUser()
 	fu.FailNext("DaemonReload", errTest)
 
-	outs := ReconcileUserWorkloads(in, allChanged(in), func(string, int) systemd.UserManager { return fu })
+	outs := ReconcileUserWorkloads(UserWorkloads{IR: in, Changed: allChanged(in), NewUser: func(string, int) systemd.UserManager { return fu }})
 	for _, o := range outs {
 		if o.Status != StatusSkipped || !contains(o.Reason, "daemon-reload failed") {
 			t.Errorf("reload failure should stage: %+v", o)
 		}
 	}
+}
+
+// A refused/unreconciled principal (Blocked) never gets its workload activated —
+// it stages, with the owner reason, and the user manager is never touched (P1 #2).
+func TestReconcileUserWorkloadsBlockedOwnerStaged(t *testing.T) {
+	in := argusIR()
+	fu := systemd.NewFakeUser()
+	outs := ReconcileUserWorkloads(UserWorkloads{
+		IR:      in,
+		Changed: allChanged(in),
+		Blocked: map[string]string{"argus": `already in privileged group "docker" without a policy grant`},
+		NewUser: func(string, int) systemd.UserManager { return fu },
+	})
+	if len(outs) != 2 {
+		t.Fatalf("want 2 staged outcomes, got %d", len(outs))
+	}
+	for _, o := range outs {
+		if o.Status != StatusSkipped || !contains(o.Reason, "owner principal not reconciled") || !contains(o.Reason, "docker") {
+			t.Errorf("blocked owner should stage with reason: %+v", o)
+		}
+	}
+	if len(fu.Calls()) != 0 {
+		t.Errorf("a blocked owner's manager must never be driven; saw %v", fu.Calls())
+	}
+}
+
+// The bounded config-tree chown: only ancestors STRICTLY below a real user home
+// are returned; a system-path home (the escalation Codex flagged) yields nothing.
+func TestConfigTreeDirsBounded(t *testing.T) {
+	home := "/var/home/argus"
+	q := "/var/home/argus/.config/containers/systemd/argusd.container"
+	got := configTreeDirs(home, q)
+	want := []string{
+		"/var/home/argus/.config",
+		"/var/home/argus/.config/containers",
+		"/var/home/argus/.config/containers/systemd",
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("configTreeDirs = %v\nwant %v (strictly below home, shallowest-first)", got, want)
+	}
+	// The home itself and anything above it are never included.
+	for _, d := range got {
+		if d == home || len(d) <= len(home) {
+			t.Errorf("%q is not strictly below the home", d)
+		}
+	}
+	// A system-path home is refused outright — no /etc/.config chown vector.
+	if dirs := configTreeDirs("/etc", "/etc/.config/containers/systemd/x.container"); dirs != nil {
+		t.Errorf("system-path home must own nothing, got %v", dirs)
+	}
+	if dirs := configTreeDirs("/var/lib/evil", "/var/lib/evil/.config/x/y.container"); dirs != nil {
+		t.Errorf("non-user-home root must own nothing, got %v", dirs)
+	}
+}
+
+// ownConfigTrees chowns exactly the below-home ancestors to the owner uid, and a
+// chown failure fails closed (surfaced as an error the caller stages on).
+func TestOwnConfigTrees(t *testing.T) {
+	fc := &fakeChowner{}
+	quads := []ir.Quadlet{{Path: "/var/home/argus/.config/containers/systemd/argusd.container"}}
+	if err := ownConfigTrees(fc, "/var/home/argus", quads, 1000); err != nil {
+		t.Fatal(err)
+	}
+	if len(fc.chowned) != 3 {
+		t.Errorf("want 3 dirs chowned, got %v", fc.chowned)
+	}
+	for _, c := range fc.chowned {
+		if c.uid != 1000 {
+			t.Errorf("chown to %d, want 1000", c.uid)
+		}
+	}
+	// A system-path home chowns nothing (bounded, even if the caller passes it).
+	fc2 := &fakeChowner{}
+	_ = ownConfigTrees(fc2, "/etc", []ir.Quadlet{{Path: "/etc/.config/x/y.container"}}, 1000)
+	if len(fc2.chowned) != 0 {
+		t.Errorf("system home must chown nothing, got %v", fc2.chowned)
+	}
+}
+
+func TestFilterUnmanagedUserQuadlets(t *testing.T) {
+	in := &ir.IR{Quadlets: []ir.Quadlet{
+		{Name: "argusd.container", Scope: ir.ScopeUser, Owner: "argus"}, // managed → kept
+		{Name: "core-x.container", Scope: ir.ScopeUser, Owner: "core"},  // unmanaged → dropped
+		{Name: "sys.container", Scope: ir.ScopeSystem},                  // system → kept
+	}}
+	managed := func(n string) bool { return n == "argus" }
+	got := FilterUnmanagedUserQuadlets(in, managed)
+	if len(got.Quadlets) != 2 {
+		t.Fatalf("want 2 kept (argus user + system), got %d: %+v", len(got.Quadlets), got.Quadlets)
+	}
+	for _, q := range got.Quadlets {
+		if q.Owner == "core" {
+			t.Errorf("unmanaged owner's quadlet leaked through: %+v", q)
+		}
+	}
+	// The input is not mutated.
+	if len(in.Quadlets) != 3 {
+		t.Errorf("filter mutated the input IR")
+	}
+}
+
+type chownCall struct {
+	path string
+	uid  int
+}
+type fakeChowner struct{ chowned []chownCall }
+
+func (f *fakeChowner) Chown(path string, uid, gid *int) error {
+	u := -1
+	if uid != nil {
+		u = *uid
+	}
+	f.chowned = append(f.chowned, chownCall{path, u})
+	return nil
 }
 
 // assertBefore checks a appears before b in calls.

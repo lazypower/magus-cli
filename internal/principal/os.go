@@ -175,7 +175,7 @@ func OSExecutor() Executor { return osExecutor{run: runCmd, subidState: readSubi
 
 type osExecutor struct {
 	run        func(name string, args ...string) error
-	subidState func() (present map[string]bool, used []subRange, err error)
+	subidState func() (inUID, inGID map[string]bool, used []subRange, err error)
 }
 
 func (e osExecutor) UserAdd(u ir.User, locked bool) error {
@@ -210,15 +210,19 @@ func (e osExecutor) GroupAdd(g ir.Group) error {
 // no-op; otherwise it allocates the next free range, preserving every other
 // principal's line in the shared /etc/subuid+/etc/subgid registries.
 func (e osExecutor) EnsureSubid(name string) error {
-	present, used, err := e.subidState()
+	inUID, inGID, used, err := e.subidState()
 	if err != nil {
 		return err
 	}
-	if present[name] {
-		return nil
+	if inUID[name] && inGID[name] {
+		return nil // both ranges present — nothing to do
 	}
+	// Add only the side(s) actually missing, from one freshly-picked range — so an
+	// asymmetric state (e.g. subuid present, subgid absent) is repaired without
+	// duplicating the side that already exists. Never claims success without the
+	// usermod call the plan promised (Codex P2 #4).
 	start := nextFreeSubStart(used, subIDMin)
-	return e.run("usermod", subidArgs(name, start, subIDCount)...)
+	return e.run("usermod", subidArgs(name, start, subIDCount, !inUID[name], !inGID[name])...)
 }
 
 // EnableLinger is idempotent: loginctl enable-linger on an already-lingering
@@ -227,12 +231,20 @@ func (e osExecutor) EnableLinger(name string) error {
 	return e.run("loginctl", "enable-linger", name)
 }
 
-// subidArgs builds the usermod argv that grants name a subordinate uid AND gid
-// range of count ids starting at start (same range for both, the rootless
-// convention). Pure — unit-tested.
-func subidArgs(name string, start, count int) []string {
+// subidArgs builds the usermod argv that grants name the requested subordinate
+// range(s) of count ids starting at start (same range for uid and gid, the
+// rootless convention). addUID/addGID select which side(s) to add, so an
+// asymmetric repair touches only the missing file. Pure — unit-tested.
+func subidArgs(name string, start, count int, addUID, addGID bool) []string {
 	r := fmt.Sprintf("%d-%d", start, start+count-1)
-	return []string{"--add-subuids", r, "--add-subgids", r, name}
+	var args []string
+	if addUID {
+		args = append(args, "--add-subuids", r)
+	}
+	if addGID {
+		args = append(args, "--add-subgids", r)
+	}
+	return append(args, name)
 }
 
 // --- subordinate-id / linger host reads (thin seams) --------------------------
@@ -278,27 +290,28 @@ func nameInSubidFile(path, name string) (bool, error) {
 // subuid range (so provision is skipped) and every allocated range across both
 // files (so the next free range never overlaps). Missing files are empty, not an
 // error.
-func readSubidState() (map[string]bool, []subRange, error) {
-	present := map[string]bool{}
-	var used []subRange
-	for _, path := range []string{subuidPath, subgidPath} {
-		data, err := os.ReadFile(path)
+func readSubidState() (inUID, inGID map[string]bool, used []subRange, err error) {
+	inUID, inGID = map[string]bool{}, map[string]bool{}
+	files := []struct {
+		path string
+		set  map[string]bool
+	}{{subuidPath, inUID}, {subgidPath, inGID}}
+	for _, f := range files {
+		data, err := os.ReadFile(f.path)
 		if err != nil {
 			if errors.Is(err, fs.ErrNotExist) {
 				continue
 			}
-			return nil, nil, err
+			return nil, nil, nil, err
 		}
 		used = append(used, parseSubidFile(string(data))...)
-		if path == subuidPath {
-			for _, line := range strings.Split(string(data), "\n") {
-				if name, _, ok := strings.Cut(line, ":"); ok && name != "" {
-					present[name] = true
-				}
+		for _, line := range strings.Split(string(data), "\n") {
+			if name, _, ok := strings.Cut(line, ":"); ok && name != "" {
+				f.set[name] = true
 			}
 		}
 	}
-	return present, used, nil
+	return inUID, inGID, used, nil
 }
 
 // lingerEnabled reports whether the /var/lib/systemd/linger/<name> marker

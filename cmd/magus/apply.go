@@ -77,6 +77,10 @@ func runApply(args []string) int {
 	if !ok {
 		return 1
 	}
+	// A user-scope quadlet under an UNMANAGED principal's home is Ignition's, not
+	// magus's — drop it before any reconciliation so it is never written or run as
+	// that user (the manage_users boundary, for workloads).
+	parsed = apply.FilterUnmanagedUserQuadlets(parsed, p.Manages)
 
 	now := time.Now().UTC()
 
@@ -179,8 +183,12 @@ func runApply(args []string) int {
 	// Their outcomes fold into the result so the summary, exit code, and status
 	// observation account for them (a staged workload is exit 2, never green).
 	if hasUserWork {
-		uOutcomes := apply.ReconcileUserWorkloads(parsed, appliedPaths(result), func(name string, uid int) systemd.UserManager {
-			return systemd.OSUser(name, uid)
+		uOutcomes := apply.ReconcileUserWorkloads(apply.UserWorkloads{
+			IR:      parsed,
+			Changed: appliedPaths(result),
+			Blocked: blockedOwners(pplan, presult),
+			Chown:   w,
+			NewUser: func(name string, uid int) systemd.UserManager { return systemd.OSUser(name, uid) },
 		})
 		for _, oc := range uOutcomes {
 			printOutcome(os.Stdout, oc)
@@ -207,6 +215,35 @@ func runApply(args []string) int {
 	fmt.Printf("Applied %d changes, %d skipped, %d errors.  exit %d\n",
 		a+pa, s+ps, e+pe, exit)
 	return exit
+}
+
+// blockedOwners maps each principal that did NOT reconcile cleanly — a refused
+// conflict (uid collision, ungranted privileged group) or a failed
+// create/subuid/linger — to the reason. Its rootless workloads are then staged,
+// never activated: magus must not run a workload as an identity the gate refused
+// or whose prerequisites failed (Codex P1 #2).
+func blockedOwners(pplan *principal.Plan, presult *principal.Result) map[string]string {
+	blocked := map[string]string{}
+	// Plan-level conflicts (a refused principal — the apply may only skip it).
+	for _, a := range pplan.Actions {
+		if a.Action == principal.ActionConflict {
+			blocked[a.Name] = a.Reason
+		}
+	}
+	// Apply-level skips/errors (the conflict's skip, or a failed provision step
+	// keyed by the owning principal's name).
+	if presult != nil {
+		for _, oc := range presult.Outcomes {
+			if oc.Status == principal.StatusSkipped || oc.Status == principal.StatusErrored {
+				reason := oc.Reason
+				if oc.Err != nil {
+					reason = oc.Err.Error()
+				}
+				blocked[oc.Name] = reason
+			}
+		}
+	}
+	return blocked
 }
 
 // appliedPaths is the set of resource paths this apply actually wrote (applied),
@@ -308,6 +345,22 @@ func saveStatusObservation(statusPath string, plan *diff.Plan, result *apply.Res
 	for _, a := range pplan.Actions {
 		if a.Action == principal.ActionConflict {
 			conflicts = append(conflicts, status.Conflict{Path: principalRef(a.Kind, a.Name), Reason: a.Reason})
+		}
+	}
+	// A staged user workload (the activation reconciler skipped it — user manager
+	// down, owner refused, tree unownable) is an unresolved state too: record it
+	// so `magus status` names the staged workload and its reason instead of a bare
+	// ok-with-skips (Codex P2 #5). Deduped by path against the conflicts above.
+	seen := map[string]bool{}
+	for _, c := range conflicts {
+		seen[c.Path] = true
+	}
+	if result != nil {
+		for _, oc := range result.Outcomes {
+			if oc.Status == apply.StatusSkipped && !seen[oc.Path] {
+				conflicts = append(conflicts, status.Conflict{Path: oc.Path, Reason: oc.Reason})
+				seen[oc.Path] = true
+			}
 		}
 	}
 

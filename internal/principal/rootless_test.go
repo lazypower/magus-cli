@@ -44,10 +44,17 @@ func TestParseSubidFileAndNextFreeStart(t *testing.T) {
 }
 
 func TestSubidArgs(t *testing.T) {
-	got := subidArgs("argus", 231072, 65536)
+	// Both sides missing → both added.
+	got := subidArgs("argus", 231072, 65536, true, true)
 	want := []string{"--add-subuids", "231072-296607", "--add-subgids", "231072-296607", "argus"}
 	if !reflect.DeepEqual(got, want) {
-		t.Errorf("subidArgs = %v\nwant %v", got, want)
+		t.Errorf("subidArgs(both) = %v\nwant %v", got, want)
+	}
+	// Only subgid missing → only --add-subgids (no duplicate subuid).
+	got = subidArgs("argus", 231072, 65536, false, true)
+	want = []string{"--add-subgids", "231072-296607", "argus"}
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("subidArgs(gid only) = %v\nwant %v", got, want)
 	}
 }
 
@@ -138,27 +145,40 @@ func TestApplyRunsRootlessProvisions(t *testing.T) {
 // already exists, next-free usermod otherwise.
 func TestOSExecutorEnsureSubid(t *testing.T) {
 	rec := &recorder{}
-	// argus already has a range → no write.
-	ex := osExecutor{run: rec.run, subidState: func() (map[string]bool, []subRange, error) {
-		return map[string]bool{"argus": true}, []subRange{{100000, 65536}}, nil
+	// argus has BOTH ranges → no write.
+	ex := osExecutor{run: rec.run, subidState: func() (map[string]bool, map[string]bool, []subRange, error) {
+		return map[string]bool{"argus": true}, map[string]bool{"argus": true}, []subRange{{100000, 65536}}, nil
 	}}
 	if err := ex.EnsureSubid("argus"); err != nil {
 		t.Fatal(err)
 	}
 	if len(rec.calls) != 0 {
-		t.Errorf("subuid already present → no usermod; got %v", rec.calls)
+		t.Errorf("both ranges present → no usermod; got %v", rec.calls)
 	}
 
-	// argus missing → usermod with the next free range above core's.
+	// argus missing both → usermod adds both, next free range above core's.
 	rec2 := &recorder{}
-	ex2 := osExecutor{run: rec2.run, subidState: func() (map[string]bool, []subRange, error) {
-		return map[string]bool{"core": true}, []subRange{{100000, 65536}}, nil
+	ex2 := osExecutor{run: rec2.run, subidState: func() (map[string]bool, map[string]bool, []subRange, error) {
+		return map[string]bool{"core": true}, map[string]bool{"core": true}, []subRange{{100000, 65536}}, nil
 	}}
 	if err := ex2.EnsureSubid("argus"); err != nil {
 		t.Fatal(err)
 	}
-	if len(rec2.calls) != 1 || rec2.calls[0][0] != "usermod" || rec2.calls[0][2] != "165536-231071" {
-		t.Errorf("EnsureSubid argv = %v (want usermod --add-subuids 165536-231071 ...)", rec2.calls)
+	if len(rec2.calls) != 1 || rec2.calls[0][0] != "usermod" ||
+		rec2.calls[0][1] != "--add-subuids" || rec2.calls[0][2] != "165536-231071" {
+		t.Errorf("EnsureSubid argv = %v (want usermod --add-subuids 165536-231071 --add-subgids ...)", rec2.calls)
+	}
+
+	// Asymmetric: subuid present, subgid absent → add ONLY subgid (no duplicate).
+	rec3 := &recorder{}
+	ex3 := osExecutor{run: rec3.run, subidState: func() (map[string]bool, map[string]bool, []subRange, error) {
+		return map[string]bool{"argus": true}, map[string]bool{}, []subRange{{100000, 65536}}, nil
+	}}
+	if err := ex3.EnsureSubid("argus"); err != nil {
+		t.Fatal(err)
+	}
+	if len(rec3.calls) != 1 || rec3.calls[0][1] != "--add-subgids" {
+		t.Errorf("asymmetric repair should add only subgid; got %v", rec3.calls)
 	}
 }
 
@@ -198,13 +218,16 @@ func TestSubidAndLingerHostReads(t *testing.T) {
 		t.Errorf("subidPresent(half) must be false — only in subuid, not subgid")
 	}
 
-	// readSubidState unions ranges across both files and records subuid names.
-	present, used, err := readSubidState()
+	// readSubidState records names PER FILE and unions ranges across both.
+	inUID, inGID, used, err := readSubidState()
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !present["core"] || !present["half"] {
-		t.Errorf("readSubidState names = %v, want core+half", present)
+	if !inUID["core"] || !inUID["half"] {
+		t.Errorf("inUID = %v, want core+half", inUID)
+	}
+	if !inGID["core"] || !inGID["argus"] || inGID["half"] {
+		t.Errorf("inGID = %v, want core+argus (not half — subgid never got it)", inGID)
 	}
 	if got := nextFreeSubStart(used, subIDMin); got != 365536 {
 		t.Errorf("nextFreeSubStart over both files = %d, want 365536", got)
@@ -226,9 +249,9 @@ func TestSubidReadsTolerateMissingFiles(t *testing.T) {
 	if ok, err := subidPresent("argus"); err != nil || ok {
 		t.Errorf("missing subuid → absent, not error; got %v,%v", ok, err)
 	}
-	present, used, err := readSubidState()
-	if err != nil || len(present) != 0 || len(used) != 0 {
-		t.Errorf("missing files → empty state; got %v,%v,%v", present, used, err)
+	inUID, inGID, used, err := readSubidState()
+	if err != nil || len(inUID) != 0 || len(inGID) != 0 || len(used) != 0 {
+		t.Errorf("missing files → empty state; got %v,%v,%v,%v", inUID, inGID, used, err)
 	}
 	if ok, err := lingerEnabled("argus"); err != nil || ok {
 		t.Errorf("missing marker → not lingering, not error; got %v,%v", ok, err)

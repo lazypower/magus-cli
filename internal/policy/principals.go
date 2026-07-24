@@ -3,6 +3,7 @@ package policy
 import (
 	"fmt"
 	"strconv"
+	"strings"
 
 	"github.com/lazypower/magus-cli/internal/ir"
 )
@@ -76,6 +77,17 @@ func (p *Policy) GrantsPrivilegedGroup(principal, group string) bool {
 func (p *Policy) checkPrincipals(in *ir.IR) []Violation {
 	var v []Violation
 
+	// Principals that own rootless (user-scope) workloads: their home is where
+	// magus writes and CHOWNS a config tree, so the home must be a real user home,
+	// never a system path — else magus could be steered into chowning /etc/... to
+	// an unprivileged uid (defense in depth behind the bounded chown).
+	rootlessOwners := map[string]bool{}
+	for _, q := range in.Quadlets {
+		if q.Scope == ir.ScopeUser && q.Owner != "" {
+			rootlessOwners[q.Owner] = true
+		}
+	}
+
 	for _, u := range in.Users {
 		if !p.Manages(u.Name) {
 			continue // unmanaged principal: Ignition's, not magus's
@@ -84,6 +96,9 @@ func (p *Policy) checkPrincipals(in *ir.IR) []Violation {
 
 		if u.UID == nil {
 			v = append(v, Violation{Resource: res, Reason: "managed principal must declare a uid (deterministic UIDs — no implicit allocation)"})
+		}
+		if rootlessOwners[u.Name] && !isUserHome(u.HomeDir) {
+			v = append(v, Violation{Resource: res, Reason: fmt.Sprintf("a rootless-workload owner must declare home_dir under /var/home/<name> or /home/<name> (got %q); magus owns the config tree there and must never chown a system path", u.HomeDir)})
 		}
 		if u.HasPassword {
 			v = append(v, Violation{Resource: res, Reason: "password_hash is not supported in v1 for a managed principal (created accounts are password-locked; a workload account is not a login account)"})
@@ -111,6 +126,21 @@ func (p *Policy) checkPrincipals(in *ir.IR) []Violation {
 	}
 
 	return v
+}
+
+// isUserHome reports whether home is directly beneath a user-home root
+// (/var/home/<name> or /home/<name>, one component, no traversal) — the only
+// place a managed rootless principal's home may live.
+func isUserHome(home string) bool {
+	if strings.Contains(home, "..") {
+		return false
+	}
+	for _, root := range []string{"/var/home/", "/home/"} {
+		if rest, ok := strings.CutPrefix(home, root); ok && rest != "" && !strings.Contains(rest, "/") {
+			return true
+		}
+	}
+	return false
 }
 
 // appendGroupGateViolation enforces the privileged-group gate for one declared

@@ -155,6 +155,18 @@ func (p *Plan) HasWork() bool {
 	return false
 }
 
+// HasConflict reports whether any principal is a conflict — a pending,
+// exit-2 state that a converged-vs-not signal (plan --json has_changes) must
+// reflect even though it is not "work" magus will perform.
+func (p *Plan) HasConflict() bool {
+	for _, a := range p.Actions {
+		if a.Action == ActionConflict {
+			return true
+		}
+	}
+	return false
+}
+
 // privilegedMemberships returns the privileged groups a principal holds
 // (declared or actual) that policy does not grant — the escalation the gate must
 // refuse. Sorted for deterministic diagnostics.

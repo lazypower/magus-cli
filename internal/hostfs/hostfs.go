@@ -140,7 +140,12 @@ func (osImpl) ResolvePath(path string) (string, error) {
 }
 
 func (osImpl) WriteFile(path string, contents []byte, mode uint32, uid, gid *int) error {
-	if err := mkdirAllOwned(filepath.Dir(path), 0o755, uid, gid); err != nil {
+	// Parent dirs are created root-owned (never chowned to the file's owner):
+	// chowning created ancestors to an arbitrary uid is a privilege-escalation
+	// vector (a system dir handed to an unprivileged user). A user-scope quadlet's
+	// home config tree is owned separately and *bounded* below the principal's
+	// home by the user-workload reconciler — see apply.chownUserConfigTree.
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
 		return err
 	}
 	tmp := path + ".magus.tmp"
@@ -199,48 +204,6 @@ func (osImpl) WriteFile(path string, contents []byte, mode uint32, uid, gid *int
 	// fsync the parent directory so the rename survives a crash, not just the
 	// file contents (which were fsync'd before the rename above).
 	return fsyncDir(filepath.Dir(path))
-}
-
-// mkdirAllOwned creates the missing directory components of dir (like
-// os.MkdirAll) and, when uid/gid is set, chowns each directory it CREATES to
-// that owner. It stops at the first existing ancestor and never touches it — so
-// a user-owned file written deep under a principal's home (a rootless quadlet
-// under <home>/.config/containers/systemd/) leaves the whole created .config
-// subtree owned by the principal, as rootless podman requires, while the
-// useradd-made home above it is left exactly as found. For an unowned write
-// (uid/gid nil, the system-file case) it behaves like os.MkdirAll: root-created,
-// unchowned.
-func mkdirAllOwned(dir string, mode os.FileMode, uid, gid *int) error {
-	if dir == "" {
-		return nil
-	}
-	// Collect the missing components from the leaf up to the first that exists.
-	var missing []string
-	for p := dir; ; {
-		if _, err := os.Stat(p); err == nil {
-			break
-		} else if !errors.Is(err, fs.ErrNotExist) {
-			return err
-		}
-		missing = append(missing, p)
-		parent := filepath.Dir(p)
-		if parent == p {
-			break // reached the root
-		}
-		p = parent
-	}
-	// Create shallowest-first so parents exist before children.
-	for i := len(missing) - 1; i >= 0; i-- {
-		if err := os.Mkdir(missing[i], mode); err != nil && !errors.Is(err, fs.ErrExist) {
-			return err
-		}
-		if uid != nil || gid != nil {
-			if err := (osImpl{}).Chown(missing[i], uid, gid); err != nil {
-				return err
-			}
-		}
-	}
-	return nil
 }
 
 // fsyncDir flushes a directory's metadata so a rename into it is crash-durable.

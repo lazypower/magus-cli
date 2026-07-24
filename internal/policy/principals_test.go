@@ -93,6 +93,50 @@ func TestCheckPrincipalNumericGroupRefused(t *testing.T) {
 	}
 }
 
+// A rootless-workload owner must declare a home under /var/home|/home — a
+// system-path home is refused at validate (defense behind the bounded chown).
+func TestCheckPrincipalRootlessHomeGate(t *testing.T) {
+	userQuad := func(owner string) ir.Quadlet {
+		return ir.Quadlet{Name: "x.container", Scope: ir.ScopeUser, Owner: owner}
+	}
+	// home under /etc → rejected.
+	bad := Check(managePolicy(false), &ir.IR{
+		Users:    []ir.User{{Name: "argus", UID: pint(1000), HomeDir: "/etc"}},
+		Quadlets: []ir.Quadlet{userQuad("argus")},
+	})
+	if !hasReason(bad, "home_dir under") {
+		t.Errorf("rootless owner with home=/etc must be rejected, got %v", bad)
+	}
+	// a legitimate /var/home home → passes.
+	ok := Check(managePolicy(false), &ir.IR{
+		Users:    []ir.User{{Name: "argus", UID: pint(1000), HomeDir: "/var/home/argus"}},
+		Quadlets: []ir.Quadlet{userQuad("argus")},
+	})
+	if hasReason(ok, "home_dir under") {
+		t.Errorf("rootless owner with /var/home home must pass, got %v", ok)
+	}
+	// a principal that owns NO user workload isn't subject to the home gate.
+	noWorkload := Check(managePolicy(false), &ir.IR{
+		Users: []ir.User{{Name: "argus", UID: pint(1000), HomeDir: "/opt/argus"}},
+	})
+	if hasReason(noWorkload, "home_dir under") {
+		t.Errorf("non-owner should not hit the rootless home gate, got %v", noWorkload)
+	}
+}
+
+func TestIsUserHome(t *testing.T) {
+	for _, h := range []string{"/var/home/argus", "/home/argus"} {
+		if !isUserHome(h) {
+			t.Errorf("%q should be a user home", h)
+		}
+	}
+	for _, h := range []string{"/etc", "/var/lib/x", "/var/home", "/home", "/var/home/a/b", "/var/home/../etc", ""} {
+		if isUserHome(h) {
+			t.Errorf("%q must NOT be a user home", h)
+		}
+	}
+}
+
 func TestGateMethods(t *testing.T) {
 	p := &Policy{
 		Version:          1,

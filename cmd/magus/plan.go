@@ -8,6 +8,7 @@ import (
 	"os"
 	"time"
 
+	"github.com/lazypower/magus-cli/internal/apply"
 	"github.com/lazypower/magus-cli/internal/diff"
 	"github.com/lazypower/magus-cli/internal/explain"
 	"github.com/lazypower/magus-cli/internal/hostfs"
@@ -68,6 +69,9 @@ func runPlan(args []string) int {
 	if !ok {
 		return 1
 	}
+	// Ignore user-scope quadlets under an unmanaged principal's home, so plan
+	// mirrors what apply will (not) do (manage_users boundary, for workloads).
+	parsed = apply.FilterUnmanagedUserQuadlets(parsed, p.Manages)
 
 	// Surface (but don't persist — plan is read-only) any owned paths the
 	// current policy now denies: they show as [orphaned], not as deletes.
@@ -159,7 +163,7 @@ type principalActionJSON struct {
 func emitPlanJSON(w io.Writer, source string, p *diff.Plan, pp *principal.Plan) int {
 	out := planJSON{
 		Source:         source,
-		HasChanges:     p.HasChanges() || pp.HasWork(),
+		HasChanges:     p.HasChanges() || pp.HasWork() || pp.HasConflict(),
 		Actions:        make([]actionJSON, 0, len(p.Actions)),
 		ServiceActions: make([]serviceActionJSON, 0, len(p.ServiceActions)),
 		Principals:     make([]principalActionJSON, 0, len(pp.Actions)),
