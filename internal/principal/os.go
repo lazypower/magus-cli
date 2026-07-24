@@ -39,7 +39,14 @@ func (r osReader) LookupUser(name string) (ActualUser, error) {
 	} else if ok {
 		a.PrimaryGroup = pg
 	}
-	all, _ := r.idGroups(name)
+	// Fail closed: a supplementary-group read that errors (NSS/SSSD/LDAP
+	// transient, `id` unavailable) must NOT look like "member of no groups" —
+	// that would let adoption silently absorb an existing privileged membership
+	// (e.g. wheel) the create path would have refused. Halt instead of guessing.
+	all, err := r.idGroups(name)
+	if err != nil {
+		return ActualUser{}, fmt.Errorf("read supplementary groups for %s: %w", name, err)
+	}
 	a.Groups = filterPrimary(all, a.PrimaryGroup)
 	return a, nil
 }

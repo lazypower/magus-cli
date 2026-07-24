@@ -126,7 +126,7 @@ func runApply(args []string) int {
 	if changes == 0 && conflicts == 0 && errored == 0 {
 		// Already converged. Refresh the observation (keeps last_apply current
 		// on a timer that mostly runs no-op applies) and exit.
-		saveStatusObservation(*statusPath, plan, nil, apply.ObserveUnits(parsed, sd), now)
+		saveStatusObservation(*statusPath, plan, nil, pplan, nil, apply.ObserveUnits(parsed, sd), now)
 		fmt.Println("\nNothing to apply.")
 		return 0
 	}
@@ -135,7 +135,7 @@ func runApply(args []string) int {
 		// recorded so `magus status` reflects them (and the exit code is 2,
 		// "conflicts present") — regardless of --yes. No prompt: there's nothing
 		// to confirm.
-		saveStatusObservation(*statusPath, plan, nil, apply.ObserveUnits(parsed, sd), now)
+		saveStatusObservation(*statusPath, plan, nil, pplan, nil, apply.ObserveUnits(parsed, sd), now)
 		fmt.Printf("\n%d conflict%s present, nothing to apply.\n", conflicts, plural(conflicts))
 		return 2
 	}
@@ -174,7 +174,7 @@ func runApply(args []string) int {
 		return 1
 	}
 
-	saveStatusObservation(*statusPath, plan, result, nil, now)
+	saveStatusObservation(*statusPath, plan, result, pplan, presult, nil, now)
 
 	a, _, s, e := result.Counts()
 	exit := result.ExitCode()
@@ -255,7 +255,7 @@ func printPrincipalOutcome(w io.Writer, oc principal.Outcome) {
 // no-op (result=ok) with the supplied observed unit states. first_seen for
 // recurring conflicts is carried forward by status.Build. A write failure is a
 // warning, never fatal — the apply already succeeded and the manifest is saved.
-func saveStatusObservation(statusPath string, plan *diff.Plan, result *apply.Result, fallbackUnits map[string]string, now time.Time) {
+func saveStatusObservation(statusPath string, plan *diff.Plan, result *apply.Result, pplan *principal.Plan, presult *principal.Result, fallbackUnits map[string]string, now time.Time) {
 	conflicts := []status.Conflict{}
 	for _, a := range plan.Actions {
 		if a.Action == diff.ActionConflict {
@@ -268,6 +268,14 @@ func saveStatusObservation(statusPath string, plan *diff.Plan, result *apply.Res
 	for _, sa := range plan.ServiceActions {
 		if sa.Op == diff.ServiceSkip {
 			conflicts = append(conflicts, status.Conflict{Path: sa.Unit, Reason: sa.Reason})
+		}
+	}
+	// A refused principal escalation (uid collision, ungranted privileged group)
+	// is an in-scope conflict too — record it so a principal-only escalation
+	// refusal reaches `magus status` instead of reading as a clean result.
+	for _, a := range pplan.Actions {
+		if a.Action == principal.ActionConflict {
+			conflicts = append(conflicts, status.Conflict{Path: principalRef(a.Kind, a.Name), Reason: a.Reason})
 		}
 	}
 
@@ -286,7 +294,27 @@ func saveStatusObservation(statusPath string, plan *diff.Plan, result *apply.Res
 		}
 		res = statusResultString(result.ExitCode())
 		units = result.UnitStates
-	} else if len(conflicts) > 0 {
+	}
+	// Principal apply errors (a useradd/usermod that failed mid-apply) are
+	// recorded like file errors so status never reads green over a real failure.
+	if presult != nil {
+		for _, oc := range presult.Outcomes {
+			if oc.Status == principal.StatusErrored {
+				msg := oc.Reason
+				if oc.Err != nil {
+					msg = oc.Err.Error()
+				}
+				errs = append(errs, status.ErrEntry{Path: principalRef(oc.Kind, oc.Name), Reason: msg})
+			}
+		}
+	}
+	// Escalate the recorded result to match what was actually observed: any error
+	// dominates; otherwise a conflict (file, enablement, or principal) is a skip.
+	// This keeps status honest on the no-apply paths (result==nil) too.
+	switch {
+	case len(errs) > 0:
+		res = status.ResultError
+	case len(conflicts) > 0 && res == status.ResultOK:
 		res = status.ResultWithSkips
 	}
 
@@ -295,6 +323,13 @@ func saveStatusObservation(statusPath string, plan *diff.Plan, result *apply.Res
 	if err := rep.Save(statusPath); err != nil {
 		fmt.Fprintf(os.Stderr, "warning: failed to write status observation: %v\n", err)
 	}
+}
+
+// principalRef renders a principal's status/error path as "<kind>:<name>" (e.g.
+// "user:argus") so identity conflicts and errors are distinguishable from file
+// paths in the observation.
+func principalRef(kind principal.Kind, name string) string {
+	return string(kind) + ":" + name
 }
 
 // statusResultString maps an apply exit code to the observation result string.

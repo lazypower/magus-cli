@@ -93,7 +93,7 @@ func runPlan(args []string) int {
 	}
 
 	if *jsonOut {
-		if code := emitPlanJSON(os.Stdout, butanePath, plan); code != 0 {
+		if code := emitPlanJSON(os.Stdout, butanePath, plan, pplan); code != 0 {
 			return code
 		}
 	} else {
@@ -122,10 +122,11 @@ func runPlan(args []string) int {
 // LLM-facing contract and status the structured surface — plan, the thing an
 // agent gates on before `apply --yes`, gets a structured surface too (UX3).
 type planJSON struct {
-	Source         string              `json:"source"`
-	HasChanges     bool                `json:"has_changes"`
-	Actions        []actionJSON        `json:"actions"`
-	ServiceActions []serviceActionJSON `json:"service_actions"`
+	Source         string                `json:"source"`
+	HasChanges     bool                  `json:"has_changes"`
+	Actions        []actionJSON          `json:"actions"`
+	ServiceActions []serviceActionJSON   `json:"service_actions"`
+	Principals     []principalActionJSON `json:"principals"`
 }
 
 type actionJSON struct {
@@ -143,14 +144,25 @@ type serviceActionJSON struct {
 	Reason string `json:"reason,omitempty"`
 }
 
+// principalActionJSON is a user/group action in the machine-readable plan. Without
+// it a scriptable consumer gating on the JSON sees no identity work while apply
+// would create or alter a principal — the plan JSON must mirror what apply does.
+type principalActionJSON struct {
+	Kind   string `json:"kind"`
+	Name   string `json:"name"`
+	Action string `json:"action"`
+	Reason string `json:"reason,omitempty"`
+}
+
 // emitPlanJSON writes the plan as indented JSON. Returns 0 on success, 1 on a
 // (near-impossible) encode error.
-func emitPlanJSON(w io.Writer, source string, p *diff.Plan) int {
+func emitPlanJSON(w io.Writer, source string, p *diff.Plan, pp *principal.Plan) int {
 	out := planJSON{
 		Source:         source,
-		HasChanges:     p.HasChanges(),
+		HasChanges:     p.HasChanges() || pp.HasWork(),
 		Actions:        make([]actionJSON, 0, len(p.Actions)),
 		ServiceActions: make([]serviceActionJSON, 0, len(p.ServiceActions)),
+		Principals:     make([]principalActionJSON, 0, len(pp.Actions)),
 	}
 	for _, a := range p.Actions {
 		out.Actions = append(out.Actions, actionJSON{
@@ -167,6 +179,14 @@ func emitPlanJSON(w io.Writer, source string, p *diff.Plan) int {
 			Unit:   sa.Unit,
 			Op:     string(sa.Op),
 			Reason: sa.Reason,
+		})
+	}
+	for _, a := range pp.Actions {
+		out.Principals = append(out.Principals, principalActionJSON{
+			Kind:   string(a.Kind),
+			Name:   a.Name,
+			Action: string(a.Action),
+			Reason: a.Reason,
 		})
 	}
 	enc := json.NewEncoder(w)

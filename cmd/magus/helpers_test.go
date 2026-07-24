@@ -3,6 +3,8 @@ package main
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -11,6 +13,7 @@ import (
 	"github.com/lazypower/magus-cli/internal/diff"
 	"github.com/lazypower/magus-cli/internal/ir"
 	"github.com/lazypower/magus-cli/internal/manifest"
+	"github.com/lazypower/magus-cli/internal/principal"
 	"github.com/lazypower/magus-cli/internal/status"
 )
 
@@ -50,7 +53,10 @@ func TestEmitPlanJSON(t *testing.T) {
 			{Unit: "x.service", Op: diff.ServiceEnable, Reason: "drift"},
 		},
 	}
-	if code := emitPlanJSON(&b, "src.bu", p); code != 0 {
+	pp := &principal.Plan{Actions: []principal.PrincipalAction{
+		{Kind: principal.KindUser, Name: "argus", Action: principal.ActionCreate, Reason: "create user (uid 1000, locked, nologin)"},
+	}}
+	if code := emitPlanJSON(&b, "src.bu", p, pp); code != 0 {
 		t.Fatalf("emitPlanJSON code = %d", code)
 	}
 	var got planJSON
@@ -65,6 +71,34 @@ func TestEmitPlanJSON(t *testing.T) {
 	}
 	if len(got.ServiceActions) != 1 || got.ServiceActions[0].Op != "enable" {
 		t.Errorf("service actions wrong: %+v", got.ServiceActions)
+	}
+	if len(got.Principals) != 1 || got.Principals[0].Kind != "user" ||
+		got.Principals[0].Name != "argus" || got.Principals[0].Action != "create" {
+		t.Errorf("principals wrong: %+v", got.Principals)
+	}
+}
+
+// TestEmitPlanJSONPrincipalOnlyChanges proves has_changes reflects principal work
+// even when the file plan is empty — a scriptable consumer gating on the JSON must
+// see that apply would create a principal.
+func TestEmitPlanJSONPrincipalOnlyChanges(t *testing.T) {
+	var b bytes.Buffer
+	p := &diff.Plan{}
+	pp := &principal.Plan{Actions: []principal.PrincipalAction{
+		{Kind: principal.KindGroup, Name: "argus", Action: principal.ActionCreate, Reason: "create group"},
+	}}
+	if code := emitPlanJSON(&b, "src.bu", p, pp); code != 0 {
+		t.Fatalf("emitPlanJSON code = %d", code)
+	}
+	var got planJSON
+	if err := json.Unmarshal(b.Bytes(), &got); err != nil {
+		t.Fatalf("invalid JSON: %v\n%s", err, b.String())
+	}
+	if !got.HasChanges {
+		t.Errorf("has_changes must be true when only a principal changes: %+v", got)
+	}
+	if len(got.Principals) != 1 {
+		t.Errorf("principals wrong: %+v", got.Principals)
 	}
 }
 
@@ -172,6 +206,54 @@ func TestPrintOutcome(t *testing.T) {
 	out := b.String()
 	if !strings.Contains(out, "✓ /x") || !strings.Contains(out, "✗ /y") {
 		t.Errorf("outcome marks wrong: %s", out)
+	}
+}
+
+func TestSaveStatusObservationRecordsPrincipalConflict(t *testing.T) {
+	// A principal-only escalation refusal (no file changes, apply never runs) must
+	// still land in the status observation as a skip — not read as a clean result.
+	statusPath := filepath.Join(t.TempDir(), "status.json")
+	now := time.Unix(1000, 0).UTC()
+	pplan := &principal.Plan{Actions: []principal.PrincipalAction{
+		{Kind: principal.KindUser, Name: "argus", Action: principal.ActionConflict,
+			Reason: "already in privileged group \"wheel\" without a policy grant"},
+	}}
+
+	saveStatusObservation(statusPath, &diff.Plan{}, nil, pplan, nil, nil, now)
+
+	rep, err := status.Load(statusPath)
+	if err != nil {
+		t.Fatalf("load status: %v", err)
+	}
+	if rep.Result != status.ResultWithSkips {
+		t.Errorf("result = %q, want %q (a refused escalation is not clean)", rep.Result, status.ResultWithSkips)
+	}
+	if len(rep.Conflicts) != 1 || rep.Conflicts[0].Path != "user:argus" {
+		t.Errorf("principal conflict not recorded: %+v", rep.Conflicts)
+	}
+}
+
+func TestSaveStatusObservationRecordsPrincipalError(t *testing.T) {
+	// A principal apply error (useradd failed mid-apply) must record as an error so
+	// status never reads green over a real failure.
+	statusPath := filepath.Join(t.TempDir(), "status.json")
+	now := time.Unix(1000, 0).UTC()
+	presult := &principal.Result{Outcomes: []principal.Outcome{
+		{Kind: principal.KindUser, Name: "argus", Status: principal.StatusErrored,
+			Err: errors.New("useradd: exit 1")},
+	}}
+
+	saveStatusObservation(statusPath, &diff.Plan{}, &apply.Result{}, &principal.Plan{}, presult, nil, now)
+
+	rep, err := status.Load(statusPath)
+	if err != nil {
+		t.Fatalf("load status: %v", err)
+	}
+	if rep.Result != status.ResultError {
+		t.Errorf("result = %q, want %q", rep.Result, status.ResultError)
+	}
+	if len(rep.Errors) != 1 || rep.Errors[0].Path != "user:argus" {
+		t.Errorf("principal error not recorded: %+v", rep.Errors)
 	}
 }
 

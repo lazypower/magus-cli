@@ -10,7 +10,20 @@ import (
 // builtinPrivilegedGroups are always treated as root-equivalent: membership is a
 // privilege escalation regardless of policy. privileged_groups in the policy
 // extends this set; it never shrinks it.
-var builtinPrivilegedGroups = []string{"root", "wheel", "sudo", "docker"}
+//
+// The set is the well-known root-equivalent groups: sudo vectors (root, wheel,
+// sudo), and groups whose membership is a root-equivalent capability on its own —
+// docker/lxd/libvirt (spawn privileged containers/VMs → escape), disk/kmem (raw
+// block-device and kernel-memory access → read/write any file), shadow (password
+// hashes), kvm (VM device), adm/systemd-journal (logs, which routinely carry
+// secrets). A denylist is inherently incomplete: host-specific privileged groups
+// are the operator's to add via privileged_groups.
+var builtinPrivilegedGroups = []string{
+	"root", "wheel", "sudo",
+	"docker", "lxd", "libvirt",
+	"disk", "kmem", "shadow", "kvm",
+	"adm", "systemd-journal",
+}
 
 // Manages reports whether name is in the manage_users allowlist — the principals
 // magus may create or modify. A principal outside the allowlist is ignored

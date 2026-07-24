@@ -108,6 +108,27 @@ func TestLookupUserGetentError(t *testing.T) {
 	}
 }
 
+func TestLookupUserGroupReadFailsClosed(t *testing.T) {
+	// The user resolves in passwd, but reading supplementary groups fails. This
+	// must NOT surface as "member of no groups" (which would let adoption absorb a
+	// hidden privileged membership) — LookupUser fails closed instead.
+	r := osReader{
+		lookup: func(db, key string) (string, bool, error) {
+			switch db + "/" + key {
+			case "passwd/argus":
+				return "argus:x:1500:1600:::/var/home/argus:/usr/sbin/nologin", true, nil
+			case "group/1600":
+				return "argus:x:1600:", true, nil
+			}
+			return "", false, nil
+		},
+		idGroups: func(name string) ([]string, error) { return nil, errors.New("id: NSS down") },
+	}
+	if _, err := r.LookupUser("argus"); err == nil {
+		t.Error("supplementary-group read failure must propagate (fail closed), not be swallowed")
+	}
+}
+
 func TestUserByIDAndGroupLookups(t *testing.T) {
 	r := stubReader(map[string]string{
 		"passwd/1500": "argus:x:1500:1600:::/:/bin/sh",

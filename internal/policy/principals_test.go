@@ -107,6 +107,13 @@ func TestGateMethods(t *testing.T) {
 	if !p.IsPrivilegedGroup("wheel") || !p.IsPrivilegedGroup("docker") {
 		t.Error("built-in privileged groups must be recognized")
 	}
+	// The builtin denylist covers the well-known root-equivalent groups beyond the
+	// sudo vectors — raw-device/hash/VM/container/log access are escalations too.
+	for _, g := range []string{"disk", "shadow", "kvm", "lxd", "libvirt", "kmem", "adm", "systemd-journal", "sudo"} {
+		if !p.IsPrivilegedGroup(g) {
+			t.Errorf("builtin privileged group %q must be recognized without a policy entry", g)
+		}
+	}
 	if !p.IsPrivilegedGroup("kvm") {
 		t.Error("policy-extended privileged group must be recognized")
 	}
