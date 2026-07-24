@@ -6,6 +6,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/lazypower/magus-cli/internal/diff"
 	"github.com/lazypower/magus-cli/internal/ir"
 	"github.com/lazypower/magus-cli/internal/systemd"
 )
@@ -218,23 +219,36 @@ func TestReconcileUserWorkloadsRefusedSourceStaged(t *testing.T) {
 	}
 }
 
-func TestFilterUserQuadletsByOwner(t *testing.T) {
+// A refused owner's quadlet write is marked a CONFLICT (withheld, surfaced) —
+// never removed from the plan (which would delete an existing source). A
+// non-refused owner's action and system quadlets are untouched.
+func TestStageRefusedOwnerQuadlets(t *testing.T) {
 	in := &ir.IR{Quadlets: []ir.Quadlet{
-		{Name: "argusd.container", Scope: ir.ScopeUser, Owner: "argus"}, // refused → dropped
-		{Name: "ok.container", Scope: ir.ScopeUser, Owner: "bob"},       // not refused → kept
-		{Name: "sys.container", Scope: ir.ScopeSystem},                  // system → kept
+		{Name: "argusd.container", Path: "/var/home/argus/.config/containers/systemd/argusd.container", Scope: ir.ScopeUser, Owner: "argus"},
+		{Name: "ok.container", Path: "/var/home/bob/.config/containers/systemd/ok.container", Scope: ir.ScopeUser, Owner: "bob"},
 	}}
-	got := FilterUserQuadletsByOwner(in, map[string]string{"argus": "in docker without a grant"})
-	if len(got.Quadlets) != 2 {
-		t.Fatalf("want 2 kept, got %d: %+v", len(got.Quadlets), got.Quadlets)
+	plan := &diff.Plan{Actions: []diff.ResourceAction{
+		{Path: "/var/home/argus/.config/containers/systemd/argusd.container", Kind: diff.KindQuadlet, Action: diff.ActionUpdate},
+		{Path: "/var/home/bob/.config/containers/systemd/ok.container", Kind: diff.KindQuadlet, Action: diff.ActionCreate},
+		{Path: "/etc/core/x", Kind: diff.KindFile, Action: diff.ActionCreate},
+	}}
+	StageRefusedOwnerQuadlets(plan, in, map[string]string{"argus": "in docker without a grant"})
+
+	byPath := map[string]diff.ResourceAction{}
+	for _, a := range plan.Actions {
+		byPath[a.Path] = a
 	}
-	for _, q := range got.Quadlets {
-		if q.Owner == "argus" {
-			t.Errorf("refused owner's quadlet must be withheld from the write: %+v", q)
-		}
+	// argus's quadlet: rewritten to conflict (withheld, NOT deleted).
+	argus := byPath["/var/home/argus/.config/containers/systemd/argusd.container"]
+	if argus.Action != diff.ActionConflict || !contains(argus.Reason, "docker") {
+		t.Errorf("refused owner's quadlet should be a conflict: %+v", argus)
 	}
-	if len(in.Quadlets) != 3 {
-		t.Errorf("filter mutated the input IR")
+	// bob's quadlet and the system file are untouched.
+	if byPath["/var/home/bob/.config/containers/systemd/ok.container"].Action != diff.ActionCreate {
+		t.Errorf("non-refused owner's action must be untouched")
+	}
+	if byPath["/etc/core/x"].Action != diff.ActionCreate {
+		t.Errorf("system file action must be untouched")
 	}
 }
 

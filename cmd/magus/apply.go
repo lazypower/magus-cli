@@ -114,13 +114,19 @@ func runApply(args []string) int {
 		fmt.Fprintf(os.Stderr, "error: %v\n", err)
 		return 1
 	}
-	parsed = apply.FilterUserQuadletsByOwner(parsed, blockedOwners(pplan, nil))
 
 	plan, err := diff.ComputeWithPolicy(p, parsed, m, w)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "error: %v\n", err)
 		return 1
 	}
+	// A refused principal (a conflict: uid collision, ungranted privileged group,
+	// immutable-attr change) must not have its rootless quadlet written or
+	// activated — but its EXISTING resources must be LEFT INTACT, never deleted
+	// (dropping the quadlet from the IR would make the sweep delete a running
+	// workload's source). So mark those quadlets' file actions as conflicts:
+	// magus withholds the write, preserves the manifest, and surfaces the refusal.
+	apply.StageRefusedOwnerQuadlets(plan, parsed, blockedOwners(pplan, nil))
 	// Enablement is persistent state reconciled every apply — model it as plan
 	// rows so it's previewed like everything else and a drift can't hide behind
 	// a clean file diff ("Nothing to apply" stays honest).
@@ -231,17 +237,21 @@ func runApply(args []string) int {
 // or whose prerequisites failed (Codex P1 #2).
 func blockedOwners(pplan *principal.Plan, presult *principal.Result) map[string]string {
 	blocked := map[string]string{}
-	// Plan-level conflicts (a refused principal — the apply may only skip it).
+	// Plan-level conflicts. A workload owner is a USER, so only a user conflict
+	// (or a subuid/linger prerequisite) blocks it — NOT a same-named group. The
+	// manifest namespaces user:argus and group:argus separately; collapsing them
+	// here would let a group-gid collision block an otherwise-valid user's
+	// workload (Codex round-3).
 	for _, a := range pplan.Actions {
-		if a.Action == principal.ActionConflict {
+		if a.Action == principal.ActionConflict && ownerKind(a.Kind) {
 			blocked[a.Name] = a.Reason
 		}
 	}
 	// Apply-level skips/errors (the conflict's skip, or a failed provision step
-	// keyed by the owning principal's name).
+	// keyed by the owning principal's name — never a group).
 	if presult != nil {
 		for _, oc := range presult.Outcomes {
-			if oc.Status == principal.StatusSkipped || oc.Status == principal.StatusErrored {
+			if (oc.Status == principal.StatusSkipped || oc.Status == principal.StatusErrored) && ownerKind(oc.Kind) {
 				reason := oc.Reason
 				if oc.Err != nil {
 					reason = oc.Err.Error()
@@ -251,6 +261,12 @@ func blockedOwners(pplan *principal.Plan, presult *principal.Result) map[string]
 		}
 	}
 	return blocked
+}
+
+// ownerKind reports whether a principal action kind identifies a workload OWNER
+// (a user, or its subuid/linger prerequisites) rather than a group.
+func ownerKind(k principal.Kind) bool {
+	return k == principal.KindUser || k == principal.KindSubid || k == principal.KindLinger
 }
 
 // appliedPaths is the set of resource paths this apply actually wrote (applied),

@@ -281,27 +281,35 @@ func FilterUnmanagedUserQuadlets(in *ir.IR, managed func(name string) bool) *ir.
 	return &out
 }
 
-// FilterUserQuadletsByOwner removes user-scope quadlets whose owner is in drop —
-// used to withhold a REFUSED principal's quadlets from the file plan so they are
-// never written into that identity's generator path (Codex round-2: gate the
-// write, not just activation). Returns a shallow IR copy; an empty/nil drop set
-// is a no-op. System quadlets are always kept.
-func FilterUserQuadletsByOwner(in *ir.IR, drop map[string]string) *ir.IR {
-	if len(drop) == 0 {
-		return in
+// StageRefusedOwnerQuadlets rewrites the file-plan action of every user-scope
+// quadlet whose owner is refused (in `refused`: owner -> reason) to a CONFLICT,
+// so magus withholds the write but does NOT delete or mutate an existing source
+// (Codex round-3). This is the ADR-consistent "touch nothing, surface the
+// refusal": unlike removing the quadlet from the IR — which makes the sweep
+// delete a still-running workload's source — a conflict preserves the manifest
+// entry and the on-disk file, exits 2, and (being a skip) also stages activation.
+// An empty/nil refused set is a no-op.
+func StageRefusedOwnerQuadlets(plan *diff.Plan, in *ir.IR, refused map[string]string) {
+	if len(refused) == 0 {
+		return
 	}
-	kept := make([]ir.Quadlet, 0, len(in.Quadlets))
+	ownerOf := map[string]string{}
 	for _, q := range in.Quadlets {
 		if q.Scope == ir.ScopeUser && q.Owner != "" {
-			if _, refused := drop[q.Owner]; refused {
-				continue
-			}
+			ownerOf[q.Path] = q.Owner
 		}
-		kept = append(kept, q)
 	}
-	out := *in
-	out.Quadlets = kept
-	return &out
+	for i := range plan.Actions {
+		a := &plan.Actions[i]
+		owner, isUserQuad := ownerOf[a.Path]
+		if !isUserQuad {
+			continue
+		}
+		if reason, isRefused := refused[owner]; isRefused {
+			a.Action = diff.ActionConflict
+			a.Reason = "owner principal " + owner + " refused (" + reason + ")"
+		}
+	}
 }
 
 // HasUserWorkloads reports whether the IR declares any user-scope quadlet — the

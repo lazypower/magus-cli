@@ -50,9 +50,12 @@ func RootlessOwners(desired *ir.IR, g Gate) []string {
 // no write) when it already holds. Ordered subuid-before-linger, and the caller
 // appends these after the user actions so the owner exists first — the spine
 // principal ⊳ subuid ⊳ linger.
-func diffRootless(desired *ir.IR, r Reader, g Gate) ([]PrincipalAction, error) {
+func diffRootless(desired *ir.IR, r Reader, g Gate, conflicted map[string]bool) ([]PrincipalAction, error) {
 	var acts []PrincipalAction
 	for _, name := range RootlessOwners(desired, g) {
+		if conflicted[name] {
+			continue // refused owner — no subuid/linger; its workload is staged, not run
+		}
 		hasSubid, err := r.HasSubid(name)
 		if err != nil {
 			return nil, fmt.Errorf("check subuid %s: %w", name, err)

@@ -99,6 +99,37 @@ func TestDiffRootless(t *testing.T) {
 	}
 }
 
+// A REFUSED owner (its user is a conflict) gets NO subuid/linger provisioning —
+// magus must not enable linger or grant subuid for an identity it refused, or its
+// user manager could start a workload as the refused identity (Codex round-3).
+func TestDiffRootlessSkipsConflictedOwner(t *testing.T) {
+	in := &ir.IR{
+		// argus declares uid 1000, but 1000 already belongs to a different user →
+		// the argus user is a conflict.
+		Users:    []ir.User{{Name: "argus", UID: intp(1000)}},
+		Quadlets: []ir.Quadlet{userQuadlet("argusd.container", "argus")},
+	}
+	r := fakeReader{uidOwner: map[int]string{1000: "squatter"}}
+	plan, err := Diff(in, r, manages("argus"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	// The user is a conflict...
+	var userConflict bool
+	for _, a := range plan.Actions {
+		if a.Kind == KindUser && a.Name == "argus" && a.Action == ActionConflict {
+			userConflict = true
+		}
+	}
+	if !userConflict {
+		t.Fatal("precondition: argus should be a uid-collision conflict")
+	}
+	// ...so NO subuid/linger rows are emitted for it.
+	if s, l := rootlessActions(plan); s != nil || l != nil {
+		t.Errorf("a refused owner must get no subuid/linger; got subid=%+v linger=%+v", s, l)
+	}
+}
+
 // No user-scoped workload → no rootless prerequisites (they are consequences of
 // owning one, never emitted for a plain identity).
 func TestDiffRootlessNoWorkloadNoPrereqs(t *testing.T) {

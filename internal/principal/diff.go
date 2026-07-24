@@ -25,6 +25,7 @@ func Diff(desired *ir.IR, r Reader, g Gate) (*Plan, error) {
 		}
 		p.Actions = append(p.Actions, a)
 	}
+	conflicted := map[string]bool{}
 	for _, u := range desired.Users {
 		if !g.Manages(u.Name) {
 			continue
@@ -33,12 +34,18 @@ func Diff(desired *ir.IR, r Reader, g Gate) (*Plan, error) {
 		if err != nil {
 			return nil, err
 		}
+		if a.Action == ActionConflict {
+			conflicted[u.Name] = true // a refused principal gets no rootless provisioning
+		}
 		p.Actions = append(p.Actions, a)
 	}
 	// Rootless prerequisites (subuid, linger) for principals that own user-scoped
 	// workloads — appended after the users so the owner is created first: the
-	// spine principal ⊳ subuid ⊳ linger.
-	rootless, err := diffRootless(desired, r, g)
+	// spine principal ⊳ subuid ⊳ linger. A refused (conflicted) owner is skipped:
+	// magus must not enable linger / grant subuid for an identity it refused, or
+	// its user manager could start a workload as the refused identity (Codex
+	// round-3).
+	rootless, err := diffRootless(desired, r, g, conflicted)
 	if err != nil {
 		return nil, err
 	}
