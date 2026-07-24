@@ -104,7 +104,7 @@ func TestCheckPrincipalRootlessHomeGate(t *testing.T) {
 		Users:    []ir.User{{Name: "argus", UID: pint(1000), HomeDir: "/etc"}},
 		Quadlets: []ir.Quadlet{userQuad("argus")},
 	})
-	if !hasReason(bad, "home_dir under") {
+	if !hasReason(bad, "home_dir must be") {
 		t.Errorf("rootless owner with home=/etc must be rejected, got %v", bad)
 	}
 	// a legitimate /var/home home → passes.
@@ -112,27 +112,31 @@ func TestCheckPrincipalRootlessHomeGate(t *testing.T) {
 		Users:    []ir.User{{Name: "argus", UID: pint(1000), HomeDir: "/var/home/argus"}},
 		Quadlets: []ir.Quadlet{userQuad("argus")},
 	})
-	if hasReason(ok, "home_dir under") {
+	if hasReason(ok, "home_dir must be") {
 		t.Errorf("rootless owner with /var/home home must pass, got %v", ok)
 	}
 	// a principal that owns NO user workload isn't subject to the home gate.
 	noWorkload := Check(managePolicy(false), &ir.IR{
 		Users: []ir.User{{Name: "argus", UID: pint(1000), HomeDir: "/opt/argus"}},
 	})
-	if hasReason(noWorkload, "home_dir under") {
+	if hasReason(noWorkload, "home_dir must be") {
 		t.Errorf("non-owner should not hit the rootless home gate, got %v", noWorkload)
 	}
 }
 
 func TestIsUserHome(t *testing.T) {
 	for _, h := range []string{"/var/home/argus", "/home/argus"} {
-		if !isUserHome(h) {
-			t.Errorf("%q should be a user home", h)
+		if !isUserHome("argus", h) {
+			t.Errorf("%q should be argus's user home", h)
 		}
 	}
-	for _, h := range []string{"/etc", "/var/lib/x", "/var/home", "/home", "/var/home/a/b", "/var/home/../etc", ""} {
-		if isUserHome(h) {
-			t.Errorf("%q must NOT be a user home", h)
+	// Must belong to THIS principal — another user's home is rejected.
+	if isUserHome("argus", "/var/home/core") {
+		t.Error("argus must not own /var/home/core")
+	}
+	for _, h := range []string{"/etc", "/var/lib/x", "/var/home", "/home", "/var/home/argus/b", "/var/home/../etc", "/var/home/argus/", ""} {
+		if isUserHome("argus", h) {
+			t.Errorf("%q must NOT be argus's user home", h)
 		}
 	}
 }

@@ -2,6 +2,7 @@ package apply
 
 import (
 	"fmt"
+	"os"
 	"path/filepath"
 	"sort"
 	"strings"
@@ -30,6 +31,7 @@ type Chowner interface {
 type UserWorkloads struct {
 	IR      *ir.IR
 	Changed map[string]bool   // source paths written this apply (start vs no-op)
+	Refused map[string]bool   // source paths magus did NOT reconcile (conflict/skip/error) → never activate
 	Blocked map[string]string // owner -> reason its principal is not reconciled (conflict/error) → stage, never activate
 	Chown   Chowner           // owns the config tree, bounded below the home
 	NewUser UserManagerFactory
@@ -91,9 +93,9 @@ func ReconcileUserWorkloads(w UserWorkloads) []Outcome {
 		}
 
 		// #1 — own the config tree magus created, BOUNDED strictly below the
-		// principal's home (never a system dir). A chown failure fails closed:
-		// stage the workloads rather than activate over a wrong-owned tree.
-		if err := ownConfigTrees(w.Chown, homes[owner], quads, uid); err != nil {
+		// principal's OWN home (never another user's home or a system dir). A chown
+		// failure fails closed: stage rather than activate over a wrong-owned tree.
+		if err := ownConfigTrees(w.Chown, owner, homes[owner], quads, uid); err != nil {
 			for _, q := range orderQuadlets(quads) {
 				outcomes = append(outcomes, userOutcome(q, diff.ActionSkip, StatusSkipped,
 					"staged, not activated: could not own config tree: "+err.Error(), nil))
@@ -101,23 +103,28 @@ func ReconcileUserWorkloads(w UserWorkloads) []Outcome {
 			continue
 		}
 
-		outcomes = append(outcomes, reconcileOwnerWorkloads(quads, w.Changed, w.NewUser(owner, uid))...)
+		outcomes = append(outcomes, reconcileOwnerWorkloads(quads, w.Changed, w.Refused, w.NewUser(owner, uid))...)
 	}
 	return outcomes
 }
 
 // ownConfigTrees chowns each quadlet's ancestor directories — strictly below the
-// principal's home — to the owner uid, so rootless podman owns its config path.
-// It is deliberately bounded: it refuses a home outside the user-home roots and
-// never touches the home itself or anything above it, so it cannot be turned into
-// an ownership-escalation of a system directory (Codex P1 #1). A nil chowner
-// (test callers) is a no-op.
-func ownConfigTrees(ch Chowner, home string, quads []ir.Quadlet, uid int) error {
+// owner's OWN home — to the owner uid, so rootless podman owns its config path.
+// It is deliberately bounded three ways, because it runs as root: the home must
+// be exactly the owner's canonical home (/var/home/<owner> or /home/<owner>); the
+// dirs must be strict descendants of it; and each dir chowned must be a real
+// directory, not a symlink (a symlinked component fails closed, so a planted link
+// can't redirect the chown to a system path — Codex P1 #1). A nil chowner (test
+// callers) is a no-op.
+func ownConfigTrees(ch Chowner, owner, home string, quads []ir.Quadlet, uid int) error {
 	if ch == nil {
 		return nil
 	}
 	for _, q := range quads {
-		for _, dir := range configTreeDirs(home, q.Path) {
+		for _, dir := range configTreeDirs(owner, home, q.Path) {
+			if fi, err := os.Lstat(dir); err == nil && fi.Mode()&os.ModeSymlink != 0 {
+				return fmt.Errorf("refusing to chown %s: it is a symlink (config tree must be real directories)", dir)
+			}
 			if err := ch.Chown(dir, &uid, nil); err != nil {
 				return err
 			}
@@ -127,14 +134,14 @@ func ownConfigTrees(ch Chowner, home string, quads []ir.Quadlet, uid int) error 
 }
 
 // configTreeDirs returns the ancestor directories of quadletPath that lie
-// STRICTLY below home, shallowest-first — the .config/... tree magus creates and
-// must hand to the principal. Returns nothing (own nothing, fail closed) unless
-// home is a plausible user home (/var/home/<u> or /home/<u>) and a strict path
-// ancestor of the quadlet. This is the boundary that stops home_dir=/etc from
-// turning into a chown of /etc/.config.
-func configTreeDirs(home, quadletPath string) []string {
+// STRICTLY below the owner's canonical home, shallowest-first — the .config/...
+// tree magus creates and must hand to the principal. Returns nothing (own
+// nothing, fail closed) unless home is exactly /var/home/<owner> or /home/<owner>
+// AND a strict path ancestor of the quadlet. This is the boundary that stops both
+// home_dir=/etc and a managed principal claiming another user's home.
+func configTreeDirs(owner, home, quadletPath string) []string {
 	home = filepath.Clean(home)
-	if !underUserHomeRoot(home) || !strictlyUnder(quadletPath, home) {
+	if !homeBelongsTo(owner, home) || !strictlyUnder(quadletPath, home) {
 		return nil
 	}
 	var dirs []string
@@ -151,17 +158,14 @@ func configTreeDirs(home, quadletPath string) []string {
 	return dirs
 }
 
-// underUserHomeRoot reports whether home is directly beneath a user-home root
-// (/var/home/<name> or /home/<name>) — the only locations a managed rootless
-// principal's home may live (also gated at validate). Defense in depth against a
-// system-path home reaching the chown.
-func underUserHomeRoot(home string) bool {
-	for _, root := range []string{"/var/home/", "/home/"} {
-		if rest, ok := strings.CutPrefix(home, root); ok && rest != "" && !strings.Contains(rest, "/") {
-			return true
-		}
+// homeBelongsTo reports whether home is exactly owner's canonical user home. The
+// same binding the validate gate enforces (policy.isUserHome), re-checked here so
+// the chown is safe even if it were ever reached without validation.
+func homeBelongsTo(owner, home string) bool {
+	if owner == "" {
+		return false
 	}
-	return false
+	return home == "/var/home/"+owner || home == "/home/"+owner
 }
 
 // strictlyUnder reports whether path is a proper descendant of dir.
@@ -185,22 +189,38 @@ func userHomes(in *ir.IR) map[string]string {
 // user generator is reloaded once if any source changed, then services are
 // (re)started in dependency order: networks/volumes before the containers that
 // reference them.
-func reconcileOwnerWorkloads(quads []ir.Quadlet, changed map[string]bool, um systemd.UserManager) []Outcome {
+func reconcileOwnerWorkloads(quads []ir.Quadlet, changed, refused map[string]bool, um systemd.UserManager) []Outcome {
+	// A quadlet whose SOURCE magus did not reconcile this apply (a conflict it
+	// refused to write, a skip, an error) is staged, never activated: magus must
+	// not start a service the user generator produced from content magus itself
+	// declined (Codex round-2 fail-open activation). Split these out first.
+	var out []Outcome
+	var activatable []ir.Quadlet
+	for _, q := range orderQuadlets(quads) {
+		if refused[q.Path] {
+			out = append(out, userOutcome(q, diff.ActionSkip, StatusSkipped,
+				"staged, not activated: source not reconciled (conflict/skip/error)", nil))
+			continue
+		}
+		activatable = append(activatable, q)
+	}
+	if len(activatable) == 0 {
+		return out
+	}
+
 	if ok, reason := um.Ready(); !ok {
-		var out []Outcome
-		for _, q := range orderQuadlets(quads) {
+		for _, q := range activatable {
 			out = append(out, userOutcome(q, diff.ActionSkip, StatusSkipped,
 				"staged, not activated: "+reason, nil))
 		}
 		return out
 	}
 
-	var out []Outcome
-	if anyChanged(quads, changed) {
+	if anyChanged(activatable, changed) {
 		if err := um.DaemonReload(); err != nil {
 			// A failed user daemon-reload means no source is (re)generated — every
 			// workload is staged, not activated, fail-closed.
-			for _, q := range orderQuadlets(quads) {
+			for _, q := range activatable {
 				out = append(out, userOutcome(q, diff.ActionSkip, StatusSkipped,
 					"staged, not activated: user daemon-reload failed: "+err.Error(), nil))
 			}
@@ -208,7 +228,7 @@ func reconcileOwnerWorkloads(quads []ir.Quadlet, changed map[string]bool, um sys
 		}
 	}
 
-	for _, q := range orderQuadlets(quads) {
+	for _, q := range activatable {
 		out = append(out, activateOne(q, changed[q.Path], um))
 	}
 	return out
@@ -253,6 +273,29 @@ func FilterUnmanagedUserQuadlets(in *ir.IR, managed func(name string) bool) *ir.
 	for _, q := range in.Quadlets {
 		if q.Scope == ir.ScopeUser && q.Owner != "" && !managed(q.Owner) {
 			continue // unmanaged owner — Ignition's concern, not magus's
+		}
+		kept = append(kept, q)
+	}
+	out := *in
+	out.Quadlets = kept
+	return &out
+}
+
+// FilterUserQuadletsByOwner removes user-scope quadlets whose owner is in drop —
+// used to withhold a REFUSED principal's quadlets from the file plan so they are
+// never written into that identity's generator path (Codex round-2: gate the
+// write, not just activation). Returns a shallow IR copy; an empty/nil drop set
+// is a no-op. System quadlets are always kept.
+func FilterUserQuadletsByOwner(in *ir.IR, drop map[string]string) *ir.IR {
+	if len(drop) == 0 {
+		return in
+	}
+	kept := make([]ir.Quadlet, 0, len(in.Quadlets))
+	for _, q := range in.Quadlets {
+		if q.Scope == ir.ScopeUser && q.Owner != "" {
+			if _, refused := drop[q.Owner]; refused {
+				continue
+			}
 		}
 		kept = append(kept, q)
 	}

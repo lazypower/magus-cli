@@ -3,7 +3,6 @@ package policy
 import (
 	"fmt"
 	"strconv"
-	"strings"
 
 	"github.com/lazypower/magus-cli/internal/ir"
 )
@@ -97,8 +96,8 @@ func (p *Policy) checkPrincipals(in *ir.IR) []Violation {
 		if u.UID == nil {
 			v = append(v, Violation{Resource: res, Reason: "managed principal must declare a uid (deterministic UIDs — no implicit allocation)"})
 		}
-		if rootlessOwners[u.Name] && !isUserHome(u.HomeDir) {
-			v = append(v, Violation{Resource: res, Reason: fmt.Sprintf("a rootless-workload owner must declare home_dir under /var/home/<name> or /home/<name> (got %q); magus owns the config tree there and must never chown a system path", u.HomeDir)})
+		if rootlessOwners[u.Name] && !isUserHome(u.Name, u.HomeDir) {
+			v = append(v, Violation{Resource: res, Reason: fmt.Sprintf("a rootless-workload owner's home_dir must be /var/home/%s or /home/%s (got %q); magus owns the config tree there, so the home must belong to this very principal — never another user's home or a system path", u.Name, u.Name, u.HomeDir)})
 		}
 		if u.HasPassword {
 			v = append(v, Violation{Resource: res, Reason: "password_hash is not supported in v1 for a managed principal (created accounts are password-locked; a workload account is not a login account)"})
@@ -128,15 +127,18 @@ func (p *Policy) checkPrincipals(in *ir.IR) []Violation {
 	return v
 }
 
-// isUserHome reports whether home is directly beneath a user-home root
-// (/var/home/<name> or /home/<name>, one component, no traversal) — the only
-// place a managed rootless principal's home may live.
-func isUserHome(home string) bool {
-	if strings.Contains(home, "..") {
+// isUserHome reports whether home is exactly this principal's canonical user
+// home — /var/home/<name> or /home/<name>. Binding the home to the principal's
+// OWN name (not just any single component) is load-bearing: it stops a managed
+// principal from declaring another user's home (or a system path) and thereby
+// claiming that user's quadlets or steering magus's config-tree chown outside
+// its own home.
+func isUserHome(name, home string) bool {
+	if name == "" {
 		return false
 	}
 	for _, root := range []string{"/var/home/", "/home/"} {
-		if rest, ok := strings.CutPrefix(home, root); ok && rest != "" && !strings.Contains(rest, "/") {
+		if home == root+name {
 			return true
 		}
 	}

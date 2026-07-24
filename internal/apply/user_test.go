@@ -185,12 +185,65 @@ func TestReconcileUserWorkloadsBlockedOwnerStaged(t *testing.T) {
 	}
 }
 
+// A quadlet whose SOURCE magus refused this apply (a conflict/skip) is staged,
+// never activated — magus must not start a service generated from content it
+// declined to write (Codex round-2 fail-open activation).
+func TestReconcileUserWorkloadsRefusedSourceStaged(t *testing.T) {
+	in := argusIR()
+	fu := systemd.NewFakeUser()
+	refusedPath := "/var/home/argus/.config/containers/systemd/argusd.container"
+	outs := ReconcileUserWorkloads(UserWorkloads{
+		IR:      in,
+		Changed: allChanged(in),
+		Refused: map[string]bool{refusedPath: true},
+		NewUser: func(string, int) systemd.UserManager { return fu },
+	})
+	var argusdStaged bool
+	for _, o := range outs {
+		if o.Path == refusedPath {
+			if o.Status != StatusSkipped || !contains(o.Reason, "source not reconciled") {
+				t.Errorf("refused source should stage: %+v", o)
+			}
+			argusdStaged = true
+		}
+	}
+	if !argusdStaged {
+		t.Errorf("refused quadlet not staged: %+v", outs)
+	}
+	// The refused source's service is never started.
+	for _, c := range fu.Calls() {
+		if c == "Start(argusd.service)" {
+			t.Errorf("a refused source must never be started; saw %q", c)
+		}
+	}
+}
+
+func TestFilterUserQuadletsByOwner(t *testing.T) {
+	in := &ir.IR{Quadlets: []ir.Quadlet{
+		{Name: "argusd.container", Scope: ir.ScopeUser, Owner: "argus"}, // refused → dropped
+		{Name: "ok.container", Scope: ir.ScopeUser, Owner: "bob"},       // not refused → kept
+		{Name: "sys.container", Scope: ir.ScopeSystem},                  // system → kept
+	}}
+	got := FilterUserQuadletsByOwner(in, map[string]string{"argus": "in docker without a grant"})
+	if len(got.Quadlets) != 2 {
+		t.Fatalf("want 2 kept, got %d: %+v", len(got.Quadlets), got.Quadlets)
+	}
+	for _, q := range got.Quadlets {
+		if q.Owner == "argus" {
+			t.Errorf("refused owner's quadlet must be withheld from the write: %+v", q)
+		}
+	}
+	if len(in.Quadlets) != 3 {
+		t.Errorf("filter mutated the input IR")
+	}
+}
+
 // The bounded config-tree chown: only ancestors STRICTLY below a real user home
 // are returned; a system-path home (the escalation Codex flagged) yields nothing.
 func TestConfigTreeDirsBounded(t *testing.T) {
 	home := "/var/home/argus"
 	q := "/var/home/argus/.config/containers/systemd/argusd.container"
-	got := configTreeDirs(home, q)
+	got := configTreeDirs("argus", home, q)
 	want := []string{
 		"/var/home/argus/.config",
 		"/var/home/argus/.config/containers",
@@ -206,11 +259,12 @@ func TestConfigTreeDirsBounded(t *testing.T) {
 		}
 	}
 	// A system-path home is refused outright — no /etc/.config chown vector.
-	if dirs := configTreeDirs("/etc", "/etc/.config/containers/systemd/x.container"); dirs != nil {
+	if dirs := configTreeDirs("argus", "/etc", "/etc/.config/containers/systemd/x.container"); dirs != nil {
 		t.Errorf("system-path home must own nothing, got %v", dirs)
 	}
-	if dirs := configTreeDirs("/var/lib/evil", "/var/lib/evil/.config/x/y.container"); dirs != nil {
-		t.Errorf("non-user-home root must own nothing, got %v", dirs)
+	// Another user's home is refused — argus may own only /var/home/argus.
+	if dirs := configTreeDirs("argus", "/var/home/core", "/var/home/core/.config/x/y.container"); dirs != nil {
+		t.Errorf("a home that isn't the owner's must own nothing, got %v", dirs)
 	}
 }
 
@@ -219,7 +273,7 @@ func TestConfigTreeDirsBounded(t *testing.T) {
 func TestOwnConfigTrees(t *testing.T) {
 	fc := &fakeChowner{}
 	quads := []ir.Quadlet{{Path: "/var/home/argus/.config/containers/systemd/argusd.container"}}
-	if err := ownConfigTrees(fc, "/var/home/argus", quads, 1000); err != nil {
+	if err := ownConfigTrees(fc, "argus", "/var/home/argus", quads, 1000); err != nil {
 		t.Fatal(err)
 	}
 	if len(fc.chowned) != 3 {
@@ -232,7 +286,7 @@ func TestOwnConfigTrees(t *testing.T) {
 	}
 	// A system-path home chowns nothing (bounded, even if the caller passes it).
 	fc2 := &fakeChowner{}
-	_ = ownConfigTrees(fc2, "/etc", []ir.Quadlet{{Path: "/etc/.config/x/y.container"}}, 1000)
+	_ = ownConfigTrees(fc2, "argus", "/etc", []ir.Quadlet{{Path: "/etc/.config/x/y.container"}}, 1000)
 	if len(fc2.chowned) != 0 {
 		t.Errorf("system home must chown nothing, got %v", fc2.chowned)
 	}

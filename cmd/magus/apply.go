@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"strings"
 	"time"
 
 	"github.com/lazypower/magus-cli/internal/apply"
@@ -101,6 +102,20 @@ func runApply(args []string) int {
 
 	w := hostfs.OS()
 	sd := systemd.OS()
+
+	// Principals (passwd.users/groups) are diffed FIRST — before the file plan —
+	// for two reasons: a file owned by a freshly-created uid needs its owner in
+	// place, and a REFUSED principal (a conflict: uid collision, ungranted
+	// privileged group) must not have its rootless quadlet written into its
+	// generator search path, or a later boot/daemon-reload would run it as the
+	// refused identity. So drop refused owners' user quadlets before the file plan.
+	pplan, err := principal.Diff(parsed, principal.OSReader(), p)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "error: %v\n", err)
+		return 1
+	}
+	parsed = apply.FilterUserQuadletsByOwner(parsed, blockedOwners(pplan, nil))
+
 	plan, err := diff.ComputeWithPolicy(p, parsed, m, w)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "error: %v\n", err)
@@ -110,15 +125,6 @@ func runApply(args []string) int {
 	// rows so it's previewed like everything else and a drift can't hide behind
 	// a clean file diff ("Nothing to apply" stays honest).
 	diff.PlanServiceState(parsed, plan, sd)
-
-	// Principals (passwd.users/groups): diffed against getent and reconciled
-	// before files, so a file owned by a freshly-created uid has its owner in
-	// place. Only managed (manage_users) principals are considered.
-	pplan, err := principal.Diff(parsed, principal.OSReader(), p)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "error: %v\n", err)
-		return 1
-	}
 
 	printPlan(os.Stdout, butanePath, plan, nil)
 	printPrincipalPlan(os.Stdout, pplan)
@@ -186,6 +192,7 @@ func runApply(args []string) int {
 		uOutcomes := apply.ReconcileUserWorkloads(apply.UserWorkloads{
 			IR:      parsed,
 			Changed: appliedPaths(result),
+			Refused: refusedPaths(result),
 			Blocked: blockedOwners(pplan, presult),
 			Chown:   w,
 			NewUser: func(name string, uid int) systemd.UserManager { return systemd.OSUser(name, uid) },
@@ -253,6 +260,20 @@ func appliedPaths(result *apply.Result) map[string]bool {
 	out := map[string]bool{}
 	for _, oc := range result.Outcomes {
 		if oc.Status == apply.StatusApplied {
+			out[oc.Path] = true
+		}
+	}
+	return out
+}
+
+// refusedPaths is the set of resource paths this apply did NOT reconcile (a
+// conflict it refused to write, a skip, an error), so the user-workload
+// reconciler never activates a service the generator produced from a source
+// magus itself declined (Codex round-2 fail-open activation).
+func refusedPaths(result *apply.Result) map[string]bool {
+	out := map[string]bool{}
+	for _, oc := range result.Outcomes {
+		if oc.Status == apply.StatusSkipped || oc.Status == apply.StatusErrored {
 			out[oc.Path] = true
 		}
 	}
@@ -351,16 +372,26 @@ func saveStatusObservation(statusPath string, plan *diff.Plan, result *apply.Res
 	// down, owner refused, tree unownable) is an unresolved state too: record it
 	// so `magus status` names the staged workload and its reason instead of a bare
 	// ok-with-skips (Codex P2 #5). Deduped by path against the conflicts above.
-	seen := map[string]bool{}
-	for _, c := range conflicts {
-		seen[c.Path] = true
+	idx := map[string]int{}
+	for i, c := range conflicts {
+		idx[c.Path] = i
 	}
 	if result != nil {
 		for _, oc := range result.Outcomes {
-			if oc.Status == apply.StatusSkipped && !seen[oc.Path] {
-				conflicts = append(conflicts, status.Conflict{Path: oc.Path, Reason: oc.Reason})
-				seen[oc.Path] = true
+			if oc.Status != apply.StatusSkipped {
+				continue
 			}
+			if i, ok := idx[oc.Path]; ok {
+				// The path already has a conflict recorded (e.g. a file conflict AND a
+				// staged activation for the same path) — MERGE the reasons so status
+				// shows both, never silently dropping the staged state.
+				if !strings.Contains(conflicts[i].Reason, oc.Reason) {
+					conflicts[i].Reason = conflicts[i].Reason + "; " + oc.Reason
+				}
+				continue
+			}
+			conflicts = append(conflicts, status.Conflict{Path: oc.Path, Reason: oc.Reason})
+			idx[oc.Path] = len(conflicts) - 1
 		}
 	}
 
