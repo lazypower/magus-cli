@@ -259,24 +259,25 @@ func TestSaveStatusObservationRecordsPrincipalConflict(t *testing.T) {
 // A staged user workload (skipped by the activation reconciler) must reach the
 // status observation with its reason — not vanish behind a bare ok-with-skips
 // (Codex P2 #5).
-// blockedOwners blocks a user whose declared group has a conflict (its identity
-// didn't reconcile), but NOT a user merely sharing a name with an unrelated
-// conflicted group (Codex round-3/4).
-func TestBlockedOwnersGroupDependency(t *testing.T) {
+// blockedOwners blocks a USER conflict (and subuid/linger prerequisites) but NOT
+// a same-named GROUP conflict — the manifest namespaces user:argus and
+// group:argus separately (Codex round-3). A group DEPENDENCY refusal is turned
+// into a user conflict upstream in principal.Diff, so it arrives here as KindUser.
+func TestBlockedOwnersKind(t *testing.T) {
 	pplan := &principal.Plan{Actions: []principal.PrincipalAction{
-		{Kind: principal.KindGroup, Name: "appgrp", Action: principal.ActionConflict, Reason: "gid 2000 but host has 3000"},
-		{Kind: principal.KindGroup, Name: "argus", Action: principal.ActionConflict, Reason: "unrelated group named argus"},
+		{Kind: principal.KindUser, Name: "argus", Action: principal.ActionConflict, Reason: "uid collision"},
+		{Kind: principal.KindLinger, Name: "worker", Action: principal.ActionConflict, Reason: "linger blocked"},
+		{Kind: principal.KindGroup, Name: "bob", Action: principal.ActionConflict, Reason: "unrelated group named bob"},
 	}}
-	users := []ir.User{
-		{Name: "argus", PrimaryGroup: "appgrp"},  // depends on appgrp → blocked
-		{Name: "bob", Groups: []string{"other"}}, // depends on nothing conflicted → not blocked
-	}
-	got := blockedOwners(pplan, nil, users)
+	got := blockedOwners(pplan, nil)
 	if _, ok := got["argus"]; !ok {
-		t.Errorf("argus depends on the conflicted appgrp → must be blocked; got %v", got)
+		t.Errorf("a user conflict must block; got %v", got)
+	}
+	if _, ok := got["worker"]; !ok {
+		t.Errorf("a linger prerequisite conflict must block; got %v", got)
 	}
 	if _, ok := got["bob"]; ok {
-		t.Errorf("bob must NOT be blocked by a same-named group conflict; got %v", got)
+		t.Errorf("a same-named GROUP conflict must NOT block a user; got %v", got)
 	}
 }
 

@@ -5,6 +5,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"strings"
 	"testing"
 
 	"github.com/lazypower/magus-cli/internal/ir"
@@ -18,8 +19,8 @@ func userQuadlet(name, owner string) ir.Quadlet {
 func TestRootlessOwners(t *testing.T) {
 	in := &ir.IR{Quadlets: []ir.Quadlet{
 		userQuadlet("argusd.container", "argus"),
-		userQuadlet("argus-egress.network", "argus"), // same owner, deduped
-		userQuadlet("bob.container", "bob"),           // unmanaged owner, dropped
+		userQuadlet("argus-egress.network", "argus"),   // same owner, deduped
+		userQuadlet("bob.container", "bob"),            // unmanaged owner, dropped
 		{Name: "sys.container", Scope: ir.ScopeSystem}, // system, no owner
 	}}
 	got := RootlessOwners(in, manages("argus"))
@@ -127,6 +128,40 @@ func TestDiffRootlessSkipsConflictedOwner(t *testing.T) {
 	// ...so NO subuid/linger rows are emitted for it.
 	if s, l := rootlessActions(plan); s != nil || l != nil {
 		t.Errorf("a refused owner must get no subuid/linger; got subid=%+v linger=%+v", s, l)
+	}
+}
+
+// A rootless owner whose DECLARED group did not reconcile (host has it at a
+// different gid) is itself turned into a conflict — so magus won't create/modify
+// it against the wrong-gid group NOR provision its subuid/linger. This makes the
+// group-dependency refusal atomic across every gate (Codex round-5).
+func TestDiffGroupDependencyMakesOwnerConflict(t *testing.T) {
+	in := &ir.IR{
+		Groups:   []ir.Group{{Name: "appgrp", GID: intp(2000)}},
+		Users:    []ir.User{{Name: "argus", UID: intp(1000), PrimaryGroup: "appgrp"}},
+		Quadlets: []ir.Quadlet{userQuadlet("argusd.container", "argus")},
+	}
+	// Host already has appgrp at gid 3000 → the group is a conflict.
+	r := fakeReader{groups: map[string]int{"appgrp": 3000}}
+	plan, err := Diff(in, r, manages("argus", "appgrp"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var userConflict bool
+	for _, a := range plan.Actions {
+		if a.Kind == KindUser && a.Name == "argus" {
+			if a.Action != ActionConflict || !strings.Contains(a.Reason, "appgrp") {
+				t.Errorf("argus should be a conflict citing its group: %+v", a)
+			}
+			userConflict = true
+		}
+	}
+	if !userConflict {
+		t.Fatal("argus (depending on a conflicted group) must become a conflict")
+	}
+	// And therefore NO subuid/linger for it.
+	if s, l := rootlessActions(plan); s != nil || l != nil {
+		t.Errorf("a group-refused owner must get no subuid/linger; got subid=%+v linger=%+v", s, l)
 	}
 }
 

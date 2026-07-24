@@ -15,6 +15,7 @@ import (
 // magus does not guess a principal's state.
 func Diff(desired *ir.IR, r Reader, g Gate) (*Plan, error) {
 	p := &Plan{}
+	conflictedGroups := map[string]string{} // group name -> conflict reason
 	for _, grp := range desired.Groups {
 		if !g.Manages(grp.Name) {
 			continue
@@ -22,6 +23,9 @@ func Diff(desired *ir.IR, r Reader, g Gate) (*Plan, error) {
 		a, err := diffGroup(grp, r)
 		if err != nil {
 			return nil, err
+		}
+		if a.Action == ActionConflict {
+			conflictedGroups[grp.Name] = a.Reason
 		}
 		p.Actions = append(p.Actions, a)
 	}
@@ -33,6 +37,18 @@ func Diff(desired *ir.IR, r Reader, g Gate) (*Plan, error) {
 		a, err := diffUser(u, r, g)
 		if err != nil {
 			return nil, err
+		}
+		// A user whose declared primary/supplementary group did not reconcile is
+		// itself a conflict — its declared identity can't be honored, so magus must
+		// not create/modify it (against a wrong-gid host group) NOR provision its
+		// rootless prerequisites. Making it a user conflict here is what makes the
+		// refusal atomic across every gate (user action, subuid/linger, quadlet
+		// write, activation), instead of only the CLI-level workload block.
+		if a.Action != ActionConflict {
+			if grp, reason, bad := conflictingDeclaredGroup(u, conflictedGroups); bad {
+				a.Action, a.Reason = ActionConflict,
+					fmt.Sprintf("declared group %q did not reconcile (%s)", grp, reason)
+			}
 		}
 		if a.Action == ActionConflict {
 			conflicted[u.Name] = true // a refused principal gets no rootless provisioning
@@ -51,6 +67,21 @@ func Diff(desired *ir.IR, r Reader, g Gate) (*Plan, error) {
 	}
 	p.Actions = append(p.Actions, rootless...)
 	return p, nil
+}
+
+// conflictingDeclaredGroup returns the first of u's declared groups (primary or
+// supplementary) that is in conflicted, and its reason. This is how a group's
+// failure to reconcile propagates to the user that depends on it.
+func conflictingDeclaredGroup(u ir.User, conflicted map[string]string) (group, reason string, bad bool) {
+	for _, gname := range append(append([]string(nil), u.Groups...), u.PrimaryGroup) {
+		if gname == "" {
+			continue
+		}
+		if r, ok := conflicted[gname]; ok {
+			return gname, r, true
+		}
+	}
+	return "", "", false
 }
 
 func diffUser(u ir.User, r Reader, g Gate) (PrincipalAction, error) {
