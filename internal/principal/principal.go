@@ -28,6 +28,13 @@ type Kind string
 const (
 	KindUser  Kind = "user"
 	KindGroup Kind = "group"
+	// KindSubid and KindLinger are the rootless prerequisites magus *provisions*
+	// (never declared) for a principal that owns rootless workloads — the first
+	// two links of ADR-0003's spine. Their Name is the owning principal. subuid
+	// grants a subordinate uid/gid range (rootless userns); linger keeps the
+	// principal's user@<uid> manager running at boot without a login session.
+	KindSubid  Kind = "subuid"
+	KindLinger Kind = "linger"
 )
 
 // Action is what reconciliation will do to one principal.
@@ -84,6 +91,15 @@ type Reader interface {
 	LookupGroup(name string) (gid int, exists bool, err error)
 	// GroupByID returns the name owning gid, and whether any group does.
 	GroupByID(gid int) (name string, exists bool, err error)
+	// HasSubid reports whether name already holds a subordinate uid/gid range
+	// (/etc/subuid + /etc/subgid). Detect-then-provision: useradd auto-allocates
+	// on FCOS, so a freshly created rootless owner usually already has one, which
+	// magus adopts rather than adding a duplicate.
+	HasSubid(name string) (bool, error)
+	// Linger reports whether lingering is enabled for name — detected via the
+	// /var/lib/systemd/linger/<name> marker, which is readable even when logind
+	// is not running (so this probe never depends on the thing it gates).
+	Linger(name string) (bool, error)
 }
 
 // ActualUser is the observed state of a user (getent passwd + id -Gn).
@@ -112,6 +128,15 @@ type Executor interface {
 	UserAddGroups(name string, groups []string) error
 	// GroupAdd creates a group.
 	GroupAdd(g ir.Group) error
+	// EnsureSubid idempotently guarantees name holds a subordinate uid/gid range,
+	// picking the next free range so every other principal's line is preserved
+	// (/etc/subuid is a shared registry, never a managed file). A no-op when a
+	// range already exists — safe to run even if useradd auto-allocated one
+	// earlier in the same apply.
+	EnsureSubid(name string) error
+	// EnableLinger enables lingering for name (loginctl enable-linger). Idempotent:
+	// re-enabling an already-lingering principal is a clean no-op.
+	EnableLinger(name string) error
 }
 
 // Plan is the ordered set of principal actions a Diff produced.

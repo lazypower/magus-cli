@@ -15,7 +15,9 @@ type fakeReader struct {
 	uidOwner map[int]string
 	groups   map[string]int
 	gidOwner map[int]string
-	err      error // if set, every lookup returns it (getent-failure path)
+	subid    map[string]bool // names with an existing subuid range
+	linger   map[string]bool // names with linger enabled
+	err      error           // if set, every lookup returns it (getent-failure path)
 }
 
 func (f fakeReader) LookupUser(name string) (ActualUser, error) {
@@ -38,6 +40,18 @@ func (f fakeReader) LookupGroup(name string) (int, bool, error) {
 func (f fakeReader) GroupByID(gid int) (string, bool, error) {
 	n, ok := f.gidOwner[gid]
 	return n, ok, nil
+}
+func (f fakeReader) HasSubid(name string) (bool, error) {
+	if f.err != nil {
+		return false, f.err
+	}
+	return f.subid[name], nil
+}
+func (f fakeReader) Linger(name string) (bool, error) {
+	if f.err != nil {
+		return false, f.err
+	}
+	return f.linger[name], nil
 }
 
 // fakeGate drives the policy surface directly.
@@ -192,6 +206,12 @@ func (e *fakeExecutor) UserAddGroups(name string, groups []string) error {
 	return e.rec("UserAddGroups(" + name + ")")
 }
 func (e *fakeExecutor) GroupAdd(g ir.Group) error { return e.rec("GroupAdd(" + g.Name + ")") }
+func (e *fakeExecutor) EnsureSubid(name string) error {
+	return e.rec("EnsureSubid(" + name + ")")
+}
+func (e *fakeExecutor) EnableLinger(name string) error {
+	return e.rec("EnableLinger(" + name + ")")
+}
 
 func has(calls []string, want string) bool {
 	for _, c := range calls {

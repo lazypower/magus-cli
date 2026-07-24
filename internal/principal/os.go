@@ -3,6 +3,8 @@ package principal
 import (
 	"errors"
 	"fmt"
+	"io/fs"
+	"os"
 	"os/exec"
 	"strconv"
 	"strings"
@@ -17,12 +19,14 @@ const nologinShell = "/usr/sbin/nologin"
 // Reader; the getent and idGroups seams are injectable so the parsing logic is
 // unit-tested without a live host.
 func OSReader() Reader {
-	return osReader{lookup: getent, idGroups: idGroups}
+	return osReader{lookup: getent, idGroups: idGroups, subid: subidPresent, linger: lingerEnabled}
 }
 
 type osReader struct {
 	lookup   func(db, key string) (string, bool, error)
 	idGroups func(name string) ([]string, error)
+	subid    func(name string) (bool, error)
+	linger   func(name string) (bool, error)
 }
 
 func (r osReader) LookupUser(name string) (ActualUser, error) {
@@ -50,6 +54,9 @@ func (r osReader) LookupUser(name string) (ActualUser, error) {
 	a.Groups = filterPrimary(all, a.PrimaryGroup)
 	return a, nil
 }
+
+func (r osReader) HasSubid(name string) (bool, error) { return r.subid(name) }
+func (r osReader) Linger(name string) (bool, error)   { return r.linger(name) }
 
 func (r osReader) UserByID(uid int) (string, bool, error) {
 	line, found, err := r.lookup("passwd", strconv.Itoa(uid))
@@ -161,12 +168,14 @@ func idGroups(name string) ([]string, error) {
 	return strings.Fields(string(out)), nil
 }
 
-// OSExecutor mutates principals through useradd / usermod / groupadd as root.
-// The run seam is injectable so argv construction is unit-tested.
-func OSExecutor() Executor { return osExecutor{run: runCmd} }
+// OSExecutor mutates principals through useradd / usermod / groupadd /
+// loginctl as root. The run and subidState seams are injectable so argv
+// construction and the detect-then-provision decision are unit-tested.
+func OSExecutor() Executor { return osExecutor{run: runCmd, subidState: readSubidState} }
 
 type osExecutor struct {
-	run func(name string, args ...string) error
+	run        func(name string, args ...string) error
+	subidState func() (present map[string]bool, used []subRange, err error)
 }
 
 func (e osExecutor) UserAdd(u ir.User, locked bool) error {
@@ -194,6 +203,117 @@ func (e osExecutor) UserAddGroups(name string, groups []string) error {
 
 func (e osExecutor) GroupAdd(g ir.Group) error {
 	return e.run("groupadd", groupAddArgs(g)...)
+}
+
+// EnsureSubid is idempotent detect-then-provision: if name already holds a
+// subordinate range (useradd auto-allocated it, or a prior apply did) it is a
+// no-op; otherwise it allocates the next free range, preserving every other
+// principal's line in the shared /etc/subuid+/etc/subgid registries.
+func (e osExecutor) EnsureSubid(name string) error {
+	present, used, err := e.subidState()
+	if err != nil {
+		return err
+	}
+	if present[name] {
+		return nil
+	}
+	start := nextFreeSubStart(used, subIDMin)
+	return e.run("usermod", subidArgs(name, start, subIDCount)...)
+}
+
+// EnableLinger is idempotent: loginctl enable-linger on an already-lingering
+// principal succeeds and changes nothing.
+func (e osExecutor) EnableLinger(name string) error {
+	return e.run("loginctl", "enable-linger", name)
+}
+
+// subidArgs builds the usermod argv that grants name a subordinate uid AND gid
+// range of count ids starting at start (same range for both, the rootless
+// convention). Pure — unit-tested.
+func subidArgs(name string, start, count int) []string {
+	r := fmt.Sprintf("%d-%d", start, start+count-1)
+	return []string{"--add-subuids", r, "--add-subgids", r, name}
+}
+
+// --- subordinate-id / linger host reads (thin seams) --------------------------
+
+// Host paths for the subordinate-id registries and the linger marker dir. Package
+// vars (not consts) so tests can point them at a temp tree; production is /etc
+// and /var/lib/systemd/linger.
+var (
+	subuidPath = "/etc/subuid"
+	subgidPath = "/etc/subgid"
+	lingerDir  = "/var/lib/systemd/linger"
+)
+
+// subidPresent reports whether name has a range in BOTH /etc/subuid and
+// /etc/subgid — rootless userns needs both. A missing file means no ranges, not
+// an error (a host may not have created them yet).
+func subidPresent(name string) (bool, error) {
+	inUID, err := nameInSubidFile(subuidPath, name)
+	if err != nil || !inUID {
+		return false, err
+	}
+	return nameInSubidFile(subgidPath, name)
+}
+
+func nameInSubidFile(path, name string) (bool, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		if errors.Is(err, fs.ErrNotExist) {
+			return false, nil
+		}
+		return false, err
+	}
+	prefix := name + ":"
+	for _, line := range strings.Split(string(data), "\n") {
+		if strings.HasPrefix(line, prefix) {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
+// readSubidState reads both registries once: the set of names already granted a
+// subuid range (so provision is skipped) and every allocated range across both
+// files (so the next free range never overlaps). Missing files are empty, not an
+// error.
+func readSubidState() (map[string]bool, []subRange, error) {
+	present := map[string]bool{}
+	var used []subRange
+	for _, path := range []string{subuidPath, subgidPath} {
+		data, err := os.ReadFile(path)
+		if err != nil {
+			if errors.Is(err, fs.ErrNotExist) {
+				continue
+			}
+			return nil, nil, err
+		}
+		used = append(used, parseSubidFile(string(data))...)
+		if path == subuidPath {
+			for _, line := range strings.Split(string(data), "\n") {
+				if name, _, ok := strings.Cut(line, ":"); ok && name != "" {
+					present[name] = true
+				}
+			}
+		}
+	}
+	return present, used, nil
+}
+
+// lingerEnabled reports whether the /var/lib/systemd/linger/<name> marker
+// exists. The marker is the on-disk fact loginctl writes; reading it never
+// depends on logind actually running, which matters because linger is a
+// prerequisite the readiness probe orders *before* the user manager is up.
+func lingerEnabled(name string) (bool, error) {
+	_, err := os.Stat(lingerDir + "/" + name)
+	if err == nil {
+		return true, nil
+	}
+	if errors.Is(err, fs.ErrNotExist) {
+		return false, nil
+	}
+	return false, err
 }
 
 // userAddArgs builds the useradd argv for u, applying the safe-default nologin

@@ -104,6 +104,23 @@ func applyOne(a PrincipalAction, users map[string]ir.User, groups map[string]ir.
 	}
 
 	switch a.Kind {
+	case KindSubid:
+		// Idempotent provision (detect-then-provision lives in the executor), so
+		// running it is safe even when useradd auto-allocated a range earlier in
+		// this same apply — the partial-order hazard is closed at the seam.
+		if err := ex.EnsureSubid(a.Name); err != nil {
+			return errored(oc, err)
+		}
+		oc.Status, oc.Reason = StatusApplied, a.Reason
+		return oc
+
+	case KindLinger:
+		if err := ex.EnableLinger(a.Name); err != nil {
+			return errored(oc, err)
+		}
+		oc.Status, oc.Reason = StatusApplied, a.Reason
+		return oc
+
 	case KindGroup:
 		g := groups[a.Name]
 		if err := ex.GroupAdd(g); err != nil {

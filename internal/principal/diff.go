@@ -35,6 +35,14 @@ func Diff(desired *ir.IR, r Reader, g Gate) (*Plan, error) {
 		}
 		p.Actions = append(p.Actions, a)
 	}
+	// Rootless prerequisites (subuid, linger) for principals that own user-scoped
+	// workloads — appended after the users so the owner is created first: the
+	// spine principal ⊳ subuid ⊳ linger.
+	rootless, err := diffRootless(desired, r, g)
+	if err != nil {
+		return nil, err
+	}
+	p.Actions = append(p.Actions, rootless...)
 	return p, nil
 }
 
