@@ -173,6 +173,31 @@ func TestAdoptAndSkipDoNotTriggerReload(t *testing.T) {
 	}
 }
 
+// A user-scope quadlet source is written by the system graph (its path node
+// exists) but produces NO system service node and does NOT drag in the system
+// daemon-reload — its service and generator reload live on the user bus,
+// reconciled out of this graph by ReconcileUserWorkloads.
+func TestUserScopeQuadletExcludedFromSystemGraph(t *testing.T) {
+	userPath := "/var/home/argus/.config/containers/systemd/argusd.container"
+	in := &ir.IR{Quadlets: []ir.Quadlet{
+		{Name: "argusd.container", Path: userPath, Scope: ir.ScopeUser, Owner: "argus"},
+	}}
+	plan := &diff.Plan{Actions: []diff.ResourceAction{
+		{Path: userPath, Kind: diff.KindQuadlet, UnitName: "argusd.container", Action: diff.ActionCreate},
+	}}
+	g := Derive(plan, in)
+
+	if !g.HasNode(userPath) {
+		t.Error("the user quadlet source must still be written (path node present)")
+	}
+	if g.HasNode("argusd.service") {
+		t.Error("a user-scope quadlet must NOT get a system service node")
+	}
+	if g.HasNode(ReloadNode) {
+		t.Error("a user-scope quadlet write must NOT trigger the system daemon-reload")
+	}
+}
+
 func TestNoReloadNodeWithoutUnitMutation(t *testing.T) {
 	in := &ir.IR{Files: []ir.File{{Path: "/etc/x"}}}
 	plan := &diff.Plan{Actions: []diff.ResourceAction{fileAct("/etc/x", diff.ActionCreate)}}

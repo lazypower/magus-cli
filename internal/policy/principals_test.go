@@ -93,6 +93,54 @@ func TestCheckPrincipalNumericGroupRefused(t *testing.T) {
 	}
 }
 
+// A rootless-workload owner must declare a home under /var/home|/home — a
+// system-path home is refused at validate (defense behind the bounded chown).
+func TestCheckPrincipalRootlessHomeGate(t *testing.T) {
+	userQuad := func(owner string) ir.Quadlet {
+		return ir.Quadlet{Name: "x.container", Scope: ir.ScopeUser, Owner: owner}
+	}
+	// home under /etc → rejected.
+	bad := Check(managePolicy(false), &ir.IR{
+		Users:    []ir.User{{Name: "argus", UID: pint(1000), HomeDir: "/etc"}},
+		Quadlets: []ir.Quadlet{userQuad("argus")},
+	})
+	if !hasReason(bad, "home_dir must be") {
+		t.Errorf("rootless owner with home=/etc must be rejected, got %v", bad)
+	}
+	// a legitimate /var/home home → passes.
+	ok := Check(managePolicy(false), &ir.IR{
+		Users:    []ir.User{{Name: "argus", UID: pint(1000), HomeDir: "/var/home/argus"}},
+		Quadlets: []ir.Quadlet{userQuad("argus")},
+	})
+	if hasReason(ok, "home_dir must be") {
+		t.Errorf("rootless owner with /var/home home must pass, got %v", ok)
+	}
+	// a principal that owns NO user workload isn't subject to the home gate.
+	noWorkload := Check(managePolicy(false), &ir.IR{
+		Users: []ir.User{{Name: "argus", UID: pint(1000), HomeDir: "/opt/argus"}},
+	})
+	if hasReason(noWorkload, "home_dir must be") {
+		t.Errorf("non-owner should not hit the rootless home gate, got %v", noWorkload)
+	}
+}
+
+func TestIsUserHome(t *testing.T) {
+	for _, h := range []string{"/var/home/argus", "/home/argus"} {
+		if !isUserHome("argus", h) {
+			t.Errorf("%q should be argus's user home", h)
+		}
+	}
+	// Must belong to THIS principal — another user's home is rejected.
+	if isUserHome("argus", "/var/home/core") {
+		t.Error("argus must not own /var/home/core")
+	}
+	for _, h := range []string{"/etc", "/var/lib/x", "/var/home", "/home", "/var/home/argus/b", "/var/home/../etc", "/var/home/argus/", ""} {
+		if isUserHome("argus", h) {
+			t.Errorf("%q must NOT be argus's user home", h)
+		}
+	}
+}
+
 func TestGateMethods(t *testing.T) {
 	p := &Policy{
 		Version:          1,
@@ -106,6 +154,13 @@ func TestGateMethods(t *testing.T) {
 	}
 	if !p.IsPrivilegedGroup("wheel") || !p.IsPrivilegedGroup("docker") {
 		t.Error("built-in privileged groups must be recognized")
+	}
+	// The builtin denylist covers the well-known root-equivalent groups beyond the
+	// sudo vectors — raw-device/hash/VM/container/log access are escalations too.
+	for _, g := range []string{"disk", "shadow", "kvm", "lxd", "libvirt", "kmem", "adm", "systemd-journal", "sudo"} {
+		if !p.IsPrivilegedGroup(g) {
+			t.Errorf("builtin privileged group %q must be recognized without a policy entry", g)
+		}
 	}
 	if !p.IsPrivilegedGroup("kvm") {
 		t.Error("policy-extended privileged group must be recognized")

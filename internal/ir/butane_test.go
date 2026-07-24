@@ -351,21 +351,117 @@ storage:
 	}
 }
 
+// A .container under a declared principal's home is promoted to a user-scoped
+// Quadlet owned by that principal; the same file shape under /etc stays system.
+// This is the argus.bu isolated-node gap ADR-0003 closes by path-derived scope.
+func TestLoadButanePromotesUserScopeQuadlet(t *testing.T) {
+	doc := `variant: fcos
+version: "1.6.0"
+passwd:
+  users:
+    - name: argus
+      uid: 1000
+      home_dir: /var/home/argus
+storage:
+  files:
+    - path: /etc/containers/systemd/sys.container
+      contents:
+        inline: "[Container]\nImage=busybox\n"
+    - path: /var/home/argus/.config/containers/systemd/argusd.container
+      contents:
+        inline: "[Container]\nImage=argusd\n"
+    - path: /var/home/argus/.config/other/notes.txt
+      contents:
+        inline: "not a quadlet\n"
+`
+	dir := t.TempDir()
+	path := filepath.Join(dir, "u.bu")
+	if err := os.WriteFile(path, []byte(doc), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	got, _, err := LoadButane(path, false)
+	if err != nil {
+		t.Fatalf("LoadButane: %v", err)
+	}
+
+	if len(got.Quadlets) != 2 {
+		t.Fatalf("Quadlets: want 2 (1 system, 1 user), got %d: %+v", len(got.Quadlets), got.Quadlets)
+	}
+	byName := map[string]Quadlet{}
+	for _, q := range got.Quadlets {
+		byName[q.Name] = q
+	}
+	sys, ok := byName["sys.container"]
+	if !ok || sys.Scope != ScopeSystem || sys.Owner != "" {
+		t.Errorf("system quadlet mis-scoped: %+v", sys)
+	}
+	usr, ok := byName["argusd.container"]
+	if !ok || usr.Scope != ScopeUser || usr.Owner != "argus" {
+		t.Errorf("user quadlet mis-scoped: %+v (want scope=user owner=argus)", usr)
+	}
+	// The source defaults to the principal's uid so rootless podman owns its
+	// config tree (magus chowns the created .config parents to match on write).
+	if usr.UID == nil || *usr.UID != 1000 {
+		t.Errorf("user quadlet should default to owner uid 1000, got %v", usr.UID)
+	}
+	// The non-quadlet file under the home stays an ordinary file, untouched.
+	var sawNotes bool
+	for _, f := range got.Files {
+		if f.Path == "/var/home/argus/.config/other/notes.txt" {
+			sawNotes = true
+		}
+	}
+	if !sawNotes {
+		t.Errorf("non-quadlet file under home should remain a File, got Files=%+v", got.Files)
+	}
+}
+
+// A user quadlet is only derived from a home that is actually declared: a
+// .container under a home path with no matching principal stays an opaque file
+// (no owner to attribute, no user manager to reconcile it through).
+func TestLoadButaneUndeclaredHomeQuadletStaysFile(t *testing.T) {
+	doc := `variant: fcos
+version: "1.6.0"
+storage:
+  files:
+    - path: /var/home/ghost/.config/containers/systemd/x.container
+      contents:
+        inline: "[Container]\nImage=busybox\n"
+`
+	dir := t.TempDir()
+	path := filepath.Join(dir, "g.bu")
+	if err := os.WriteFile(path, []byte(doc), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	got, _, err := LoadButane(path, false)
+	if err != nil {
+		t.Fatalf("LoadButane: %v", err)
+	}
+	if len(got.Quadlets) != 0 {
+		t.Errorf("no principal declares that home → no user quadlet; got %+v", got.Quadlets)
+	}
+	if len(got.Files) != 1 {
+		t.Errorf("the .container should remain an ordinary file; got Files=%+v", got.Files)
+	}
+}
+
 func TestDeferredQuadletType(t *testing.T) {
+	userRoots := []userRoot{{name: "argus", prefix: "/var/home/argus/.config/containers/systemd/"}}
 	cases := map[string]string{
-		"/etc/containers/systemd/a.kube":  ".kube",
-		"/etc/containers/systemd/a.pod":   ".pod",
-		"/etc/containers/systemd/a.image": ".image",
-		"/etc/containers/systemd/a.build": ".build",
+		"/etc/containers/systemd/a.kube":                    ".kube",
+		"/etc/containers/systemd/a.pod":                     ".pod",
+		"/etc/containers/systemd/a.image":                   ".image",
+		"/etc/containers/systemd/a.build":                   ".build",
+		"/var/home/argus/.config/containers/systemd/a.kube": ".kube", // deferred under a user root too
 	}
 	for path, want := range cases {
-		if got := deferredQuadletType(path); got != want {
+		if got := deferredQuadletType(path, userRoots); got != want {
 			t.Errorf("deferredQuadletType(%q) = %q, want %q", path, got, want)
 		}
 	}
 	// Supported types and non-quadlet locations are not deferred.
 	for _, ok := range []string{"/etc/containers/systemd/a.container", "/etc/magus.d/a.kube"} {
-		if got := deferredQuadletType(ok); got != "" {
+		if got := deferredQuadletType(ok, userRoots); got != "" {
 			t.Errorf("deferredQuadletType(%q) = %q, want \"\"", ok, got)
 		}
 	}

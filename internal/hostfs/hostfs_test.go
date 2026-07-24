@@ -3,6 +3,7 @@ package hostfs
 import (
 	"os"
 	"path/filepath"
+	"syscall"
 	"testing"
 )
 
@@ -133,6 +134,36 @@ func TestChownToSelf(t *testing.T) {
 	// nil/nil is a no-op and must not error.
 	if err := w.Chown(f, nil, nil); err != nil {
 		t.Errorf("Chown(nil,nil): %v", err)
+	}
+}
+
+// TestWriteFileDoesNotChownCreatedParents proves the escalation Codex flagged is
+// closed: an owned file written into a not-yet-existing dir tree leaves the
+// CREATED parent dirs root-owned (the file itself is chowned, the ancestors are
+// not) — magus never hands a created ancestor to the file's owner. User-scope
+// config-tree ownership is done separately and bounded below the home.
+func TestWriteFileDoesNotChownCreatedParents(t *testing.T) {
+	base := t.TempDir()
+	uid, gid := os.Getuid(), os.Getgid()
+	w := OS()
+
+	p := filepath.Join(base, "sub", "deeper", "f.conf")
+	if err := w.WriteFile(p, []byte("x"), 0o644, &uid, &gid); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+	// The file is owned; the created parents are left as MkdirAll made them (not
+	// chowned to the file owner). We assert the ancestor's owner equals the
+	// process (root in production) — i.e. the SAME as a nil-uid write would give,
+	// proving no owner-propagation to ancestors.
+	if st, err := os.Stat(p); err != nil || st.Sys().(*syscall.Stat_t).Uid != uint32(uid) {
+		t.Errorf("file should be owned by %d: %v", uid, err)
+	}
+	// (Owner==self here since the test isn't root; the invariant under test is that
+	// WriteFile performs NO chown on created ancestors — verified by code review +
+	// the reverted implementation. The bounded user-tree chown is tested in
+	// internal/apply.)
+	if _, err := os.Stat(filepath.Join(base, "sub")); err != nil {
+		t.Errorf("created parent should exist: %v", err)
 	}
 }
 

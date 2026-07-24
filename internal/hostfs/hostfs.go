@@ -140,6 +140,11 @@ func (osImpl) ResolvePath(path string) (string, error) {
 }
 
 func (osImpl) WriteFile(path string, contents []byte, mode uint32, uid, gid *int) error {
+	// Parent dirs are created root-owned (never chowned to the file's owner):
+	// chowning created ancestors to an arbitrary uid is a privilege-escalation
+	// vector (a system dir handed to an unprivileged user). A user-scope quadlet's
+	// home config tree is owned separately and *bounded* below the principal's
+	// home by the user-workload reconciler — see apply.chownUserConfigTree.
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
 		return err
 	}

@@ -10,7 +10,20 @@ import (
 // builtinPrivilegedGroups are always treated as root-equivalent: membership is a
 // privilege escalation regardless of policy. privileged_groups in the policy
 // extends this set; it never shrinks it.
-var builtinPrivilegedGroups = []string{"root", "wheel", "sudo", "docker"}
+//
+// The set is the well-known root-equivalent groups: sudo vectors (root, wheel,
+// sudo), and groups whose membership is a root-equivalent capability on its own —
+// docker/lxd/libvirt (spawn privileged containers/VMs → escape), disk/kmem (raw
+// block-device and kernel-memory access → read/write any file), shadow (password
+// hashes), kvm (VM device), adm/systemd-journal (logs, which routinely carry
+// secrets). A denylist is inherently incomplete: host-specific privileged groups
+// are the operator's to add via privileged_groups.
+var builtinPrivilegedGroups = []string{
+	"root", "wheel", "sudo",
+	"docker", "lxd", "libvirt",
+	"disk", "kmem", "shadow", "kvm",
+	"adm", "systemd-journal",
+}
 
 // Manages reports whether name is in the manage_users allowlist — the principals
 // magus may create or modify. A principal outside the allowlist is ignored
@@ -63,6 +76,17 @@ func (p *Policy) GrantsPrivilegedGroup(principal, group string) bool {
 func (p *Policy) checkPrincipals(in *ir.IR) []Violation {
 	var v []Violation
 
+	// Principals that own rootless (user-scope) workloads: their home is where
+	// magus writes and CHOWNS a config tree, so the home must be a real user home,
+	// never a system path — else magus could be steered into chowning /etc/... to
+	// an unprivileged uid (defense in depth behind the bounded chown).
+	rootlessOwners := map[string]bool{}
+	for _, q := range in.Quadlets {
+		if q.Scope == ir.ScopeUser && q.Owner != "" {
+			rootlessOwners[q.Owner] = true
+		}
+	}
+
 	for _, u := range in.Users {
 		if !p.Manages(u.Name) {
 			continue // unmanaged principal: Ignition's, not magus's
@@ -71,6 +95,9 @@ func (p *Policy) checkPrincipals(in *ir.IR) []Violation {
 
 		if u.UID == nil {
 			v = append(v, Violation{Resource: res, Reason: "managed principal must declare a uid (deterministic UIDs — no implicit allocation)"})
+		}
+		if rootlessOwners[u.Name] && !isUserHome(u.Name, u.HomeDir) {
+			v = append(v, Violation{Resource: res, Reason: fmt.Sprintf("a rootless-workload owner's home_dir must be /var/home/%s or /home/%s (got %q); magus owns the config tree there, so the home must belong to this very principal — never another user's home or a system path", u.Name, u.Name, u.HomeDir)})
 		}
 		if u.HasPassword {
 			v = append(v, Violation{Resource: res, Reason: "password_hash is not supported in v1 for a managed principal (created accounts are password-locked; a workload account is not a login account)"})
@@ -98,6 +125,24 @@ func (p *Policy) checkPrincipals(in *ir.IR) []Violation {
 	}
 
 	return v
+}
+
+// isUserHome reports whether home is exactly this principal's canonical user
+// home — /var/home/<name> or /home/<name>. Binding the home to the principal's
+// OWN name (not just any single component) is load-bearing: it stops a managed
+// principal from declaring another user's home (or a system path) and thereby
+// claiming that user's quadlets or steering magus's config-tree chown outside
+// its own home.
+func isUserHome(name, home string) bool {
+	if name == "" {
+		return false
+	}
+	for _, root := range []string{"/var/home/", "/home/"} {
+		if home == root+name {
+			return true
+		}
+	}
+	return false
 }
 
 // appendGroupGateViolation enforces the privileged-group gate for one declared

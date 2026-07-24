@@ -129,10 +129,9 @@ var quadletExtensions = []string{".container", ".volume", ".network"}
 // honest.
 var deferredQuadletExtensions = []string{".pod", ".kube", ".image", ".build"}
 
-func isQuadletPath(path string) bool {
-	if !strings.HasPrefix(path, quadletRoot) {
-		return false
-	}
+// hasQuadletExt reports whether path carries a v1-supported quadlet extension
+// (location-agnostic; callers combine it with a root-prefix check).
+func hasQuadletExt(path string) bool {
 	ext := filepath.Ext(path)
 	for _, q := range quadletExtensions {
 		if ext == q {
@@ -142,10 +141,36 @@ func isQuadletPath(path string) bool {
 	return false
 }
 
+func isQuadletPath(path string) bool {
+	return strings.HasPrefix(path, quadletRoot) && hasQuadletExt(path)
+}
+
+// userQuadletSubdir is the per-principal quadlet root, relative to the home dir:
+// systemd-quadlet's user generator scans <home>/.config/containers/systemd/.
+const userQuadletSubdir = ".config/containers/systemd/"
+
+// userQuadletRoot returns the absolute quadlet root for a principal's home
+// (empty home → empty, so an undeclared home derives no user scope).
+func userQuadletRoot(home string) string {
+	if home == "" {
+		return ""
+	}
+	return filepath.Clean(home) + "/" + userQuadletSubdir
+}
+
 // deferredQuadletType returns the deferred quadlet extension if path is a
-// not-yet-supported quadlet under the quadlet root, else "".
-func deferredQuadletType(path string) string {
-	if !strings.HasPrefix(path, quadletRoot) {
+// not-yet-supported quadlet under any quadlet root (system or user), else "".
+// The user generator processes a deferred type under a home just as the system
+// one does, so both must be refused at load to keep the authority boundary honest.
+func deferredQuadletType(path string, userRoots []userRoot) string {
+	underRoot := strings.HasPrefix(path, quadletRoot)
+	for _, r := range userRoots {
+		if strings.HasPrefix(path, r.prefix) {
+			underRoot = true
+			break
+		}
+	}
+	if !underRoot {
 		return ""
 	}
 	ext := filepath.Ext(path)
@@ -155,6 +180,32 @@ func deferredQuadletType(path string) string {
 		}
 	}
 	return ""
+}
+
+// userRoot binds a declared principal's quadlet root prefix to its name and uid,
+// so a quadlet under that prefix is promoted to a user-scoped Quadlet owned by
+// name and written owned by uid.
+type userRoot struct {
+	name   string
+	prefix string
+	uid    *int
+}
+
+// userQuadletOwner returns the owning principal (name + uid) if path is a
+// supported quadlet under one of userRoots, matching the longest (most specific)
+// prefix so nested homes cannot mis-attribute. ok is false for a non-quadlet or
+// a path under no declared home.
+func userQuadletOwner(path string, userRoots []userRoot) (owner string, uid *int, ok bool) {
+	if !hasQuadletExt(path) {
+		return "", nil, false
+	}
+	best := ""
+	for _, r := range userRoots {
+		if strings.HasPrefix(path, r.prefix) && len(r.prefix) > len(best) {
+			owner, uid, best = r.name, r.uid, r.prefix
+		}
+	}
+	return owner, uid, best != ""
 }
 
 // LoadButane reads source, runs the Butane → Ignition translation, and
@@ -189,6 +240,18 @@ func LoadButane(source string, allowInsecureHTTP bool) (*IR, []string, error) {
 
 	out := &IR{}
 
+	// Derive each declared principal's quadlet root up front: a quadlet under a
+	// principal's <home>/.config/containers/systemd/ is a *user*-scoped workload
+	// owned by that principal (ADR-0003 path-derived scope). Scope is a physical
+	// fact of location; whether magus reconciles the owner is a downstream policy
+	// decision (manage_users), exactly as with the principal itself.
+	var userRoots []userRoot
+	for _, u := range ign.Passwd.Users {
+		if root := userQuadletRoot(derefString(u.HomeDir)); root != "" {
+			userRoots = append(userRoots, userRoot{name: u.Name, prefix: root, uid: u.UID.v})
+		}
+	}
+
 	for _, f := range ign.Storage.Files {
 		contents, err := decodeSource(f.Contents.Source, f.Contents.Compression)
 		if err != nil {
@@ -197,8 +260,8 @@ func LoadButane(source string, allowInsecureHTTP bool) (*IR, []string, error) {
 		// Reject deferred quadlet types under the quadlet root before anything
 		// else: the generator would act on them but magus can't gate their
 		// generated service in v1.
-		if dt := deferredQuadletType(f.Path); dt != "" {
-			return nil, warnings, fmt.Errorf("file %s: quadlet type %q is not supported in v1 (deferred) but systemd-quadlet would still process it — remove it from %s", f.Path, dt, quadletRoot)
+		if dt := deferredQuadletType(f.Path, userRoots); dt != "" {
+			return nil, warnings, fmt.Errorf("file %s: quadlet type %q is not supported in v1 (deferred) but systemd-quadlet would still process it — remove it from the quadlet root", f.Path, dt)
 		}
 		// Auto-promote quadlet-shaped files: anything under
 		// /etc/containers/systemd/ with a recognized quadlet extension
@@ -214,6 +277,33 @@ func LoadButane(source string, allowInsecureHTTP bool) (*IR, []string, error) {
 				UID:      f.User.ID.v,
 				GID:      f.Group.ID.v,
 				Contents: contents,
+				Scope:    ScopeSystem,
+			})
+			continue
+		}
+		// The same promotion, one scope down: a quadlet under a declared
+		// principal's home is that principal's rootless workload. The user
+		// generator materializes its .service under the owner's user manager, so
+		// magus must see it as a Quadlet (owner-attributed) to gate and order it —
+		// not as an opaque file (the argus.bu isolated-node gap ADR-0003 names).
+		if owner, ownerUID, ok := userQuadletOwner(f.Path, userRoots); ok {
+			// A user-scope quadlet must be owned by its principal — rootless podman
+			// refuses a config tree it doesn't own. Default the source's owner to the
+			// principal's uid (magus chowns the created .config parents to match on
+			// write); an explicit file user.id still wins if the operator set one.
+			uid := f.User.ID.v
+			if uid == nil {
+				uid = ownerUID
+			}
+			out.Quadlets = append(out.Quadlets, Quadlet{
+				Path:     f.Path,
+				Name:     filepath.Base(f.Path),
+				Mode:     f.Mode.value(0644),
+				UID:      uid,
+				GID:      f.Group.ID.v,
+				Contents: contents,
+				Scope:    ScopeUser,
+				Owner:    owner,
 			})
 			continue
 		}

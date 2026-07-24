@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"strings"
 	"time"
 
 	"github.com/lazypower/magus-cli/internal/apply"
@@ -77,6 +78,10 @@ func runApply(args []string) int {
 	if !ok {
 		return 1
 	}
+	// A user-scope quadlet under an UNMANAGED principal's home is Ignition's, not
+	// magus's — drop it before any reconciliation so it is never written or run as
+	// that user (the manage_users boundary, for workloads).
+	parsed = apply.FilterUnmanagedUserQuadlets(parsed, p.Manages)
 
 	now := time.Now().UTC()
 
@@ -97,24 +102,35 @@ func runApply(args []string) int {
 
 	w := hostfs.OS()
 	sd := systemd.OS()
-	plan, err := diff.ComputeWithPolicy(p, parsed, m, w)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "error: %v\n", err)
-		return 1
-	}
-	// Enablement is persistent state reconciled every apply — model it as plan
-	// rows so it's previewed like everything else and a drift can't hide behind
-	// a clean file diff ("Nothing to apply" stays honest).
-	diff.PlanServiceState(parsed, plan, sd)
 
-	// Principals (passwd.users/groups): diffed against getent and reconciled
-	// before files, so a file owned by a freshly-created uid has its owner in
-	// place. Only managed (manage_users) principals are considered.
+	// Principals (passwd.users/groups) are diffed FIRST — before the file plan —
+	// for two reasons: a file owned by a freshly-created uid needs its owner in
+	// place, and a REFUSED principal (a conflict: uid collision, ungranted
+	// privileged group) must not have its rootless quadlet written into its
+	// generator search path, or a later boot/daemon-reload would run it as the
+	// refused identity. So drop refused owners' user quadlets before the file plan.
 	pplan, err := principal.Diff(parsed, principal.OSReader(), p)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "error: %v\n", err)
 		return 1
 	}
+
+	plan, err := diff.ComputeWithPolicy(p, parsed, m, w)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "error: %v\n", err)
+		return 1
+	}
+	// A refused principal (a conflict: uid collision, ungranted privileged group,
+	// immutable-attr change) must not have its rootless quadlet written or
+	// activated — but its EXISTING resources must be LEFT INTACT, never deleted
+	// (dropping the quadlet from the IR would make the sweep delete a running
+	// workload's source). So mark those quadlets' file actions as conflicts:
+	// magus withholds the write, preserves the manifest, and surfaces the refusal.
+	apply.StageRefusedOwnerQuadlets(plan, parsed, blockedOwners(pplan, nil))
+	// Enablement is persistent state reconciled every apply — model it as plan
+	// rows so it's previewed like everything else and a drift can't hide behind
+	// a clean file diff ("Nothing to apply" stays honest).
+	diff.PlanServiceState(parsed, plan, sd)
 
 	printPlan(os.Stdout, butanePath, plan, nil)
 	printPrincipalPlan(os.Stdout, pplan)
@@ -123,19 +139,24 @@ func runApply(args []string) int {
 	pChanges, pConflicts := principalPlanCounts(pplan)
 	changes += pChanges
 	conflicts += pConflicts
-	if changes == 0 && conflicts == 0 && errored == 0 {
+	// A user workload can be staged-but-not-activated with everything on disk in
+	// place (its user manager wasn't up last apply), so a converged file/principal
+	// plan is NOT sufficient to early-exit — the activation step must still run to
+	// (re)attempt it. Configs with no user workloads are unaffected.
+	hasUserWork := apply.HasUserWorkloads(parsed)
+	if changes == 0 && conflicts == 0 && errored == 0 && !hasUserWork {
 		// Already converged. Refresh the observation (keeps last_apply current
 		// on a timer that mostly runs no-op applies) and exit.
-		saveStatusObservation(*statusPath, plan, nil, apply.ObserveUnits(parsed, sd), now)
+		saveStatusObservation(*statusPath, plan, nil, pplan, nil, apply.ObserveUnits(parsed, sd), now)
 		fmt.Println("\nNothing to apply.")
 		return 0
 	}
-	if changes == 0 && errored == 0 {
+	if changes == 0 && errored == 0 && !hasUserWork {
 		// Conflicts only: nothing to apply, but the conflicts must still be
 		// recorded so `magus status` reflects them (and the exit code is 2,
 		// "conflicts present") — regardless of --yes. No prompt: there's nothing
 		// to confirm.
-		saveStatusObservation(*statusPath, plan, nil, apply.ObserveUnits(parsed, sd), now)
+		saveStatusObservation(*statusPath, plan, nil, pplan, nil, apply.ObserveUnits(parsed, sd), now)
 		fmt.Printf("\n%d conflict%s present, nothing to apply.\n", conflicts, plural(conflicts))
 		return 2
 	}
@@ -169,12 +190,31 @@ func runApply(args []string) int {
 		printOutcome(os.Stdout, oc)
 	}
 
+	// Rootless user workloads activate last, over each owner's user manager —
+	// after identity + subuid + linger (above) and the source writes (just now).
+	// Their outcomes fold into the result so the summary, exit code, and status
+	// observation account for them (a staged workload is exit 2, never green).
+	if hasUserWork {
+		uOutcomes := apply.ReconcileUserWorkloads(apply.UserWorkloads{
+			IR:      parsed,
+			Changed: appliedPaths(result),
+			Refused: refusedPaths(result),
+			Blocked: blockedOwners(pplan, presult),
+			Chown:   w,
+			NewUser: func(name string, uid int) systemd.UserManager { return systemd.OSUser(name, uid) },
+		})
+		for _, oc := range uOutcomes {
+			printOutcome(os.Stdout, oc)
+		}
+		result.Outcomes = append(result.Outcomes, uOutcomes...)
+	}
+
 	if err := m.Save(*manifestPath); err != nil {
 		fmt.Fprintf(os.Stderr, "error: failed to save manifest: %v\n", err)
 		return 1
 	}
 
-	saveStatusObservation(*statusPath, plan, result, nil, now)
+	saveStatusObservation(*statusPath, plan, result, pplan, presult, nil, now)
 
 	a, _, s, e := result.Counts()
 	exit := result.ExitCode()
@@ -188,6 +228,74 @@ func runApply(args []string) int {
 	fmt.Printf("Applied %d changes, %d skipped, %d errors.  exit %d\n",
 		a+pa, s+ps, e+pe, exit)
 	return exit
+}
+
+// blockedOwners maps each principal that did NOT reconcile cleanly — a refused
+// conflict (uid collision, ungranted privileged group) or a failed
+// create/subuid/linger — to the reason. Its rootless workloads are then staged,
+// never activated: magus must not run a workload as an identity the gate refused
+// or whose prerequisites failed (Codex P1 #2).
+func blockedOwners(pplan *principal.Plan, presult *principal.Result) map[string]string {
+	blocked := map[string]string{}
+	// Plan-level conflicts. A workload owner is a USER, so only a user conflict (or
+	// a subuid/linger prerequisite) blocks it — NOT a same-named group by mere name
+	// (the manifest namespaces user:argus and group:argus separately; collapsing
+	// them would let an unrelated group-gid collision block a valid user — Codex
+	// round-3). A group that a user actually DEPENDS on is handled upstream in
+	// principal.Diff, which turns the dependent user itself into a conflict — so it
+	// arrives here as a KindUser conflict and needs no special case (Codex round-5).
+	for _, a := range pplan.Actions {
+		if a.Action == principal.ActionConflict && ownerKind(a.Kind) {
+			blocked[a.Name] = a.Reason
+		}
+	}
+	// Apply-level skips/errors (the conflict's skip, or a failed provision step
+	// keyed by the owning principal's name — never a group).
+	if presult != nil {
+		for _, oc := range presult.Outcomes {
+			if (oc.Status == principal.StatusSkipped || oc.Status == principal.StatusErrored) && ownerKind(oc.Kind) {
+				reason := oc.Reason
+				if oc.Err != nil {
+					reason = oc.Err.Error()
+				}
+				blocked[oc.Name] = reason
+			}
+		}
+	}
+	return blocked
+}
+
+// ownerKind reports whether a principal action kind identifies a workload OWNER
+// (a user, or its subuid/linger prerequisites) rather than a group.
+func ownerKind(k principal.Kind) bool {
+	return k == principal.KindUser || k == principal.KindSubid || k == principal.KindLinger
+}
+
+// appliedPaths is the set of resource paths this apply actually wrote (applied),
+// so the user-workload reconciler can tell a freshly-written quadlet source
+// (start/restart) from an unchanged one (leave the running service alone).
+func appliedPaths(result *apply.Result) map[string]bool {
+	out := map[string]bool{}
+	for _, oc := range result.Outcomes {
+		if oc.Status == apply.StatusApplied {
+			out[oc.Path] = true
+		}
+	}
+	return out
+}
+
+// refusedPaths is the set of resource paths this apply did NOT reconcile (a
+// conflict it refused to write, a skip, an error), so the user-workload
+// reconciler never activates a service the generator produced from a source
+// magus itself declined (Codex round-2 fail-open activation).
+func refusedPaths(result *apply.Result) map[string]bool {
+	out := map[string]bool{}
+	for _, oc := range result.Outcomes {
+		if oc.Status == apply.StatusSkipped || oc.Status == apply.StatusErrored {
+			out[oc.Path] = true
+		}
+	}
+	return out
 }
 
 // worstExit combines two apply exit codes by the spec priority: errors (1) beat
@@ -255,7 +363,7 @@ func printPrincipalOutcome(w io.Writer, oc principal.Outcome) {
 // no-op (result=ok) with the supplied observed unit states. first_seen for
 // recurring conflicts is carried forward by status.Build. A write failure is a
 // warning, never fatal — the apply already succeeded and the manifest is saved.
-func saveStatusObservation(statusPath string, plan *diff.Plan, result *apply.Result, fallbackUnits map[string]string, now time.Time) {
+func saveStatusObservation(statusPath string, plan *diff.Plan, result *apply.Result, pplan *principal.Plan, presult *principal.Result, fallbackUnits map[string]string, now time.Time) {
 	conflicts := []status.Conflict{}
 	for _, a := range plan.Actions {
 		if a.Action == diff.ActionConflict {
@@ -268,6 +376,40 @@ func saveStatusObservation(statusPath string, plan *diff.Plan, result *apply.Res
 	for _, sa := range plan.ServiceActions {
 		if sa.Op == diff.ServiceSkip {
 			conflicts = append(conflicts, status.Conflict{Path: sa.Unit, Reason: sa.Reason})
+		}
+	}
+	// A refused principal escalation (uid collision, ungranted privileged group)
+	// is an in-scope conflict too — record it so a principal-only escalation
+	// refusal reaches `magus status` instead of reading as a clean result.
+	for _, a := range pplan.Actions {
+		if a.Action == principal.ActionConflict {
+			conflicts = append(conflicts, status.Conflict{Path: principalRef(a.Kind, a.Name), Reason: a.Reason})
+		}
+	}
+	// A staged user workload (the activation reconciler skipped it — user manager
+	// down, owner refused, tree unownable) is an unresolved state too: record it
+	// so `magus status` names the staged workload and its reason instead of a bare
+	// ok-with-skips (Codex P2 #5). Deduped by path against the conflicts above.
+	idx := map[string]int{}
+	for i, c := range conflicts {
+		idx[c.Path] = i
+	}
+	if result != nil {
+		for _, oc := range result.Outcomes {
+			if oc.Status != apply.StatusSkipped {
+				continue
+			}
+			if i, ok := idx[oc.Path]; ok {
+				// The path already has a conflict recorded (e.g. a file conflict AND a
+				// staged activation for the same path) — MERGE the reasons so status
+				// shows both, never silently dropping the staged state.
+				if !strings.Contains(conflicts[i].Reason, oc.Reason) {
+					conflicts[i].Reason = conflicts[i].Reason + "; " + oc.Reason
+				}
+				continue
+			}
+			conflicts = append(conflicts, status.Conflict{Path: oc.Path, Reason: oc.Reason})
+			idx[oc.Path] = len(conflicts) - 1
 		}
 	}
 
@@ -286,7 +428,27 @@ func saveStatusObservation(statusPath string, plan *diff.Plan, result *apply.Res
 		}
 		res = statusResultString(result.ExitCode())
 		units = result.UnitStates
-	} else if len(conflicts) > 0 {
+	}
+	// Principal apply errors (a useradd/usermod that failed mid-apply) are
+	// recorded like file errors so status never reads green over a real failure.
+	if presult != nil {
+		for _, oc := range presult.Outcomes {
+			if oc.Status == principal.StatusErrored {
+				msg := oc.Reason
+				if oc.Err != nil {
+					msg = oc.Err.Error()
+				}
+				errs = append(errs, status.ErrEntry{Path: principalRef(oc.Kind, oc.Name), Reason: msg})
+			}
+		}
+	}
+	// Escalate the recorded result to match what was actually observed: any error
+	// dominates; otherwise a conflict (file, enablement, or principal) is a skip.
+	// This keeps status honest on the no-apply paths (result==nil) too.
+	switch {
+	case len(errs) > 0:
+		res = status.ResultError
+	case len(conflicts) > 0 && res == status.ResultOK:
 		res = status.ResultWithSkips
 	}
 
@@ -295,6 +457,13 @@ func saveStatusObservation(statusPath string, plan *diff.Plan, result *apply.Res
 	if err := rep.Save(statusPath); err != nil {
 		fmt.Fprintf(os.Stderr, "warning: failed to write status observation: %v\n", err)
 	}
+}
+
+// principalRef renders a principal's status/error path as "<kind>:<name>" (e.g.
+// "user:argus") so identity conflicts and errors are distinguishable from file
+// paths in the observation.
+func principalRef(kind principal.Kind, name string) string {
+	return string(kind) + ":" + name
 }
 
 // statusResultString maps an apply exit code to the observation result string.

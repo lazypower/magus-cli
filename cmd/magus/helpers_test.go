@@ -3,6 +3,8 @@ package main
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -11,6 +13,7 @@ import (
 	"github.com/lazypower/magus-cli/internal/diff"
 	"github.com/lazypower/magus-cli/internal/ir"
 	"github.com/lazypower/magus-cli/internal/manifest"
+	"github.com/lazypower/magus-cli/internal/principal"
 	"github.com/lazypower/magus-cli/internal/status"
 )
 
@@ -50,7 +53,10 @@ func TestEmitPlanJSON(t *testing.T) {
 			{Unit: "x.service", Op: diff.ServiceEnable, Reason: "drift"},
 		},
 	}
-	if code := emitPlanJSON(&b, "src.bu", p); code != 0 {
+	pp := &principal.Plan{Actions: []principal.PrincipalAction{
+		{Kind: principal.KindUser, Name: "argus", Action: principal.ActionCreate, Reason: "create user (uid 1000, locked, nologin)"},
+	}}
+	if code := emitPlanJSON(&b, "src.bu", p, pp); code != 0 {
 		t.Fatalf("emitPlanJSON code = %d", code)
 	}
 	var got planJSON
@@ -65,6 +71,57 @@ func TestEmitPlanJSON(t *testing.T) {
 	}
 	if len(got.ServiceActions) != 1 || got.ServiceActions[0].Op != "enable" {
 		t.Errorf("service actions wrong: %+v", got.ServiceActions)
+	}
+	if len(got.Principals) != 1 || got.Principals[0].Kind != "user" ||
+		got.Principals[0].Name != "argus" || got.Principals[0].Action != "create" {
+		t.Errorf("principals wrong: %+v", got.Principals)
+	}
+}
+
+// A principal conflict with no filesystem work must still report has_changes:true
+// (it exits 2), so an automation gating on the JSON never treats a refused
+// escalation as clean (Codex P2 #6).
+func TestEmitPlanJSONConflictIsAChange(t *testing.T) {
+	var b bytes.Buffer
+	pp := &principal.Plan{Actions: []principal.PrincipalAction{
+		{Kind: principal.KindUser, Name: "argus", Action: principal.ActionConflict, Reason: "uid 1000 already belongs to \"other\""},
+	}}
+	if code := emitPlanJSON(&b, "src.bu", &diff.Plan{}, pp); code != 0 {
+		t.Fatalf("emitPlanJSON code = %d", code)
+	}
+	var got planJSON
+	if err := json.Unmarshal(b.Bytes(), &got); err != nil {
+		t.Fatal(err)
+	}
+	if !got.HasChanges {
+		t.Errorf("a principal conflict must set has_changes:true, got %+v", got)
+	}
+	if len(got.Principals) != 1 || got.Principals[0].Action != "conflict" {
+		t.Errorf("conflict should appear in principals: %+v", got.Principals)
+	}
+}
+
+// TestEmitPlanJSONPrincipalOnlyChanges proves has_changes reflects principal work
+// even when the file plan is empty — a scriptable consumer gating on the JSON must
+// see that apply would create a principal.
+func TestEmitPlanJSONPrincipalOnlyChanges(t *testing.T) {
+	var b bytes.Buffer
+	p := &diff.Plan{}
+	pp := &principal.Plan{Actions: []principal.PrincipalAction{
+		{Kind: principal.KindGroup, Name: "argus", Action: principal.ActionCreate, Reason: "create group"},
+	}}
+	if code := emitPlanJSON(&b, "src.bu", p, pp); code != 0 {
+		t.Fatalf("emitPlanJSON code = %d", code)
+	}
+	var got planJSON
+	if err := json.Unmarshal(b.Bytes(), &got); err != nil {
+		t.Fatalf("invalid JSON: %v\n%s", err, b.String())
+	}
+	if !got.HasChanges {
+		t.Errorf("has_changes must be true when only a principal changes: %+v", got)
+	}
+	if len(got.Principals) != 1 {
+		t.Errorf("principals wrong: %+v", got.Principals)
 	}
 }
 
@@ -172,6 +229,108 @@ func TestPrintOutcome(t *testing.T) {
 	out := b.String()
 	if !strings.Contains(out, "✓ /x") || !strings.Contains(out, "✗ /y") {
 		t.Errorf("outcome marks wrong: %s", out)
+	}
+}
+
+func TestSaveStatusObservationRecordsPrincipalConflict(t *testing.T) {
+	// A principal-only escalation refusal (no file changes, apply never runs) must
+	// still land in the status observation as a skip — not read as a clean result.
+	statusPath := filepath.Join(t.TempDir(), "status.json")
+	now := time.Unix(1000, 0).UTC()
+	pplan := &principal.Plan{Actions: []principal.PrincipalAction{
+		{Kind: principal.KindUser, Name: "argus", Action: principal.ActionConflict,
+			Reason: "already in privileged group \"wheel\" without a policy grant"},
+	}}
+
+	saveStatusObservation(statusPath, &diff.Plan{}, nil, pplan, nil, nil, now)
+
+	rep, err := status.Load(statusPath)
+	if err != nil {
+		t.Fatalf("load status: %v", err)
+	}
+	if rep.Result != status.ResultWithSkips {
+		t.Errorf("result = %q, want %q (a refused escalation is not clean)", rep.Result, status.ResultWithSkips)
+	}
+	if len(rep.Conflicts) != 1 || rep.Conflicts[0].Path != "user:argus" {
+		t.Errorf("principal conflict not recorded: %+v", rep.Conflicts)
+	}
+}
+
+// A staged user workload (skipped by the activation reconciler) must reach the
+// status observation with its reason — not vanish behind a bare ok-with-skips
+// (Codex P2 #5).
+// blockedOwners blocks a USER conflict (and subuid/linger prerequisites) but NOT
+// a same-named GROUP conflict — the manifest namespaces user:argus and
+// group:argus separately (Codex round-3). A group DEPENDENCY refusal is turned
+// into a user conflict upstream in principal.Diff, so it arrives here as KindUser.
+func TestBlockedOwnersKind(t *testing.T) {
+	pplan := &principal.Plan{Actions: []principal.PrincipalAction{
+		{Kind: principal.KindUser, Name: "argus", Action: principal.ActionConflict, Reason: "uid collision"},
+		{Kind: principal.KindLinger, Name: "worker", Action: principal.ActionConflict, Reason: "linger blocked"},
+		{Kind: principal.KindGroup, Name: "bob", Action: principal.ActionConflict, Reason: "unrelated group named bob"},
+	}}
+	got := blockedOwners(pplan, nil)
+	if _, ok := got["argus"]; !ok {
+		t.Errorf("a user conflict must block; got %v", got)
+	}
+	if _, ok := got["worker"]; !ok {
+		t.Errorf("a linger prerequisite conflict must block; got %v", got)
+	}
+	if _, ok := got["bob"]; ok {
+		t.Errorf("a same-named GROUP conflict must NOT block a user; got %v", got)
+	}
+}
+
+func TestSaveStatusObservationRecordsStagedWorkload(t *testing.T) {
+	statusPath := filepath.Join(t.TempDir(), "status.json")
+	now := time.Unix(1000, 0).UTC()
+	result := &apply.Result{Outcomes: []apply.Outcome{
+		{Path: "/var/home/argus/.config/containers/systemd/argusd.container",
+			Action: diff.ActionSkip, Status: apply.StatusSkipped,
+			Reason: "staged, not activated: /run/user/1000 not present"},
+	}}
+
+	saveStatusObservation(statusPath, &diff.Plan{}, result, &principal.Plan{}, nil, nil, now)
+
+	rep, err := status.Load(statusPath)
+	if err != nil {
+		t.Fatalf("load status: %v", err)
+	}
+	if rep.Result != status.ResultWithSkips {
+		t.Errorf("result = %q, want with-skips", rep.Result)
+	}
+	var found bool
+	for _, c := range rep.Conflicts {
+		if strings.Contains(c.Path, "argusd.container") && strings.Contains(c.Reason, "staged") {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("staged workload not recorded in status: %+v", rep.Conflicts)
+	}
+}
+
+func TestSaveStatusObservationRecordsPrincipalError(t *testing.T) {
+	// A principal apply error (useradd failed mid-apply) must record as an error so
+	// status never reads green over a real failure.
+	statusPath := filepath.Join(t.TempDir(), "status.json")
+	now := time.Unix(1000, 0).UTC()
+	presult := &principal.Result{Outcomes: []principal.Outcome{
+		{Kind: principal.KindUser, Name: "argus", Status: principal.StatusErrored,
+			Err: errors.New("useradd: exit 1")},
+	}}
+
+	saveStatusObservation(statusPath, &diff.Plan{}, &apply.Result{}, &principal.Plan{}, presult, nil, now)
+
+	rep, err := status.Load(statusPath)
+	if err != nil {
+		t.Fatalf("load status: %v", err)
+	}
+	if rep.Result != status.ResultError {
+		t.Errorf("result = %q, want %q", rep.Result, status.ResultError)
+	}
+	if len(rep.Errors) != 1 || rep.Errors[0].Path != "user:argus" {
+		t.Errorf("principal error not recorded: %+v", rep.Errors)
 	}
 }
 

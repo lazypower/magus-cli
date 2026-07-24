@@ -184,6 +184,9 @@ func ApplyWithPolicy(p *policy.Policy, plan *diff.Plan, in *ir.IR, w hostfs.Writ
 		ex.unitByService[u.Name] = u
 	}
 	for _, q := range in.Quadlets {
+		if q.Scope == ir.ScopeUser {
+			continue // user-scope quadlets reconcile through the user manager (ReconcileUserWorkloads)
+		}
 		if svc, err := diff.QuadletGeneratedService(q.Name); err == nil {
 			ex.quadletByNode[svc] = quadletNode{quadlet: q, service: svc}
 		}
@@ -449,6 +452,9 @@ func ObserveUnits(in *ir.IR, sd systemd.Manager) map[string]string {
 		out[u.Name] = activeState(sd, u.Name)
 	}
 	for _, q := range in.Quadlets {
+		if q.Scope == ir.ScopeUser {
+			continue // observed through the user manager, not the system one
+		}
 		if svc, err := diff.QuadletGeneratedService(q.Name); err == nil {
 			out[svc] = activeState(sd, svc)
 		}
