@@ -50,6 +50,7 @@ func Derive(plan *diff.Plan, in *ir.IR) *graph.Graph {
 		g:              graph.New(),
 		declaredFiles:  map[string]bool{},
 		declaredQuads:  map[string]bool{},
+		userQuadPaths:  map[string]bool{},
 		unitService:    map[string]string{},
 		quadletService: map[string]string{},
 	}
@@ -69,6 +70,7 @@ type builder struct {
 
 	declaredFiles map[string]bool // ir.File paths — targets of EnvironmentFile= edges
 	declaredQuads map[string]bool // ir.Quadlet names — targets of Network=/Volume= edges
+	userQuadPaths map[string]bool // user-scope quadlet source paths — excluded from the system reload
 
 	unitService    map[string]string // unit name    -> service node id
 	quadletService map[string]string // quadlet name -> service node id
@@ -85,6 +87,9 @@ func (b *builder) indexIR(in *ir.IR) {
 	}
 	for _, q := range in.Quadlets {
 		b.declaredQuads[q.Name] = true
+		if q.Scope == ir.ScopeUser {
+			b.userQuadPaths[q.Path] = true
+		}
 	}
 }
 
@@ -99,7 +104,10 @@ func (b *builder) addNodes(plan *diff.Plan, in *ir.IR) {
 		if a.Kind == diff.KindDirectory {
 			b.dirs = append(b.dirs, a.Path)
 		}
-		if triggersReload(a) {
+		// A user-scope quadlet source write reloads the *user* generator (handled
+		// out of this graph, in the user-workload reconciler), never the system
+		// one — so it must not drag in the system daemon-reload barrier.
+		if triggersReload(a) && !b.userQuadPaths[a.Path] {
 			b.reloadTriggers = append(b.reloadTriggers, a.Path)
 		}
 	}
@@ -116,6 +124,9 @@ func (b *builder) addNodes(plan *diff.Plan, in *ir.IR) {
 		b.serviceNodes = append(b.serviceNodes, sid)
 	}
 	for _, q := range in.Quadlets {
+		if q.Scope == ir.ScopeUser {
+			continue // user-scope services are reconciled through the user manager, not this graph
+		}
 		svc, err := diff.QuadletGeneratedService(q.Name)
 		if err != nil {
 			continue // unsupported quadlet type — no generated service to reconcile

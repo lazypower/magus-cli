@@ -123,14 +123,19 @@ func runApply(args []string) int {
 	pChanges, pConflicts := principalPlanCounts(pplan)
 	changes += pChanges
 	conflicts += pConflicts
-	if changes == 0 && conflicts == 0 && errored == 0 {
+	// A user workload can be staged-but-not-activated with everything on disk in
+	// place (its user manager wasn't up last apply), so a converged file/principal
+	// plan is NOT sufficient to early-exit — the activation step must still run to
+	// (re)attempt it. Configs with no user workloads are unaffected.
+	hasUserWork := apply.HasUserWorkloads(parsed)
+	if changes == 0 && conflicts == 0 && errored == 0 && !hasUserWork {
 		// Already converged. Refresh the observation (keeps last_apply current
 		// on a timer that mostly runs no-op applies) and exit.
 		saveStatusObservation(*statusPath, plan, nil, pplan, nil, apply.ObserveUnits(parsed, sd), now)
 		fmt.Println("\nNothing to apply.")
 		return 0
 	}
-	if changes == 0 && errored == 0 {
+	if changes == 0 && errored == 0 && !hasUserWork {
 		// Conflicts only: nothing to apply, but the conflicts must still be
 		// recorded so `magus status` reflects them (and the exit code is 2,
 		// "conflicts present") — regardless of --yes. No prompt: there's nothing
@@ -169,6 +174,20 @@ func runApply(args []string) int {
 		printOutcome(os.Stdout, oc)
 	}
 
+	// Rootless user workloads activate last, over each owner's user manager —
+	// after identity + subuid + linger (above) and the source writes (just now).
+	// Their outcomes fold into the result so the summary, exit code, and status
+	// observation account for them (a staged workload is exit 2, never green).
+	if hasUserWork {
+		uOutcomes := apply.ReconcileUserWorkloads(parsed, appliedPaths(result), func(name string, uid int) systemd.UserManager {
+			return systemd.OSUser(name, uid)
+		})
+		for _, oc := range uOutcomes {
+			printOutcome(os.Stdout, oc)
+		}
+		result.Outcomes = append(result.Outcomes, uOutcomes...)
+	}
+
 	if err := m.Save(*manifestPath); err != nil {
 		fmt.Fprintf(os.Stderr, "error: failed to save manifest: %v\n", err)
 		return 1
@@ -188,6 +207,19 @@ func runApply(args []string) int {
 	fmt.Printf("Applied %d changes, %d skipped, %d errors.  exit %d\n",
 		a+pa, s+ps, e+pe, exit)
 	return exit
+}
+
+// appliedPaths is the set of resource paths this apply actually wrote (applied),
+// so the user-workload reconciler can tell a freshly-written quadlet source
+// (start/restart) from an unchanged one (leave the running service alone).
+func appliedPaths(result *apply.Result) map[string]bool {
+	out := map[string]bool{}
+	for _, oc := range result.Outcomes {
+		if oc.Status == apply.StatusApplied {
+			out[oc.Path] = true
+		}
+	}
+	return out
 }
 
 // worstExit combines two apply exit codes by the spec priority: errors (1) beat
