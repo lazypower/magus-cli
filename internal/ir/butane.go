@@ -182,28 +182,30 @@ func deferredQuadletType(path string, userRoots []userRoot) string {
 	return ""
 }
 
-// userRoot binds a declared principal's quadlet root prefix to its name, so a
-// quadlet under that prefix is promoted to a user-scoped Quadlet owned by name.
+// userRoot binds a declared principal's quadlet root prefix to its name and uid,
+// so a quadlet under that prefix is promoted to a user-scoped Quadlet owned by
+// name and written owned by uid.
 type userRoot struct {
 	name   string
 	prefix string
+	uid    *int
 }
 
-// userQuadletOwner returns the owning principal if path is a supported quadlet
-// under one of userRoots, matching the longest (most specific) prefix so nested
-// homes cannot mis-attribute. ok is false for a non-quadlet or a path under no
-// declared home.
-func userQuadletOwner(path string, userRoots []userRoot) (owner string, ok bool) {
+// userQuadletOwner returns the owning principal (name + uid) if path is a
+// supported quadlet under one of userRoots, matching the longest (most specific)
+// prefix so nested homes cannot mis-attribute. ok is false for a non-quadlet or
+// a path under no declared home.
+func userQuadletOwner(path string, userRoots []userRoot) (owner string, uid *int, ok bool) {
 	if !hasQuadletExt(path) {
-		return "", false
+		return "", nil, false
 	}
 	best := ""
 	for _, r := range userRoots {
 		if strings.HasPrefix(path, r.prefix) && len(r.prefix) > len(best) {
-			owner, best = r.name, r.prefix
+			owner, uid, best = r.name, r.uid, r.prefix
 		}
 	}
-	return owner, best != ""
+	return owner, uid, best != ""
 }
 
 // LoadButane reads source, runs the Butane → Ignition translation, and
@@ -246,7 +248,7 @@ func LoadButane(source string, allowInsecureHTTP bool) (*IR, []string, error) {
 	var userRoots []userRoot
 	for _, u := range ign.Passwd.Users {
 		if root := userQuadletRoot(derefString(u.HomeDir)); root != "" {
-			userRoots = append(userRoots, userRoot{name: u.Name, prefix: root})
+			userRoots = append(userRoots, userRoot{name: u.Name, prefix: root, uid: u.UID.v})
 		}
 	}
 
@@ -284,12 +286,20 @@ func LoadButane(source string, allowInsecureHTTP bool) (*IR, []string, error) {
 		// generator materializes its .service under the owner's user manager, so
 		// magus must see it as a Quadlet (owner-attributed) to gate and order it —
 		// not as an opaque file (the argus.bu isolated-node gap ADR-0003 names).
-		if owner, ok := userQuadletOwner(f.Path, userRoots); ok {
+		if owner, ownerUID, ok := userQuadletOwner(f.Path, userRoots); ok {
+			// A user-scope quadlet must be owned by its principal — rootless podman
+			// refuses a config tree it doesn't own. Default the source's owner to the
+			// principal's uid (magus chowns the created .config parents to match on
+			// write); an explicit file user.id still wins if the operator set one.
+			uid := f.User.ID.v
+			if uid == nil {
+				uid = ownerUID
+			}
 			out.Quadlets = append(out.Quadlets, Quadlet{
 				Path:     f.Path,
 				Name:     filepath.Base(f.Path),
 				Mode:     f.Mode.value(0644),
-				UID:      f.User.ID.v,
+				UID:      uid,
 				GID:      f.Group.ID.v,
 				Contents: contents,
 				Scope:    ScopeUser,

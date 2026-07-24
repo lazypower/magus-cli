@@ -3,6 +3,7 @@ package hostfs
 import (
 	"os"
 	"path/filepath"
+	"syscall"
 	"testing"
 )
 
@@ -133,6 +134,48 @@ func TestChownToSelf(t *testing.T) {
 	// nil/nil is a no-op and must not error.
 	if err := w.Chown(f, nil, nil); err != nil {
 		t.Errorf("Chown(nil,nil): %v", err)
+	}
+}
+
+// TestWriteFileOwnsCreatedParents proves the fix the live rootless run demanded:
+// writing an owned file deep under an existing dir chowns the parent dirs magus
+// CREATES to the file's owner, but never touches the pre-existing ancestor (the
+// useradd-made home). Uses self uid so the chown is permitted unprivileged.
+func TestWriteFileOwnsCreatedParents(t *testing.T) {
+	base := t.TempDir() // stands in for the principal's home: pre-exists, must be left alone
+	baseBefore, _ := os.Stat(base)
+	uid, gid := os.Getuid(), os.Getgid()
+	w := OS()
+
+	p := filepath.Join(base, ".config", "containers", "systemd", "argusd.container")
+	if err := w.WriteFile(p, []byte("[Container]\n"), 0o644, &uid, &gid); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+
+	// Every created parent under base is owned by the file's owner.
+	for _, d := range []string{".config", ".config/containers", ".config/containers/systemd"} {
+		st, err := os.Stat(filepath.Join(base, d))
+		if err != nil {
+			t.Fatalf("stat created parent %s: %v", d, err)
+		}
+		sys := st.Sys().(*syscall.Stat_t)
+		if int(sys.Uid) != uid {
+			t.Errorf("created parent %s uid = %d, want %d", d, sys.Uid, uid)
+		}
+	}
+	// The pre-existing base is untouched (same inode — not recreated/rechowned).
+	baseAfter, _ := os.Stat(base)
+	if baseBefore.Sys().(*syscall.Stat_t).Ino != baseAfter.Sys().(*syscall.Stat_t).Ino {
+		t.Errorf("pre-existing ancestor was disturbed")
+	}
+
+	// Unowned write (nil uid) still works and creates parents, no chown.
+	p2 := filepath.Join(base, "sys", "a", "b.conf")
+	if err := w.WriteFile(p2, []byte("x"), 0o644, nil, nil); err != nil {
+		t.Fatalf("unowned WriteFile: %v", err)
+	}
+	if _, err := os.Stat(p2); err != nil {
+		t.Errorf("unowned nested write did not create parents: %v", err)
 	}
 }
 

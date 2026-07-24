@@ -399,6 +399,11 @@ storage:
 	if !ok || usr.Scope != ScopeUser || usr.Owner != "argus" {
 		t.Errorf("user quadlet mis-scoped: %+v (want scope=user owner=argus)", usr)
 	}
+	// The source defaults to the principal's uid so rootless podman owns its
+	// config tree (magus chowns the created .config parents to match on write).
+	if usr.UID == nil || *usr.UID != 1000 {
+		t.Errorf("user quadlet should default to owner uid 1000, got %v", usr.UID)
+	}
 	// The non-quadlet file under the home stays an ordinary file, untouched.
 	var sawNotes bool
 	for _, f := range got.Files {
