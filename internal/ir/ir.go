@@ -108,12 +108,30 @@ type DropIn struct {
 	Contents string
 }
 
+// Scope distinguishes a system resource — reconciled through the system systemd
+// manager as root, under /etc — from a user resource, reconciled through an
+// owning principal's per-user systemd manager (runuser + XDG_RUNTIME_DIR),
+// under that principal's home. It is the axis ADR-0003's rootless spine turns on:
+// a user-scoped quadlet cannot activate until its owner's user manager is
+// operational (linger + user@<uid>).
+type Scope string
+
+const (
+	// ScopeSystem is the default: root-owned, /etc-rooted, system systemctl.
+	ScopeSystem Scope = "system"
+	// ScopeUser is a rootless resource under a principal's home, reconciled via
+	// that principal's user manager. Owner names the principal.
+	ScopeUser Scope = "user"
+)
+
 // Quadlet is a podman-managed container declaration auto-promoted from a
-// storage.files entry whose path falls under /etc/containers/systemd/ and
-// whose extension is one of v1's supported quadlet types (.container,
-// .volume, .network). The systemd-quadlet generator runs at daemon-reload
-// time and materializes a .service from each quadlet source — that .service
-// is what magus enables, starts, and (on content change) restarts.
+// storage.files entry whose extension is one of v1's supported quadlet types
+// (.container, .volume, .network) and whose path falls under a quadlet root:
+// the system root /etc/containers/systemd/ (Scope system), or a declared
+// principal's <home>/.config/containers/systemd/ (Scope user, Owner set). The
+// systemd-quadlet generator runs at daemon-reload time and materializes a
+// .service from each quadlet source — that .service is what magus starts and (on
+// content change) restarts, in the matching scope.
 //
 // Name is the basename of Path (e.g., "ollama.container"). The generated
 // .service name is derived from Name via QuadletGeneratedService.
@@ -124,6 +142,11 @@ type Quadlet struct {
 	UID      *int
 	GID      *int
 	Contents []byte
+	// Scope is system (default) or user. Owner is the owning principal's name
+	// when Scope is user, "" otherwise. Path derivation guarantees a user
+	// quadlet has exactly one owner (ADR-0003 invariant).
+	Scope Scope
+	Owner string
 }
 
 // UnitNameFromPath recovers the systemd unit name from a managed path. It
